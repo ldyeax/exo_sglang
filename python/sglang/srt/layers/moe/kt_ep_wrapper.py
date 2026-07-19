@@ -47,6 +47,10 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from sglang.srt.layers.moe.quant_method_registry import (
+    register_moe_quant_wrapper,
+    require_moe_quant_wrapper_registered,
+)
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda
@@ -2333,8 +2337,6 @@ def update_gpu_expert_mappings(
             - logical_to_gpu_index: CUDA int32 tensor [num_experts], maps logical -> GPU index
             - gpu_index_to_logical: CPU int32 tensor [num_gpu_experts], reverse mapping
     """
-    num_gpu_experts = len(selected_experts)
-
     # Create new mask (CPU tensor)
     gpu_experts_mask_cpu = torch.zeros(num_experts, dtype=torch.bool, device='cpu')
     gpu_experts_mask_cpu[selected_experts.cpu()] = True
@@ -3259,6 +3261,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 # sglang.srt.models.deepseek_v4 -> auto-discovered by ModelRegistry.
 # ---------------------------------------------------------------------------
 
+
 def _kt_ep_predicate(layer, server_args):
     return create_kt_config_from_server_args(server_args, layer.layer_id)
 
@@ -3267,9 +3270,22 @@ def _kt_ep_factory(layer, gpu_method, kt_config):
     return KTEPWrapperMethod(gpu_method, kt_config)
 
 
-from sglang.srt.layers.moe.quant_method_registry import register_moe_quant_wrapper
-
 # priority=20 → wraps after mxfp4 (matches PR #38 Phase 3 → outer wrapper)
-register_moe_quant_wrapper(
-    "kt_ep", _kt_ep_predicate, _kt_ep_factory, priority=20
-)
+register_moe_quant_wrapper("kt_ep", _kt_ep_predicate, _kt_ep_factory, priority=20)
+
+
+def require_kt_ep_registration() -> None:
+    """Require both the KT runtime and its MoE quant-wrapper registration."""
+    if not KTRANSFORMERS_AVAILABLE:
+        raise ImportError(
+            "kt_kernel is not installed. KTransformers expert parallelism "
+            "cannot be enabled."
+        )
+    require_moe_quant_wrapper_registered("kt_ep")
+
+
+def get_kt_ep_gpu_experts_masks() -> torch.Tensor:
+    """Return the initialized layer/expert placement mask or fail closed."""
+    if _KT_GPU_EXPERTS_MASKS is None:
+        raise RuntimeError("KT GPU expert placement masks are not initialized")
+    return _KT_GPU_EXPERTS_MASKS

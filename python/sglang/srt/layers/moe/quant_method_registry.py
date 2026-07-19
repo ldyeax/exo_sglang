@@ -51,6 +51,21 @@ def register_moe_quant_wrapper(
     _QUANT_WRAPPERS.append((priority, wrapper_id, predicate, factory))
 
 
+def is_moe_quant_wrapper_registered(wrapper_id: str) -> bool:
+    """Return whether a wrapper plugin has registered its stable id."""
+    return any(existing_id == wrapper_id for _, existing_id, _, _ in _QUANT_WRAPPERS)
+
+
+def require_moe_quant_wrapper_registered(wrapper_id: str) -> None:
+    """Fail closed when a required wrapper plugin did not register."""
+    if not is_moe_quant_wrapper_registered(wrapper_id):
+        registered_ids = sorted(existing_id for _, existing_id, _, _ in _QUANT_WRAPPERS)
+        raise RuntimeError(
+            f"Required MoE quant-method wrapper {wrapper_id!r} is not registered. "
+            f"Registered wrapper ids: {registered_ids}"
+        )
+
+
 def maybe_wrap_moe_quant_method(
     layer: Any, gpu_method: "FusedMoEMethodBase", server_args: "ServerArgs"
 ) -> "FusedMoEMethodBase":
