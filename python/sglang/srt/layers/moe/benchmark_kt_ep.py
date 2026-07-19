@@ -33,6 +33,32 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+_EXPERT_PROJECTION_NAMES = {
+    "gate_proj.weight": "gate",
+    "up_proj.weight": "up",
+    "down_proj.weight": "down",
+    "w1.weight": "gate",
+    "w3.weight": "up",
+    "w2.weight": "down",
+}
+_EXPERT_PROJECTIONS = ("gate", "up", "down")
+
+
+def _parse_expert_projection_key(
+    key: str, layer_idx: int
+) -> Optional[Tuple[int, str]]:
+    expert_prefix = f"model.layers.{layer_idx}.mlp.experts."
+    if not key.startswith(expert_prefix):
+        return None
+
+    suffix = key[len(expert_prefix) :]
+    expert_id_text, separator, projection_name = suffix.partition(".")
+    projection = _EXPERT_PROJECTION_NAMES.get(projection_name)
+    if not separator or not expert_id_text.isdigit() or projection is None:
+        return None
+    return int(expert_id_text), projection
+
+
 def setup_minimal_server_args(model_path: str):
     """Initialize minimal server args for MoE computation to work."""
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -139,8 +165,6 @@ def detect_first_moe_layer(model_path: str, max_layers_to_check: int = 10) -> in
     Returns:
         Index of the first MoE layer (0 if all layers have MoE or detection fails)
     """
-    import re
-
     safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
     if not safetensors_files:
         return 0
@@ -536,99 +560,147 @@ class BenchmarkKTWrapper:
         logger.info(f"GPU method created: w13_weight shape = {self.mock_layer.w13_weight.shape}, "
                     f"w2_weight shape = {self.mock_layer.w2_weight.shape}")
 
-    def load_gpu_weights(self, model_path: str, layer_idx: int = 0):
-        """Load GPU expert weights from model checkpoint.
-
-        Note: For quantized models (FP8, INT4, etc.), weight shapes may not match
-        bf16 layout. In such cases, we skip loading and use random weights instead.
-        This is acceptable for benchmarking since weight values don't affect timing.
-        """
+    def load_gpu_weights(self, model_path: str, layer_idx: int = 0) -> int:
+        """Load every resident BF16 expert projection from a model checkpoint."""
         logger.info(f"Loading GPU weights from {model_path} for layer {layer_idx}")
 
         safetensors_files = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
         if not safetensors_files:
-            logger.warning("No safetensors files found, using random weights")
-            return
+            raise FileNotFoundError(f"No safetensors files found in {model_path}")
 
-        # Get weight shape info
-        # For triton kernels: w13_weight is [num_experts, hidden_size, 2*intermediate]
-        #                     w2_weight is [num_experts, intermediate, hidden_size]
+        if self.mock_layer is None:
+            raise RuntimeError("GPU weights were not allocated")
+
         w13_weight = self.mock_layer.w13_weight.data
         w2_weight = self.mock_layer.w2_weight.data
+        expected_w13_destination_shape = (
+            self.num_gpu_experts,
+            2 * self.intermediate_size,
+            self.hidden_size,
+        )
+        expected_w2_destination_shape = (
+            self.num_gpu_experts,
+            self.hidden_size,
+            self.intermediate_size,
+        )
+        if tuple(w13_weight.shape) != expected_w13_destination_shape:
+            raise RuntimeError(
+                "Non-Triton w13_weight shape mismatch: "
+                f"expected {expected_w13_destination_shape}, "
+                f"got {tuple(w13_weight.shape)}"
+            )
+        if tuple(w2_weight.shape) != expected_w2_destination_shape:
+            raise RuntimeError(
+                "Non-Triton w2_weight shape mismatch: "
+                f"expected {expected_w2_destination_shape}, "
+                f"got {tuple(w2_weight.shape)}"
+            )
+        if (
+            w13_weight.dtype != self.params_dtype
+            or w2_weight.dtype != self.params_dtype
+        ):
+            raise RuntimeError(
+                "GPU expert destination dtype mismatch: "
+                f"expected {self.params_dtype}, got {w13_weight.dtype} and {w2_weight.dtype}"
+            )
 
-        layer_prefix = f"model.layers.{layer_idx}."
-        loaded_count = 0
-        skipped_count = 0
+        expected_shapes = {
+            "gate": (self.intermediate_size, self.hidden_size),
+            "up": (self.intermediate_size, self.hidden_size),
+            "down": (self.hidden_size, self.intermediate_size),
+        }
+        expected_slots = {
+            (expert_idx, projection)
+            for expert_idx in range(self.num_gpu_experts)
+            for projection in _EXPERT_PROJECTIONS
+        }
+        weight_locations: Dict[Tuple[int, str], Tuple[str, str]] = {}
 
         for sf_file in safetensors_files:
             with safe_open(sf_file, framework="pt", device="cpu") as f:
                 for key in f.keys():
-                    if layer_prefix not in key:
+                    parsed_key = _parse_expert_projection_key(key, layer_idx)
+                    if parsed_key is None:
                         continue
-                    if "experts" not in key:
-                        continue
-                    # Skip scale tensors for quantized models
-                    if "scale" in key:
-                        continue
-
-                    # Extract expert ID
-                    parts = key.split(".")
-                    expert_idx = None
-                    for i, part in enumerate(parts):
-                        if part == "experts" and i + 1 < len(parts):
-                            try:
-                                expert_idx = int(parts[i + 1])
-                            except ValueError:
-                                continue
-                            break
-
-                    if expert_idx is None:
-                        continue
-
-                    # Skip CPU experts
+                    expert_idx, projection = parsed_key
                     if expert_idx >= self.num_gpu_experts:
                         continue
 
-                    # Load weight
-                    weight = f.get_tensor(key)
+                    slot = (expert_idx, projection)
+                    previous_location = weight_locations.get(slot)
+                    if previous_location is not None:
+                        raise RuntimeError(
+                            "Duplicate GPU expert projection for "
+                            f"expert {expert_idx} {projection}: "
+                            f"{previous_location[0]}:{previous_location[1]} and "
+                            f"{sf_file}:{key}"
+                        )
 
-                    # Check if this is a quantized weight (shape mismatch)
-                    # For bf16: w1/w3 should be [intermediate, hidden], w2 should be [hidden, intermediate]
-                    expected_w13_shape = (self.intermediate_size, self.hidden_size)
-                    expected_w2_shape = (self.hidden_size, self.intermediate_size)
+                    checkpoint_shape = tuple(f.get_slice(key).get_shape())
+                    expected_shape = expected_shapes[projection]
+                    if checkpoint_shape != expected_shape:
+                        raise RuntimeError(
+                            f"GPU expert checkpoint shape mismatch for {key}: "
+                            f"expected {expected_shape}, got {checkpoint_shape}"
+                        )
+                    weight_locations[slot] = (sf_file, key)
 
-                    try:
-                        weight_bf16 = weight.to(self.params_dtype)
+        missing_slots = sorted(expected_slots - weight_locations.keys())
+        if missing_slots:
+            missing_description = ", ".join(
+                f"expert {expert_idx} {projection}"
+                for expert_idx, projection in missing_slots
+            )
+            raise RuntimeError(
+                "Missing GPU expert projections for "
+                f"layer {layer_idx}: {missing_description}"
+            )
 
-                        # For triton_kernels layout: [num_experts, K, N] where input is [M, K]
-                        # w13: [num_experts, hidden_size, 2*intermediate]
-                        # w2: [num_experts, intermediate, hidden_size]
-                        if ("w1" in key or "gate_proj" in key) and "w13" not in key:
-                            if weight_bf16.shape == expected_w13_shape:
-                                w13_weight[expert_idx, :, :self.intermediate_size].copy_(weight_bf16.T)
-                                loaded_count += 1
-                            else:
-                                skipped_count += 1
-                        elif ("w3" in key or "up_proj" in key) and "w13" not in key:
-                            if weight_bf16.shape == expected_w13_shape:
-                                w13_weight[expert_idx, :, self.intermediate_size:].copy_(weight_bf16.T)
-                                loaded_count += 1
-                            else:
-                                skipped_count += 1
-                        elif ("w2" in key or "down_proj" in key) and "w13" not in key:
-                            if weight_bf16.shape == expected_w2_shape:
-                                w2_weight[expert_idx, :, :].copy_(weight_bf16.T)
-                                loaded_count += 1
-                            else:
-                                skipped_count += 1
-                    except Exception as e:
-                        skipped_count += 1
-                        continue
+        expected_count = 3 * self.num_gpu_experts
+        if len(weight_locations) != expected_count:
+            raise RuntimeError(
+                "GPU expert projection count mismatch: "
+                f"expected {expected_count}, got {len(weight_locations)}"
+            )
 
-        if loaded_count > 0:
-            logger.info(f"GPU weights loaded: {loaded_count} weight tensors")
-        if skipped_count > 0:
-            logger.warning(f"Skipped {skipped_count} weights (quantized format, using random weights instead)")
+        locations_by_file: Dict[str, List[Tuple[int, str, str]]] = {}
+        for (expert_idx, projection), (sf_file, key) in weight_locations.items():
+            locations_by_file.setdefault(sf_file, []).append(
+                (expert_idx, projection, key)
+            )
+
+        loaded_count = 0
+        for sf_file in sorted(locations_by_file):
+            with safe_open(sf_file, framework="pt", device="cpu") as f:
+                for expert_idx, projection, key in sorted(locations_by_file[sf_file]):
+                    weight = f.get_tensor(key).to(
+                        dtype=self.params_dtype,
+                        device=w13_weight.device,
+                    )
+                    if tuple(weight.shape) != expected_shapes[projection]:
+                        raise RuntimeError(
+                            f"GPU expert checkpoint changed while loading {key}"
+                        )
+
+                    if projection == "gate":
+                        w13_weight[
+                            expert_idx, : self.intermediate_size, :
+                        ].copy_(weight)
+                    elif projection == "up":
+                        w13_weight[
+                            expert_idx, self.intermediate_size :, :
+                        ].copy_(weight)
+                    else:
+                        w2_weight[expert_idx, :, :].copy_(weight)
+                    loaded_count += 1
+
+        if loaded_count != expected_count:
+            raise RuntimeError(
+                "GPU expert projection load count mismatch: "
+                f"expected {expected_count}, got {loaded_count}"
+            )
+        logger.info(f"GPU weights loaded: {loaded_count} weight tensors")
+        return loaded_count
 
     def load_cpu_weights(self, layer_idx: int = 0):
         """Load CPU expert weights via KTMoEWrapper.
