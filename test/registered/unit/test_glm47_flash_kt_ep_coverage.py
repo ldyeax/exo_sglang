@@ -67,6 +67,7 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
             sparse_block.layer_id = layer_id
             sparse_block.config = config
             sparse_block.experts = experts
+            sparse_block.is_hash = False
             layers.append(SimpleNamespace(layer_id=layer_id, mlp=sparse_block))
         return config, masks, layers
 
@@ -135,6 +136,24 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
                 config=self._config(), pp_size=2, prefix="model"
             )
 
+    def test_preconstruction_requirement_rejects_hash_layers(self):
+        config = self._config()
+        config.n_hash_layers = 1
+        fake_kt_module = SimpleNamespace(require_kt_ep_registration=lambda: None)
+        with (
+            patch.object(
+                glm,
+                "get_server_args",
+                return_value=self._server_args(),
+            ),
+            patch.dict(
+                sys.modules,
+                {"sglang.srt.layers.moe.kt_ep_wrapper": fake_kt_module},
+            ),
+            self.assertRaisesRegex(RuntimeError, "does not support hash-routed MoE"),
+        ):
+            glm._require_glm47_flash_kt_ep(config=config, pp_size=1, prefix="model")
+
     def test_coverage_receipt_binds_all_46_routed_layers(self):
         config, masks, layers = self._coverage_fixture()
 
@@ -159,6 +178,20 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
         layers[12].mlp.experts.layer_name = "model.layers.11.mlp.experts"
 
         with self.assertRaisesRegex(RuntimeError, "layer path mismatch"):
+            self._build_receipt(config, masks, layers)
+
+    def test_coverage_rejects_missing_hash_routing_state(self):
+        config, masks, layers = self._coverage_fixture()
+        del layers[11].mlp.is_hash
+
+        with self.assertRaisesRegex(RuntimeError, "must disable DeepSeek hash routing"):
+            self._build_receipt(config, masks, layers)
+
+    def test_coverage_rejects_enabled_hash_routing(self):
+        config, masks, layers = self._coverage_fixture()
+        layers[11].mlp.is_hash = True
+
+        with self.assertRaisesRegex(RuntimeError, "must disable DeepSeek hash routing"):
             self._build_receipt(config, masks, layers)
 
     def test_coverage_rejects_unwrapped_layer(self):

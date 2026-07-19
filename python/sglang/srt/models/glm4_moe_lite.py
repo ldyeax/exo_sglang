@@ -130,6 +130,16 @@ def _require_glm47_flash_kt_ep(
             "KTransformers GLM-4.7-Flash integration received an unsupported "
             f"model topology: {mismatches}"
         )
+    hash_layer_counts = {}
+    for name in ("n_hash_layers", "num_hash_layers"):
+        value = getattr(config, name, None)
+        if value not in (None, 0):
+            hash_layer_counts[name] = value
+    if hash_layer_counts:
+        raise RuntimeError(
+            "KTransformers GLM-4.7-Flash does not support hash-routed MoE "
+            f"layers: {hash_layer_counts}"
+        )
     if pp_size != 1:
         raise RuntimeError(
             "KTransformers GLM-4.7-Flash coverage receipts currently require "
@@ -185,6 +195,11 @@ def _build_glm47_flash_kt_ep_coverage_receipt(
         experts = sparse_block.experts
         module_path = f"{prefix}.layers.{layer_id}.mlp.experts"
 
+        if getattr(sparse_block, "is_hash", None) is not False:
+            raise RuntimeError(
+                f"{module_path} must disable DeepSeek hash routing, got "
+                f"{getattr(sparse_block, 'is_hash', None)!r}"
+            )
         if type(experts) is not FusedMoE:
             raise RuntimeError(
                 f"{module_path} must be the local FusedMoE implementation, got "
@@ -371,6 +386,9 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
+        # This class inherits DeepseekV2MoE's forward methods but constructs
+        # GLM's score-based TopK, which never accepts hash-routing inputs.
+        self.is_hash = False
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
