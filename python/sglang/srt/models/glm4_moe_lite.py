@@ -14,9 +14,11 @@
 
 """Inference-only GLM-4.7-Flash model compatible with HuggingFace weights."""
 
+import hashlib
+import json
 import logging
 import re
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -94,6 +96,176 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
+
+_GLM47_FLASH_NUM_LAYERS = 47
+_GLM47_FLASH_FIRST_MOE_LAYER = 1
+_GLM47_FLASH_NUM_ROUTED_EXPERTS = 64
+
+
+def _require_glm47_flash_kt_ep(
+    config: PretrainedConfig, pp_size: int, prefix: str
+) -> bool:
+    """Validate the exact GLM-4.7-Flash KT topology before allocating layers."""
+    server_args = get_server_args()
+    if server_args.kt_weight_path is None:
+        return False
+
+    from sglang.srt.layers.moe.kt_ep_wrapper import require_kt_ep_registration
+
+    require_kt_ep_registration()
+
+    expected_config = {
+        "num_hidden_layers": _GLM47_FLASH_NUM_LAYERS,
+        "first_k_dense_replace": _GLM47_FLASH_FIRST_MOE_LAYER,
+        "n_routed_experts": _GLM47_FLASH_NUM_ROUTED_EXPERTS,
+        "moe_layer_freq": 1,
+    }
+    mismatches = {
+        name: {"expected": expected, "actual": getattr(config, name, None)}
+        for name, expected in expected_config.items()
+        if getattr(config, name, None) != expected
+    }
+    if mismatches:
+        raise RuntimeError(
+            "KTransformers GLM-4.7-Flash integration received an unsupported "
+            f"model topology: {mismatches}"
+        )
+    if pp_size != 1:
+        raise RuntimeError(
+            "KTransformers GLM-4.7-Flash coverage receipts currently require "
+            f"pipeline parallel size 1, got {pp_size}"
+        )
+    if prefix != "model":
+        raise RuntimeError(
+            "KTransformers GLM-4.7-Flash requires canonical model prefix "
+            f"'model', got {prefix!r}"
+        )
+    return True
+
+
+def _build_glm47_flash_kt_ep_coverage_receipt(
+    layers: nn.ModuleList,
+    config: PretrainedConfig,
+    prefix: str,
+) -> Dict[str, Any]:
+    """Verify every local routed layer and return a machine-readable receipt."""
+    from sglang.srt.layers.moe.kt_ep_wrapper import get_kt_ep_gpu_experts_masks
+
+    server_args = get_server_args()
+    masks = get_kt_ep_gpu_experts_masks()
+    expected_mask_shape = (
+        _GLM47_FLASH_NUM_LAYERS,
+        _GLM47_FLASH_NUM_ROUTED_EXPERTS,
+    )
+    if tuple(masks.shape) != expected_mask_shape:
+        raise RuntimeError(
+            "KTransformers GLM-4.7-Flash expert placement mask shape mismatch: "
+            f"expected {expected_mask_shape}, got {tuple(masks.shape)}"
+        )
+
+    expected_layer_ids = list(
+        range(_GLM47_FLASH_FIRST_MOE_LAYER, _GLM47_FLASH_NUM_LAYERS)
+    )
+    actual_layer_ids = [
+        layer_id
+        for layer_id, layer in enumerate(layers)
+        if isinstance(getattr(layer, "mlp", None), Glm4MoeLiteSparseMoeBlock)
+    ]
+    if actual_layer_ids != expected_layer_ids:
+        raise RuntimeError(
+            "KTransformers GLM-4.7-Flash routed-layer coverage mismatch: "
+            f"expected {expected_layer_ids}, got {actual_layer_ids}"
+        )
+
+    configured_resident_count = server_args.kt_num_gpu_experts
+    layer_receipts = []
+    for layer_id in expected_layer_ids:
+        decoder_layer = layers[layer_id]
+        sparse_block = decoder_layer.mlp
+        experts = sparse_block.experts
+        module_path = f"{prefix}.layers.{layer_id}.mlp.experts"
+
+        if type(experts) is not FusedMoE:
+            raise RuntimeError(
+                f"{module_path} must be the local FusedMoE implementation, got "
+                f"{type(experts).__module__}.{type(experts).__name__}"
+            )
+        if getattr(experts, "layer_name", None) != module_path:
+            raise RuntimeError(
+                f"{module_path} layer path mismatch: "
+                f"{getattr(experts, 'layer_name', None)!r}"
+            )
+
+        quant_method = experts.quant_method
+        if not isinstance(quant_method, KTEPWrapperMethod):
+            raise RuntimeError(f"{module_path} is not wrapped by KTEPWrapperMethod")
+        kt_config = quant_method.kt_config
+
+        linkage = {
+            "decoder_layer_id": getattr(decoder_layer, "layer_id", None),
+            "sparse_block_layer_id": getattr(sparse_block, "layer_id", None),
+            "fused_moe_layer_id": getattr(experts, "layer_id", None),
+            "runner_layer_id": getattr(experts.moe_runner_config, "layer_id", None),
+            "kt_config_layer_idx": getattr(kt_config, "layer_idx", None),
+        }
+        invalid_linkage = {
+            name: value for name, value in linkage.items() if value != layer_id
+        }
+        if invalid_linkage:
+            raise RuntimeError(
+                f"{module_path} layer linkage mismatch: {invalid_linkage}"
+            )
+        if getattr(sparse_block, "config", None) is not config:
+            raise RuntimeError(f"{module_path} is not linked to the model config")
+        if getattr(kt_config, "num_layers", None) != _GLM47_FLASH_NUM_LAYERS:
+            raise RuntimeError(
+                f"{module_path} KTConfig num_layers mismatch: "
+                f"{getattr(kt_config, 'num_layers', None)!r}"
+            )
+
+        layer_mask = getattr(kt_config, "gpu_experts_mask", None)
+        if layer_mask is None or tuple(layer_mask.shape) != (
+            _GLM47_FLASH_NUM_ROUTED_EXPERTS,
+        ):
+            raise RuntimeError(
+                f"{module_path} KTConfig mask must have shape "
+                f"({_GLM47_FLASH_NUM_ROUTED_EXPERTS},)"
+            )
+        if not torch.equal(layer_mask.cpu(), masks[layer_id].cpu()):
+            raise RuntimeError(
+                f"{module_path} KTConfig mask is not linked to placement row {layer_id}"
+            )
+        resident_count = int(layer_mask.sum().item())
+        if resident_count != configured_resident_count:
+            raise RuntimeError(
+                f"{module_path} GPU-resident expert count mismatch: expected "
+                f"{configured_resident_count}, got {resident_count}"
+            )
+
+        layer_receipts.append(
+            {
+                "layer_id": layer_id,
+                "module_path": module_path,
+                "wrapper": "KTEPWrapperMethod",
+                "gpu_resident_experts": resident_count,
+            }
+        )
+
+    mask_bytes = bytes(int(value) for value in masks.to(dtype=torch.uint8).view(-1))
+    return {
+        "schema_version": 1,
+        "model_architecture": "Glm4MoeLiteForCausalLM",
+        "pipeline_parallel_size": 1,
+        "layer_count": _GLM47_FLASH_NUM_LAYERS,
+        "routed_layer_ids": expected_layer_ids,
+        "routed_expert_count": _GLM47_FLASH_NUM_ROUTED_EXPERTS,
+        "gpu_expert_mask_shape": list(expected_mask_shape),
+        "gpu_expert_mask_sha256": hashlib.sha256(mask_bytes).hexdigest(),
+        "configured_gpu_resident_experts_per_layer": configured_resident_count,
+        "ktransformers_method": server_args.kt_method,
+        "wrapper": "KTEPWrapperMethod",
+        "layers": layer_receipts,
+    }
 
 
 class Glm4MoeLiteMLP(nn.Module):
@@ -770,6 +942,11 @@ class Glm4MoeLiteModel(nn.Module):
         self.vocab_size = config.vocab_size
         self.first_k_dense_replace = config.first_k_dense_replace
         self.pp_group = get_pp_group()
+        kt_ep_enabled = _require_glm47_flash_kt_ep(
+            config=config,
+            pp_size=self.pp_group.world_size,
+            prefix=prefix,
+        )
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -799,6 +976,17 @@ class Glm4MoeLiteModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
+        self.kt_ep_coverage_receipt = None
+        if kt_ep_enabled:
+            self.kt_ep_coverage_receipt = _build_glm47_flash_kt_ep_coverage_receipt(
+                layers=self.layers,
+                config=config,
+                prefix=prefix,
+            )
+            logger.info(
+                "GLM47_FLASH_KT_EP_COVERAGE_RECEIPT %s",
+                json.dumps(self.kt_ep_coverage_receipt, sort_keys=True),
+            )
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens

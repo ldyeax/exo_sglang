@@ -6354,3 +6354,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
 
 # ---------------------------------------------------------------------------
+
+
+def require_kt_ep_registration() -> None:
+    """Fail closed when the KT runtime needed by the direct MoE wrapper is absent."""
+    if not KTRANSFORMERS_AVAILABLE:
+        raise ImportError(
+            "kt_kernel is not installed. KTransformers expert parallelism "
+            "cannot be enabled."
+        )
+
+
+def get_kt_ep_gpu_experts_masks() -> torch.Tensor:
+    """Return the initialized layer/expert placement mask or fail closed."""
+    if _KT_GPU_EXPERTS_MASKS is None:
+        raise RuntimeError("KT GPU expert placement masks are not initialized")
+    return _KT_GPU_EXPERTS_MASKS
