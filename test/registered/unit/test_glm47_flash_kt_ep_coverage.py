@@ -27,6 +27,13 @@ class _FakeKTEPWrapperMethod:
         self.kt_config = kt_config
 
 
+class _FakeGlm4MoeLiteModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.kt_ep_coverage_receipt = None
+        self.layers = torch.nn.ModuleList()
+
+
 class TestGlm47FlashKtEpCoverage(unittest.TestCase):
     def _config(self):
         return SimpleNamespace(
@@ -70,6 +77,34 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
             sparse_block.is_hash = False
             layers.append(SimpleNamespace(layer_id=layer_id, mlp=sparse_block))
         return config, masks, layers
+
+    def _construct_causal_model(self, *, is_last_rank):
+        config = SimpleNamespace(vocab_size=154880, hidden_size=2048)
+        pp_group = SimpleNamespace(is_last_rank=is_last_rank)
+        model_body = _FakeGlm4MoeLiteModel()
+        expected_lm_head = torch.nn.Identity()
+        lm_head_constructor = Mock(return_value=expected_lm_head)
+        server_args = SimpleNamespace(enable_dp_lm_head=False)
+
+        with (
+            patch.object(glm, "get_pp_group", return_value=pp_group),
+            patch.object(
+                glm,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_size=1),
+            ),
+            patch.object(
+                glm.Glm4MoeLiteForCausalLM,
+                "determine_num_fused_shared_experts",
+            ),
+            patch.object(glm, "Glm4MoeLiteModel", return_value=model_body),
+            patch.object(glm, "ParallelLMHead", lm_head_constructor),
+            patch.object(glm, "LogitsProcessor", return_value=torch.nn.Identity()),
+            patch.object(glm, "get_server_args", return_value=server_args),
+        ):
+            model = glm.Glm4MoeLiteForCausalLM(config)
+
+        return model, expected_lm_head, lm_head_constructor
 
     def _build_receipt(
         self,
@@ -132,6 +167,27 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
 
         self.assertTrue(enabled)
         require_registration.assert_called_once_with()
+
+    def test_non_last_pipeline_rank_does_not_allocate_lm_head(self):
+        model, _, lm_head_constructor = self._construct_causal_model(is_last_rank=False)
+
+        lm_head_constructor.assert_not_called()
+        self.assertIsInstance(model.lm_head, glm.PPMissingLayer)
+        self.assertNotIn("lm_head.weight", dict(model.named_parameters()))
+
+    def test_last_pipeline_rank_retains_lm_head(self):
+        model, expected_lm_head, lm_head_constructor = self._construct_causal_model(
+            is_last_rank=True
+        )
+
+        self.assertIs(model.lm_head, expected_lm_head)
+        lm_head_constructor.assert_called_once_with(
+            154880,
+            2048,
+            quant_config=None,
+            prefix="lm_head",
+            use_attn_tp_group=False,
+        )
 
     def test_preconstruction_requirement_accepts_pipeline_parallelism(self):
         fake_kt_module = SimpleNamespace(require_kt_ep_registration=lambda: None)

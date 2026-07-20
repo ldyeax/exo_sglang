@@ -1134,13 +1134,17 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.model = Glm4MoeLiteModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("lm_head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
-        )
+        self.kt_ep_coverage_receipt = self.model.kt_ep_coverage_receipt
+        if self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
         self._routed_experts_weights_of_layer = LazyValue(
