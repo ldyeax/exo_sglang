@@ -140,10 +140,10 @@ def _require_glm47_flash_kt_ep(
             "KTransformers GLM-4.7-Flash does not support hash-routed MoE "
             f"layers: {hash_layer_counts}"
         )
-    if pp_size != 1:
+    if not 1 <= pp_size <= _GLM47_FLASH_NUM_LAYERS:
         raise RuntimeError(
-            "KTransformers GLM-4.7-Flash coverage receipts currently require "
-            f"pipeline parallel size 1, got {pp_size}"
+            "KTransformers GLM-4.7-Flash requires a pipeline parallel size "
+            f"between 1 and {_GLM47_FLASH_NUM_LAYERS}, got {pp_size}"
         )
     if prefix != "model":
         raise RuntimeError(
@@ -157,6 +157,10 @@ def _build_glm47_flash_kt_ep_coverage_receipt(
     layers: nn.ModuleList,
     config: PretrainedConfig,
     prefix: str,
+    pp_rank: int,
+    pp_size: int,
+    start_layer: int,
+    end_layer: int,
 ) -> Dict[str, Any]:
     """Verify every local routed layer and return a machine-readable receipt."""
     from sglang.srt.layers.moe.kt_ep_wrapper import get_kt_ep_gpu_experts_masks
@@ -173,8 +177,19 @@ def _build_glm47_flash_kt_ep_coverage_receipt(
             f"expected {expected_mask_shape}, got {tuple(masks.shape)}"
         )
 
+    if (
+        pp_size < 1
+        or not 0 <= pp_rank < pp_size
+        or not 0 <= start_layer < end_layer <= _GLM47_FLASH_NUM_LAYERS
+    ):
+        raise RuntimeError(
+            "KTransformers GLM-4.7-Flash received an invalid local pipeline "
+            f"range: rank={pp_rank}, size={pp_size}, "
+            f"layers=[{start_layer}, {end_layer})"
+        )
+
     expected_layer_ids = list(
-        range(_GLM47_FLASH_FIRST_MOE_LAYER, _GLM47_FLASH_NUM_LAYERS)
+        range(max(start_layer, _GLM47_FLASH_FIRST_MOE_LAYER), end_layer)
     )
     actual_layer_ids = [
         layer_id
@@ -270,7 +285,10 @@ def _build_glm47_flash_kt_ep_coverage_receipt(
     return {
         "schema_version": 1,
         "model_architecture": "Glm4MoeLiteForCausalLM",
-        "pipeline_parallel_size": 1,
+        "pipeline_parallel_rank": pp_rank,
+        "pipeline_parallel_size": pp_size,
+        "pipeline_layer_start": start_layer,
+        "pipeline_layer_end": end_layer,
         "layer_count": _GLM47_FLASH_NUM_LAYERS,
         "routed_layer_ids": expected_layer_ids,
         "routed_expert_count": _GLM47_FLASH_NUM_ROUTED_EXPERTS,
@@ -1000,6 +1018,10 @@ class Glm4MoeLiteModel(nn.Module):
                 layers=self.layers,
                 config=config,
                 prefix=prefix,
+                pp_rank=self.pp_group.rank_in_group,
+                pp_size=self.pp_group.world_size,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
             )
             logger.info(
                 "GLM47_FLASH_KT_EP_COVERAGE_RECEIPT %s",

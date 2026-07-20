@@ -1123,6 +1123,32 @@ def _merge_hybrid_expert_outputs(
     return gpu_output + cpu_output
 
 
+def _broadcast_tp_object_list(values: List[object]) -> None:
+    if not dist.is_initialized():
+        return
+    tp_group = get_tp_group()
+    if tp_group.world_size == 1:
+        return
+    dist.broadcast_object_list(
+        values,
+        src=tp_group.first_rank,
+        group=tp_group.cpu_group,
+    )
+
+
+def _broadcast_tp_tensor(tensor: torch.Tensor, *, on_device: bool) -> None:
+    if not dist.is_initialized():
+        return
+    tp_group = get_tp_group()
+    if tp_group.world_size == 1:
+        return
+    dist.broadcast(
+        tensor,
+        src=tp_group.first_rank,
+        group=tp_group.device_group if on_device else tp_group.cpu_group,
+    )
+
+
 @dataclass
 class KTConfig:
     """Configuration for KTransformers heterogeneous computing CPU part.
@@ -1895,12 +1921,9 @@ class SharedFullContext:
             self.shm_unique_id = uuid.uuid4().hex[:8]
         else:
             self.shm_unique_id = None
-        if dist.is_initialized():
-            unique_id_list = [self.shm_unique_id]
-            dist.broadcast_object_list(
-                unique_id_list, src=0, group=get_tp_group().cpu_group
-            )
-            self.shm_unique_id = unique_id_list[0]
+        unique_id_list = [self.shm_unique_id]
+        _broadcast_tp_object_list(unique_id_list)
+        self.shm_unique_id = unique_id_list[0]
 
         for name in self.weight_names:
             gpu_tensor = getattr(self.gpu_layer, name)
@@ -3800,8 +3823,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
     else:
         raise ValueError(f"Unknown kt_expert_placement_strategy: {strategy}")
 
-    if dist.is_initialized():
-        dist.broadcast(masks, src=0, group=get_tp_group().cpu_group)
+    _broadcast_tp_tensor(masks, on_device=False)
 
     _KT_GPU_EXPERTS_MASKS = masks
 
@@ -6231,8 +6253,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
 
         # Broadcast selected experts to all ranks for consistent weight updates
-        if dist.is_initialized():
-            dist.broadcast(selected_experts, src=0, group=get_tp_group().device_group)
+        _broadcast_tp_tensor(selected_experts, on_device=True)
 
         # Step 2: Copy selected expert weights from ctx.gpu_layer to layer.
         # Both are already in inference format: apply() already called

@@ -71,7 +71,18 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
             layers.append(SimpleNamespace(layer_id=layer_id, mlp=sparse_block))
         return config, masks, layers
 
-    def _build_receipt(self, config, masks, layers, server_args=None):
+    def _build_receipt(
+        self,
+        config,
+        masks,
+        layers,
+        server_args=None,
+        *,
+        pp_rank=0,
+        pp_size=1,
+        start_layer=0,
+        end_layer=47,
+    ):
         fake_kt_module = SimpleNamespace(
             get_kt_ep_gpu_experts_masks=lambda: masks,
         )
@@ -93,6 +104,10 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
                 layers=layers,
                 config=config,
                 prefix="model",
+                pp_rank=pp_rank,
+                pp_size=pp_size,
+                start_layer=start_layer,
+                end_layer=end_layer,
             )
 
     def test_preconstruction_requirement_accepts_exact_profile(self):
@@ -118,7 +133,7 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
         self.assertTrue(enabled)
         require_registration.assert_called_once_with()
 
-    def test_preconstruction_requirement_rejects_pipeline_parallelism(self):
+    def test_preconstruction_requirement_accepts_pipeline_parallelism(self):
         fake_kt_module = SimpleNamespace(require_kt_ep_registration=lambda: None)
         with (
             patch.object(
@@ -130,10 +145,29 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
                 sys.modules,
                 {"sglang.srt.layers.moe.kt_ep_wrapper": fake_kt_module},
             ),
-            self.assertRaisesRegex(RuntimeError, "pipeline parallel size 1"),
+        ):
+            enabled = glm._require_glm47_flash_kt_ep(
+                config=self._config(), pp_size=3, prefix="model"
+            )
+
+        self.assertTrue(enabled)
+
+    def test_preconstruction_requirement_rejects_invalid_pipeline_size(self):
+        fake_kt_module = SimpleNamespace(require_kt_ep_registration=lambda: None)
+        with (
+            patch.object(
+                glm,
+                "get_server_args",
+                return_value=self._server_args(),
+            ),
+            patch.dict(
+                sys.modules,
+                {"sglang.srt.layers.moe.kt_ep_wrapper": fake_kt_module},
+            ),
+            self.assertRaisesRegex(RuntimeError, "between 1 and 47"),
         ):
             glm._require_glm47_flash_kt_ep(
-                config=self._config(), pp_size=2, prefix="model"
+                config=self._config(), pp_size=0, prefix="model"
             )
 
     def test_preconstruction_requirement_rejects_hash_layers(self):
@@ -161,6 +195,10 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
 
         self.assertEqual(receipt["gpu_expert_mask_shape"], [47, 64])
         self.assertEqual(receipt["configured_gpu_resident_experts_per_layer"], 3)
+        self.assertEqual(receipt["pipeline_parallel_rank"], 0)
+        self.assertEqual(receipt["pipeline_parallel_size"], 1)
+        self.assertEqual(receipt["pipeline_layer_start"], 0)
+        self.assertEqual(receipt["pipeline_layer_end"], 47)
         self.assertEqual(receipt["routed_layer_ids"], list(range(1, 47)))
         self.assertEqual(len(receipt["layers"]), 46)
         self.assertEqual(
@@ -172,6 +210,73 @@ class TestGlm47FlashKtEpCoverage(unittest.TestCase):
             "model.layers.46.mlp.experts",
         )
         self.assertEqual(len(receipt["gpu_expert_mask_sha256"]), 64)
+
+    def test_coverage_receipt_binds_each_pp3_stage_local_range(self):
+        stage_ranges = ((0, 16), (16, 32), (32, 47))
+        for pp_rank, (start_layer, end_layer) in enumerate(stage_ranges):
+            with self.subTest(pp_rank=pp_rank):
+                config, masks, all_layers = self._coverage_fixture()
+                layers = [
+                    layer
+                    if start_layer <= layer_id < end_layer
+                    else SimpleNamespace(layer_id=layer_id, mlp=object())
+                    for layer_id, layer in enumerate(all_layers)
+                ]
+
+                receipt = self._build_receipt(
+                    config,
+                    masks,
+                    layers,
+                    pp_rank=pp_rank,
+                    pp_size=3,
+                    start_layer=start_layer,
+                    end_layer=end_layer,
+                )
+
+                expected_layer_ids = list(range(max(start_layer, 1), end_layer))
+                self.assertEqual(receipt["pipeline_parallel_rank"], pp_rank)
+                self.assertEqual(receipt["pipeline_parallel_size"], 3)
+                self.assertEqual(receipt["pipeline_layer_start"], start_layer)
+                self.assertEqual(receipt["pipeline_layer_end"], end_layer)
+                self.assertEqual(receipt["routed_layer_ids"], expected_layer_ids)
+                self.assertEqual(
+                    [layer["layer_id"] for layer in receipt["layers"]],
+                    expected_layer_ids,
+                )
+
+    def test_coverage_rejects_routed_layer_outside_local_range(self):
+        config, masks, all_layers = self._coverage_fixture()
+        layers = [
+            layer
+            if 16 <= layer_id < 32 or layer_id == 15
+            else SimpleNamespace(layer_id=layer_id, mlp=object())
+            for layer_id, layer in enumerate(all_layers)
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "routed-layer coverage mismatch"):
+            self._build_receipt(
+                config,
+                masks,
+                layers,
+                pp_rank=1,
+                pp_size=3,
+                start_layer=16,
+                end_layer=32,
+            )
+
+    def test_coverage_rejects_invalid_local_pipeline_range(self):
+        config, masks, layers = self._coverage_fixture()
+
+        with self.assertRaisesRegex(RuntimeError, "invalid local pipeline range"):
+            self._build_receipt(
+                config,
+                masks,
+                layers,
+                pp_rank=3,
+                pp_size=3,
+                start_layer=32,
+                end_layer=47,
+            )
 
     def test_coverage_rejects_noncanonical_fused_moe_path(self):
         config, masks, layers = self._coverage_fixture()
