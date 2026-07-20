@@ -25,6 +25,7 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
@@ -45,6 +46,108 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, make_layers, print_warning_once
+
+
+def _olmoe_qk_rms_norm_local_sums(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """Return rank-local FP32 Q/K squared sums in one collective payload."""
+    if q.shape[:-1] != k.shape[:-1]:
+        raise ValueError(
+            "OLMoE Q/K RMSNorm requires matching leading dimensions, got "
+            f"{q.shape[:-1]} and {k.shape[:-1]}"
+        )
+    return torch.cat(
+        (
+            q.to(torch.float32).square().sum(dim=-1, keepdim=True),
+            k.to(torch.float32).square().sum(dim=-1, keepdim=True),
+        ),
+        dim=-1,
+    )
+
+
+def _apply_olmoe_qk_rms_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    global_sums: torch.Tensor,
+    q_global_size: int,
+    k_global_size: int,
+    q_epsilon: float,
+    k_epsilon: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Normalize rank-local Q/K shards from their globally reduced sums."""
+    expected_sums_shape = (*q.shape[:-1], 2)
+    if global_sums.shape != expected_sums_shape:
+        raise ValueError(
+            "OLMoE Q/K RMSNorm statistics shape mismatch: expected "
+            f"{expected_sums_shape}, got {tuple(global_sums.shape)}"
+        )
+    if q_weight.numel() != q.shape[-1] or k_weight.numel() != k.shape[-1]:
+        raise ValueError("OLMoE Q/K RMSNorm weight and local shard sizes disagree")
+
+    q_scale = torch.rsqrt(global_sums[..., 0:1] / q_global_size + q_epsilon)
+    k_scale = torch.rsqrt(global_sums[..., 1:2] / k_global_size + k_epsilon)
+    normalized_q = (q.to(torch.float32) * q_scale * q_weight).to(q.dtype)
+    normalized_k = (k.to(torch.float32) * k_scale * k_weight).to(k.dtype)
+    return normalized_q, normalized_k
+
+
+class OlmoeQKRMSNormTP(nn.Module):
+    """RMSNorm for one contiguous tensor-parallel Q or K projection shard."""
+
+    def __init__(self, global_size: int, eps: float = 1e-5) -> None:
+        super().__init__()
+        self.tp_world = get_parallel().tp_size
+        self.tp_rank = get_parallel().tp_rank
+        if global_size % self.tp_world != 0:
+            raise ValueError(
+                f"OLMoE RMSNorm size {global_size} is not divisible by "
+                f"tensor-parallel size {self.tp_world}"
+            )
+        self.global_size = global_size
+        self.local_size = global_size // self.tp_world
+        self.variance_epsilon = eps
+        self.weight = nn.Parameter(torch.ones(self.local_size))
+        self.weight.weight_loader = self.weight_loader
+
+    @staticmethod
+    def weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
+        """Load the contiguous checkpoint slice owned by this TP rank."""
+        tp_world = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
+        expected_global_size = param.numel() * tp_world
+        if tuple(loaded_weight.shape) != (expected_global_size,):
+            raise ValueError(
+                "OLMoE RMSNorm checkpoint shape mismatch: expected "
+                f"{(expected_global_size,)}, got {tuple(loaded_weight.shape)}"
+            )
+        shard_start = tp_rank * param.numel()
+        param.data.copy_(loaded_weight[shard_start : shard_start + param.numel()])
+
+    @staticmethod
+    def forward_qk(
+        q_norm: "OlmoeQKRMSNormTP",
+        k_norm: "OlmoeQKRMSNormTP",
+        q: torch.Tensor,
+        k: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Normalize both local shards with one fused TP all-reduce."""
+        if q_norm.tp_world != k_norm.tp_world:
+            raise ValueError("OLMoE Q/K RMSNorm tensor-parallel sizes disagree")
+        global_sums = _olmoe_qk_rms_norm_local_sums(q, k)
+        if q_norm.tp_world > 1:
+            global_sums = tensor_model_parallel_all_reduce(global_sums)
+        return _apply_olmoe_qk_rms_norm(
+            q,
+            k,
+            q_norm.weight,
+            k_norm.weight,
+            global_sums,
+            q_norm.global_size,
+            k_norm.global_size,
+            q_norm.variance_epsilon,
+            k_norm.variance_epsilon,
+        )
 
 
 class OlmoeMoE(nn.Module):
@@ -107,7 +210,6 @@ class OlmoeMoE(nn.Module):
 
 
 class OlmoeAttention(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -123,6 +225,7 @@ class OlmoeAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         tp_size = get_parallel().tp_size
+        self.tp_size = tp_size
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -152,8 +255,18 @@ class OlmoeAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("qkv_proj", prefix),
         )
-        self.q_norm = RMSNorm(hidden_size, eps=1e-5)
-        self.k_norm = RMSNorm(hidden_size, eps=1e-5)
+        q_norm_size = self.total_num_heads * self.head_dim
+        k_norm_size = self.total_num_kv_heads * self.head_dim
+        if tp_size == 1:
+            self.q_norm = RMSNorm(q_norm_size, eps=1e-5)
+            self.k_norm = RMSNorm(k_norm_size, eps=1e-5)
+        else:
+            if self.total_num_kv_heads < tp_size:
+                raise ValueError(
+                    "OLMoE TP Q/K RMSNorm does not support replicated KV heads"
+                )
+            self.q_norm = OlmoeQKRMSNormTP(q_norm_size, eps=1e-5)
+            self.k_norm = OlmoeQKRMSNormTP(k_norm_size, eps=1e-5)
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -188,7 +301,11 @@ class OlmoeAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.q_norm(q.contiguous()), self.k_norm(k.contiguous())
+        q, k = q.contiguous(), k.contiguous()
+        if self.tp_size == 1:
+            q, k = self.q_norm(q), self.k_norm(k)
+        else:
+            q, k = OlmoeQKRMSNormTP.forward_qk(self.q_norm, self.k_norm, q, k)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
@@ -196,7 +313,6 @@ class OlmoeAttention(nn.Module):
 
 
 class OlmoeDecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -261,7 +377,6 @@ class OlmoeDecoderLayer(nn.Module):
 
 
 class OlmoeModel(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -311,7 +426,6 @@ class OlmoeModel(nn.Module):
 
 
 class OlmoeForCausalLM(nn.Module):
-
     fall_back_to_pt_during_load = False
 
     def __init__(
