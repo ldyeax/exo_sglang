@@ -26,9 +26,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.kernels.ops.attention.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
@@ -104,6 +101,11 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.small_ep import (
+    SmallEPContractError,
+    select_small_ep_model_forward,
+    small_ep_forward_scope,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -208,6 +210,8 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from torch import nn
+from transformers import PretrainedConfig
 
 if _use_aiter:
     from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
@@ -955,6 +959,7 @@ class DeepseekV2MoE(nn.Module):
                     input_ids,
                     input_ids_global=input_ids_global,
                     skip_shared_experts=skip_shared_experts,
+                    forward_batch=forward_batch,
                 )
         else:
             return self.forward_deepep(
@@ -1111,6 +1116,7 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1208,16 +1214,48 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        if pre_quant_input is not None:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
-                pre_quant_input=pre_quant_input,
+        kt_wrapper_present = isinstance(
+            self.experts.quant_method,
+            KTEPWrapperMethod,
+        )
+        if kt_wrapper_present:
+            server_args = get_server_args()
+            architecture = (getattr(self.config, "architectures", None) or ("",))[0]
+            small_ep_selected = select_small_ep_model_forward(
+                enabled=server_args.kt_stream_prefill_small_ep,
+                architecture=architecture,
+                kt_wrapper_present=True,
+                context_parallel_extend=(
+                    forward_batch is not None
+                    and dsa_use_prefill_cp(
+                        forward_batch,
+                        self.dsa_enable_prefill_cp,
+                    )
+                ),
+                num_tokens=int(hidden_states.shape[0]),
+                token_threshold=int(
+                    server_args.kt_gpu_prefill_token_threshold or 0
+                ),
             )
         else:
-            final_hidden_states = self.experts(
-                hidden_states,
-                topk_output,
+            small_ep_selected = False
+
+        with small_ep_forward_scope(small_ep_selected) as small_ep_state:
+            if pre_quant_input is not None:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                    pre_quant_input=pre_quant_input,
+                )
+            else:
+                final_hidden_states = self.experts(
+                    hidden_states,
+                    topk_output,
+                )
+        if small_ep_state.partial_produced and not get_forward().mlp_reduce_scatter:
+            raise SmallEPContractError(
+                "SmallEP local partial requires the DSA context-parallel "
+                "reduce-scatter postprocess"
             )
         if routed_timing is not None:
             routed_timing.__exit__(None, None, None)

@@ -1179,6 +1179,7 @@ class KTConfig:
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
     stream_prefill: bool = False
+    stream_prefill_small_ep: bool = False
     stream_prefill_experts_per_chunk: int = 4
     stream_prefill_ring_slots: int = 2
     stream_prefill_safety_margin_mb: int = 512
@@ -1595,11 +1596,18 @@ class SharedFullContext:
         global_num_experts: int,
         moe_runner_config: "MoeRunnerConfig",
         host_buffer_experts: int = 2,
+        local_complete_experts: bool = False,
     ):
         if host_buffer_experts < 2:
             raise ValueError("host_buffer_experts must be at least 2")
         self.host_buffer_experts = host_buffer_experts
-        self._build_layers(layer, init_args, global_num_experts, moe_runner_config)
+        self._build_layers(
+            layer,
+            init_args,
+            global_num_experts,
+            moe_runner_config,
+            local_complete_experts,
+        )
 
         # Capture original tensors to support restoration before loading
         self.original_params = {
@@ -1630,7 +1638,14 @@ class SharedFullContext:
         self._w13_scale_mxfp8_param = layer.w13_weight_scale_inv
         self._w2_scale_mxfp8_param = layer.w2_weight_scale_inv
 
-    def _build_layers(self, layer, init_args, global_num_experts, moe_runner_config):
+    def _build_layers(
+        self,
+        layer,
+        init_args,
+        global_num_experts,
+        moe_runner_config,
+        local_complete_experts,
+    ):
         from sglang.srt.layers.moe.fused_moe_triton.layer import (
             UnquantizedFusedMoEMethod,
         )
@@ -1649,6 +1664,12 @@ class SharedFullContext:
         self.gpu_layer.num_experts = global_num_experts
         self.gpu_layer.num_local_experts = global_num_experts
         self.gpu_layer.num_gpu_experts = global_num_experts
+        self.gpu_layer.intermediate_size_per_partition = (
+            intermediate_size_per_partition
+        )
+        if local_complete_experts:
+            self.gpu_layer.moe_tp_size = 1
+            self.gpu_layer.moe_tp_rank = 0
 
         # Create quant_method for gpu_layer
         if self.gpu_layer.quant_config is not None:
@@ -4362,6 +4383,9 @@ def create_kt_config_from_server_args(
         ),
         gpu_prefill_token_threshold=gpu_prefill_token_threshold,
         stream_prefill=getattr(server_args, "kt_stream_prefill", False),
+        stream_prefill_small_ep=getattr(
+            server_args, "kt_stream_prefill_small_ep", False
+        ),
         stream_prefill_experts_per_chunk=getattr(
             server_args, "kt_stream_prefill_experts_per_chunk", 4
         ),
@@ -6818,6 +6842,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             plan = collectively_admit_kt_stream_prefill(
                 KTStreamPrefillConfig(
                     enabled=True,
+                    small_ep_enabled=self.kt_config.stream_prefill_small_ep,
                     experts_per_chunk=(
                         self.kt_config.stream_prefill_experts_per_chunk
                     ),
@@ -6853,6 +6878,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     ),
                     parameter_dtype=parameter_dtype,
                     available_device_bytes=free_device_bytes,
+                    attention_context_parallel_size=get_parallel().attn_cp_size,
+                    dsa_prefill_context_parallel=(
+                        server_args.enable_dsa_prefill_context_parallel
+                    ),
+                    moe_a2a_backend=server_args.moe_a2a_backend,
+                    expert_parallel_size=get_parallel().moe_ep_size,
+                    moe_tensor_parallel_size=get_parallel().moe_tp_size,
                 ),
             )
             executor = get_or_create_kt_stream_prefill_executor(

@@ -46,6 +46,11 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_tp_group,
 )
+from sglang.srt.layers.moe.small_ep import (
+    SmallEPLayout,
+    mark_small_ep_partial_produced,
+    require_small_ep_forward_scope,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.kt_ep_wrapper import (
@@ -93,6 +98,7 @@ class KTStreamPrefillConfig:
     """User-controlled bounded-ring settings."""
 
     enabled: bool = False
+    small_ep_enabled: bool = False
     experts_per_chunk: int = 4
     ring_slots: int = 2
     safety_margin_bytes: int = _DEFAULT_SAFETY_MARGIN_BYTES
@@ -119,15 +125,22 @@ class KTStreamPrefillFacts:
     moe_intermediate_size: int
     parameter_dtype: torch.dtype
     available_device_bytes: int
+    attention_context_parallel_size: int = 1
+    dsa_prefill_context_parallel: bool = False
+    moe_a2a_backend: str = "none"
+    expert_parallel_size: int = 1
+    moe_tensor_parallel_size: int = 2
 
 
 @dataclass(frozen=True)
 class KTStreamPrefillPlan:
     """Admitted immutable execution and memory plan."""
 
+    small_ep_enabled: bool
     experts_per_chunk: int
     ring_slots: int
     num_experts: int
+    local_num_experts: int
     top_k: int
     hidden_size: int
     moe_intermediate_size: int
@@ -139,7 +152,19 @@ class KTStreamPrefillPlan:
 
     @property
     def chunks_per_layer(self) -> int:
-        return self.num_experts // self.experts_per_chunk
+        return self.local_num_experts // self.experts_per_chunk
+
+    def owned_experts(self, rank: int) -> tuple[int, ...]:
+        if not self.small_ep_enabled:
+            if rank < 0 or rank >= self.tensor_parallel_size:
+                raise KTStreamPrefillAdmissionError(
+                    f"stream-prefill rank must be in [0,{self.tensor_parallel_size})"
+                )
+            return tuple(range(self.num_experts))
+        return SmallEPLayout.contiguous(
+            self.num_experts,
+            self.tensor_parallel_size,
+        ).owned_experts(rank)
 
 
 def admit_kt_stream_prefill(
@@ -167,6 +192,29 @@ def admit_kt_stream_prefill(
         failures.append(
             f"tensor parallel size must be 2, got {facts.tensor_parallel_size}"
         )
+    if config.small_ep_enabled:
+        if not facts.dsa_prefill_context_parallel:
+            failures.append("SmallEP requires DSA prefill context parallelism")
+        if facts.attention_context_parallel_size != 2:
+            failures.append(
+                "SmallEP attention context-parallel size must be 2, got "
+                f"{facts.attention_context_parallel_size}"
+            )
+        if facts.moe_a2a_backend != "none":
+            failures.append(
+                "SmallEP owns its expert exchange and requires MoE A2A backend "
+                f"'none', got {facts.moe_a2a_backend!r}"
+            )
+        if facts.expert_parallel_size != 1:
+            failures.append(
+                "SmallEP requires SGLang expert parallel size 1, got "
+                f"{facts.expert_parallel_size}"
+            )
+        if facts.moe_tensor_parallel_size != 2:
+            failures.append(
+                "SmallEP requires the original two-way MoE TP checkpoint layout, got "
+                f"{facts.moe_tensor_parallel_size}"
+            )
     if facts.threadpool_count != facts.tensor_parallel_size:
         failures.append(
             "KT threadpool count must equal tensor parallel size "
@@ -192,7 +240,9 @@ def admit_kt_stream_prefill(
     if facts.dynamic_expert_update:
         failures.append("dynamic expert update is incompatible with the reusable ring")
     if facts.expert_lora_enabled:
-        failures.append("KT expert LoRA is not admitted by the first stream-prefill path")
+        failures.append(
+            "KT expert LoRA is not admitted by the first stream-prefill path"
+        )
     if facts.prefill_token_threshold <= 0:
         failures.append(
             "--kt-gpu-prefill-token-threshold must be positive when "
@@ -203,7 +253,9 @@ def admit_kt_stream_prefill(
             f"temporary GPU experts must be BF16, got {facts.parameter_dtype}"
         )
     if facts.num_experts != 256:
-        failures.append(f"GLM-5.2 must expose 256 routed experts, got {facts.num_experts}")
+        failures.append(
+            f"GLM-5.2 must expose 256 routed experts, got {facts.num_experts}"
+        )
     if facts.top_k != 8:
         failures.append(f"GLM-5.2 must route top-8 experts, got top-{facts.top_k}")
     if facts.hidden_size != 6144:
@@ -220,9 +272,7 @@ def admit_kt_stream_prefill(
     if config.experts_per_chunk <= 0:
         failures.append("experts per chunk must be positive")
     elif config.experts_per_chunk > 16:
-        failures.append(
-            "experts per chunk must not exceed 16 on a 24 GiB RTX 3090"
-        )
+        failures.append("experts per chunk must not exceed 16 on a 24 GiB RTX 3090")
     elif config.experts_per_chunk & (config.experts_per_chunk - 1):
         failures.append("experts per chunk must be a power of two")
     elif facts.num_experts % config.experts_per_chunk != 0:
@@ -238,25 +288,26 @@ def admit_kt_stream_prefill(
             "KT stream-prefill admission failed: " + "; ".join(failures)
         )
 
-    intermediate_per_rank = (
-        facts.moe_intermediate_size // facts.tensor_parallel_size
-    )
-    if intermediate_per_rank * facts.tensor_parallel_size != facts.moe_intermediate_size:
+    intermediate_per_rank = facts.moe_intermediate_size
+    if not config.small_ep_enabled:
+        intermediate_per_rank //= facts.tensor_parallel_size
+    if (
+        not config.small_ep_enabled
+        and intermediate_per_rank * facts.tensor_parallel_size
+        != facts.moe_intermediate_size
+    ):
         raise KTStreamPrefillAdmissionError(
             "KT stream-prefill requires an even intermediate-size TP partition"
         )
 
-    # Per rank: gate [I/TP,H] + up [I/TP,H] + down [H,I/TP].
+    # Plain SLP loads one intermediate TP shard on each rank.  SmallEP assigns
+    # complete experts, so each owner loads both source shards into one full-I
+    # shadow expert before the context-parallel reduce-scatter.
     per_expert_device_bytes = (
-        3
-        * facts.hidden_size
-        * intermediate_per_rank
-        * _BF16_BYTES
+        3 * facts.hidden_size * intermediate_per_rank * _BF16_BYTES
     )
     device_ring_bytes = (
-        per_expert_device_bytes
-        * config.experts_per_chunk
-        * config.ring_slots
+        per_expert_device_bytes * config.experts_per_chunk * config.ring_slots
     )
     required_device_bytes = device_ring_bytes + config.safety_margin_bytes
     if facts.available_device_bytes < required_device_bytes:
@@ -268,9 +319,15 @@ def admit_kt_stream_prefill(
         )
 
     return KTStreamPrefillPlan(
+        small_ep_enabled=config.small_ep_enabled,
         experts_per_chunk=config.experts_per_chunk,
         ring_slots=config.ring_slots,
         num_experts=facts.num_experts,
+        local_num_experts=(
+            facts.num_experts // facts.tensor_parallel_size
+            if config.small_ep_enabled
+            else facts.num_experts
+        ),
         top_k=facts.top_k,
         hidden_size=facts.hidden_size,
         moe_intermediate_size=facts.moe_intermediate_size,
@@ -299,8 +356,7 @@ def collectively_admit_kt_stream_prefill(
 
     if dist.is_initialized() and get_tensor_model_parallel_world_size() > 1:
         errors: list[Optional[str]] = [
-            None
-            for _ in range(get_tensor_model_parallel_world_size())
+            None for _ in range(get_tensor_model_parallel_world_size())
         ]
         dist.all_gather_object(
             errors,
@@ -314,8 +370,7 @@ def collectively_admit_kt_stream_prefill(
         ]
         if failures:
             raise KTStreamPrefillAdmissionError(
-                "collective KT stream-prefill admission failed: "
-                + " | ".join(failures)
+                "collective KT stream-prefill admission failed: " + " | ".join(failures)
             )
     elif local_error is not None:
         raise KTStreamPrefillAdmissionError(local_error)
@@ -457,15 +512,21 @@ class KTStreamPrefillExecutor:
 
         self.plan = plan
         self._device = next(layer.parameters()).device
-        self._ring = ReusableAsyncRing[
-            tuple[int, ...], _LoadedExpertChunk, None
-        ](plan.ring_slots)
+        self._ring = ReusableAsyncRing[tuple[int, ...], _LoadedExpertChunk, None](
+            plan.ring_slots
+        )
         self._slots: list[_CudaRingSlot] = []
 
         init_args = owner._full_init_args
         if init_args is None:
             raise KTStreamPrefillAdmissionError(
                 "KT stream-prefill cannot allocate before MoE weights are created"
+            )
+        if plan.small_ep_enabled:
+            init_args = (
+                init_args[0],
+                plan.moe_intermediate_size,
+                init_args[2],
             )
         for _ in range(plan.ring_slots):
             context = SharedFullContext(
@@ -474,6 +535,7 @@ class KTStreamPrefillExecutor:
                 global_num_experts=plan.experts_per_chunk,
                 moe_runner_config=owner.moe_runner_config,
                 host_buffer_experts=plan.experts_per_chunk,
+                local_complete_experts=plan.small_ep_enabled,
             )
             if not getattr(context, "is_bf16_quant", False):
                 raise KTStreamPrefillAdmissionError(
@@ -490,8 +552,9 @@ class KTStreamPrefillExecutor:
             )
 
         logger.info(
-            "KT stream-prefill admitted: experts_per_chunk=%d ring_slots=%d "
+            "KT stream-prefill admitted: small_ep=%s experts_per_chunk=%d ring_slots=%d "
             "chunks_per_layer=%d device_ring=%.2f MiB pinned_host_per_rank=%.2f MiB",
+            plan.small_ep_enabled,
             plan.experts_per_chunk,
             plan.ring_slots,
             plan.chunks_per_layer,
@@ -537,6 +600,21 @@ class KTStreamPrefillExecutor:
         tp_world_size = get_tensor_model_parallel_world_size()
         rank_zero_error: Optional[BaseException] = None
 
+        requested_chunks: list[tuple[int, ...]]
+        if self.plan.small_ep_enabled:
+            if not dist.is_initialized() or tp_world_size != 2:
+                raise RuntimeError(
+                    "SmallEP stream loading requires an initialized two-rank TP group"
+                )
+            requested_chunks = [tuple() for _ in range(tp_world_size)]
+            dist.all_gather_object(
+                requested_chunks,
+                logical_expert_ids,
+                group=get_tp_group().cpu_group,
+            )
+        else:
+            requested_chunks = [logical_expert_ids for _ in range(tp_world_size)]
+
         if tp_rank == 0:
             try:
                 if source_wrapper is None:
@@ -547,25 +625,62 @@ class KTStreamPrefillExecutor:
                 w2_cpu = context.cpu_buffers["w2_weight"]
                 w13_expert_bytes = w13_cpu[0].numel() * w13_cpu.element_size()
                 w2_expert_bytes = w2_cpu[0].numel() * w2_cpu.element_size()
-                for destination_index, logical_expert_id in enumerate(
-                    logical_expert_ids
-                ):
-                    w13_pointers = [
-                        pointer + destination_index * w13_expert_bytes
-                        for pointer in context.all_rank_buffer_ptrs["w13_weight"]
-                    ]
-                    w2_pointers = [
-                        pointer + destination_index * w2_expert_bytes
-                        for pointer in context.all_rank_buffer_ptrs["w2_weight"]
-                    ]
-                    source_wrapper.submit_write_weight_scale_to_buffer(
-                        tp_world_size,
-                        logical_expert_id,
-                        w13_pointers,
-                        [0] * tp_world_size,
-                        w2_pointers,
-                        [0] * tp_world_size,
-                    )
+                if self.plan.small_ep_enabled:
+                    for destination_rank, destination_experts in enumerate(
+                        requested_chunks
+                    ):
+                        if len(destination_experts) != len(logical_expert_ids):
+                            raise RuntimeError(
+                                "SmallEP ranks requested different stream chunk sizes: "
+                                f"rank0={len(logical_expert_ids)}, "
+                                f"rank{destination_rank}={len(destination_experts)}"
+                            )
+                        for destination_index, logical_expert_id in enumerate(
+                            destination_experts
+                        ):
+                            w13_pointer = (
+                                context.all_rank_buffer_ptrs["w13_weight"][
+                                    destination_rank
+                                ]
+                                + destination_index * w13_expert_bytes
+                            )
+                            w2_pointer = (
+                                context.all_rank_buffer_ptrs["w2_weight"][
+                                    destination_rank
+                                ]
+                                + destination_index * w2_expert_bytes
+                            )
+                            # A one-way export materializes both source TP
+                            # shards into the complete expert owned by this
+                            # destination rank.
+                            source_wrapper.submit_write_weight_scale_to_buffer(
+                                1,
+                                logical_expert_id,
+                                [w13_pointer],
+                                [0],
+                                [w2_pointer],
+                                [0],
+                            )
+                else:
+                    for destination_index, logical_expert_id in enumerate(
+                        logical_expert_ids
+                    ):
+                        w13_pointers = [
+                            pointer + destination_index * w13_expert_bytes
+                            for pointer in context.all_rank_buffer_ptrs["w13_weight"]
+                        ]
+                        w2_pointers = [
+                            pointer + destination_index * w2_expert_bytes
+                            for pointer in context.all_rank_buffer_ptrs["w2_weight"]
+                        ]
+                        source_wrapper.submit_write_weight_scale_to_buffer(
+                            tp_world_size,
+                            logical_expert_id,
+                            w13_pointers,
+                            [0] * tp_world_size,
+                            w2_pointers,
+                            [0] * tp_world_size,
+                        )
                 source_wrapper.sync_write_weight_scale_to_buffer()
             except BaseException as error:
                 rank_zero_error = error
@@ -608,9 +723,7 @@ class KTStreamPrefillExecutor:
 
         topk_output = dispatch_output.topk_output
         if not TopKOutputChecker.format_is_standard(topk_output):
-            raise RuntimeError(
-                "KT stream-prefill requires StandardTopKOutput routing"
-            )
+            raise RuntimeError("KT stream-prefill requires StandardTopKOutput routing")
         logical_to_slot = torch.full(
             (self.plan.num_experts,),
             -1,
@@ -650,17 +763,12 @@ class KTStreamPrefillExecutor:
     ) -> "CombineInput":
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        if self.plan.small_ep_enabled:
+            require_small_ep_forward_scope()
         chunks = tuple(
-            tuple(
-                range(
-                    start,
-                    min(start + self.plan.experts_per_chunk, self.plan.num_experts),
-                )
-            )
-            for start in range(
-                0,
-                self.plan.num_experts,
-                self.plan.experts_per_chunk,
+            iter_rank_expert_chunks(
+                self.plan,
+                get_tensor_model_parallel_rank(),
             )
         )
         source_wrapper = owner.wrapper
@@ -686,6 +794,8 @@ class KTStreamPrefillExecutor:
                 ),
                 compute=compute_and_accumulate,
             )
+            if self.plan.small_ep_enabled:
+                mark_small_ep_partial_produced()
             return StandardCombineInput(hidden_states=output)
         except BaseException:
             # Fail closed: a model-process restart is preferable to reusing a
@@ -737,3 +847,14 @@ def iter_expert_chunks(
         raise ValueError("num_experts and experts_per_chunk must be positive")
     for start in range(0, num_experts, experts_per_chunk):
         yield tuple(range(start, min(start + experts_per_chunk, num_experts)))
+
+
+def iter_rank_expert_chunks(
+    plan: KTStreamPrefillPlan,
+    rank: int,
+) -> Iterable[tuple[int, ...]]:
+    """Yield the exact expert ownership subset streamed by one rank."""
+
+    owned = plan.owned_experts(rank)
+    for start in range(0, len(owned), plan.experts_per_chunk):
+        yield owned[start : start + plan.experts_per_chunk]

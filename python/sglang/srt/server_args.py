@@ -2941,6 +2941,15 @@ class ServerArgs:
         "[experimental ktransformers parameter] Use a bounded BF16 expert-chunk ring for long-prefill GPU fallback.",
         NS("exec.moe"),
     ] = False
+    kt_stream_prefill_small_ep: A[
+        bool,
+        (
+            "[experimental ktransformers parameter] Use GLM-5.2's two-rank "
+            "SmallEP stream-prefill path with DSA context-parallel attention, "
+            "disjoint complete-expert ownership, and reduce-scatter."
+        ),
+        NS("exec.moe"),
+    ] = False
     kt_stream_prefill_experts_per_chunk: A[
         int,
         "[experimental ktransformers parameter] Experts held in each stream-prefill ring slot.",
@@ -8609,6 +8618,10 @@ class ServerArgs:
             )
 
     def _check_kt_stream_prefill(self) -> None:
+        if self.kt_stream_prefill_small_ep and not self.kt_stream_prefill:
+            raise ValueError(
+                "--kt-stream-prefill-small-ep requires --kt-stream-prefill"
+            )
         if not self.kt_stream_prefill:
             return
 
@@ -8667,6 +8680,42 @@ class ServerArgs:
             errors.append(
                 "--kt-stream-prefill-safety-margin-mb must be non-negative"
             )
+
+        if self.kt_stream_prefill_small_ep:
+            hf_config = self.get_model_config().hf_config
+            if hasattr(hf_config, "text_config"):
+                hf_config = hf_config.text_config
+            architectures = getattr(hf_config, "architectures", None) or ()
+            architecture = architectures[0] if architectures else ""
+            resolved = self._resolved()
+            if architecture != "GlmMoeDsaForCausalLM":
+                errors.append(
+                    "--kt-stream-prefill-small-ep requires GlmMoeDsaForCausalLM"
+                )
+            if not self.enable_dsa_prefill_context_parallel:
+                errors.append(
+                    "--kt-stream-prefill-small-ep requires "
+                    "--enable-dsa-prefill-context-parallel"
+                )
+            if resolved.attn_cp_size != 2:
+                errors.append(
+                    "--kt-stream-prefill-small-ep requires "
+                    "--attention-context-parallel-size 2"
+                )
+            if self.dsa_prefill_cp_mode != "round-robin-split":
+                errors.append(
+                    "--kt-stream-prefill-small-ep first supports only "
+                    "--dsa-prefill-cp-mode round-robin-split"
+                )
+            if self.moe_a2a_backend != "none":
+                errors.append(
+                    "--kt-stream-prefill-small-ep requires --moe-a2a-backend none"
+                )
+            if resolved.ep_size != 1 or self.moe_dp_size != 1:
+                errors.append(
+                    "--kt-stream-prefill-small-ep requires expert and "
+                    "MoE data parallel sizes of 1"
+                )
 
         incompatible_environment = (
             "SGLANG_KT_REMOTE_EXPERT_ENDPOINT",
