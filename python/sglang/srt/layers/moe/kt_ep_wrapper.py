@@ -54,6 +54,10 @@ from sglang.srt.layers.moe.quant_method_registry import (
     register_moe_quant_wrapper,
     require_moe_quant_wrapper_registered,
 )
+from sglang.srt.layers.moe.kt_stream_prefill_contract import (
+    SharedFullContextHostBufferMode,
+    validate_shared_full_context_host_buffer,
+)
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
 from sglang.srt.utils import get_compiler_backend, is_cuda
@@ -517,10 +521,15 @@ class SharedFullContext:
         moe_runner_config: "MoeRunnerConfig",
         host_buffer_experts: int = 2,
         local_complete_experts: bool = False,
+        host_buffer_mode: "SharedFullContextHostBufferMode" = "legacy_double_buffer",
     ):
-        if host_buffer_experts < 2:
-            raise ValueError("host_buffer_experts must be at least 2")
+        validate_shared_full_context_host_buffer(
+            host_buffer_experts=host_buffer_experts,
+            global_num_experts=global_num_experts,
+            host_buffer_mode=host_buffer_mode,
+        )
         self.host_buffer_experts = host_buffer_experts
+        self.host_buffer_mode = host_buffer_mode
         self._build_layers(
             layer,
             init_args,

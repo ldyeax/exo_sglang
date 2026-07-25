@@ -545,6 +545,7 @@ class KTStreamPrefillExecutor:
                 moe_runner_config=owner.moe_runner_config,
                 host_buffer_experts=plan.experts_per_chunk,
                 local_complete_experts=plan.small_ep_enabled,
+                host_buffer_mode="stream_prefill_ring_slot",
             )
             if not getattr(context, "is_bf16_quant", False):
                 raise KTStreamPrefillAdmissionError(
