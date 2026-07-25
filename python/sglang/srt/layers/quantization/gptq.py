@@ -73,6 +73,8 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 ScalarType, scalar_types = get_scalar_types()
 
+_EXO_MLA_KV_B_W8_CONFIG_KEY = "exo_mla_kv_b_w8"
+
 
 def check_marlin_format(hf_quant_cfg: Dict[str, Any]) -> bool:
     # compat: gptqmodel and autogptq (eol) main use checkpoint_format: str
@@ -209,6 +211,12 @@ class GPTQConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> GPTQConfig:
+        if config.get(_EXO_MLA_KV_B_W8_CONFIG_KEY) is not None:
+            raise ValueError(
+                "The compact Exo MLA kv_b W8 checkpoint cannot use the plain "
+                "GPTQ loader. Use automatic quantization selection or "
+                "--quantization gptq_marlin."
+            )
         dynamic = cls.get_from_keys_or(config, ["dynamic"], default={})
         dynamic = {} if dynamic is None else dynamic
 
@@ -372,6 +380,14 @@ class GPTQMarlinConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(cls, hf_quant_cfg, user_quant) -> Optional[str]:
+        if (
+            hf_quant_cfg.get(_EXO_MLA_KV_B_W8_CONFIG_KEY) is not None
+            and user_quant == "gptq"
+        ):
+            raise ValueError(
+                "The compact Exo MLA kv_b W8 checkpoint cannot use explicit "
+                "--quantization gptq. Omit the option or select gptq_marlin."
+            )
         is_marlin_format = check_marlin_format(hf_quant_cfg)
 
         can_convert = cls.is_gptq_marlin_compatible(hf_quant_cfg)
@@ -402,8 +418,25 @@ class GPTQMarlinConfig(QuantizationConfig):
     ) -> Optional[QuantizeMethodBase]:
         # Delay the import to avoid circular dependency
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+        from sglang.srt.layers.quantization.utils import get_dynamic_override
+
+        mla_kv_b_format = self.full_config.get(_EXO_MLA_KV_B_W8_CONFIG_KEY)
+        if mla_kv_b_format is not None and prefix.endswith(".kv_b_proj"):
+            if not isinstance(mla_kv_b_format, dict):
+                raise ValueError(f"{_EXO_MLA_KV_B_W8_CONFIG_KEY} must be a JSON object")
+            from sglang.srt.layers.quantization.mla_kv_b_w8 import (
+                GPTQMLAKVW8Method,
+            )
+
+            return GPTQMLAKVW8Method(self, mla_kv_b_format)
 
         if isinstance(layer, FusedMoE):
+            if get_dynamic_override(self, layer_name=prefix) is False:
+                from sglang.srt.layers.quantization.unquant import (
+                    UnquantizedFusedMoEMethod,
+                )
+
+                return UnquantizedFusedMoEMethod()
             return GPTQMarlinMoEMethod(self)
         return get_linear_quant_method(self, layer, prefix, GPTQMarlinLinearMethod)
 

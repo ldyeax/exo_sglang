@@ -216,6 +216,19 @@ else:
 
 logger = logging.getLogger(__name__)
 
+_PACKED_LINEAR_QUANTIZATION_METHODS = frozenset(
+    {"awq", "awq_marlin", "gptq", "gptq_marlin", "moe_wna16"}
+)
+
+
+def _uses_packed_linear_weights(layer: nn.Module) -> bool:
+    quant_method = getattr(layer, "quant_method", None)
+    quant_config = getattr(quant_method, "quant_config", None)
+    return (
+        quant_config is not None
+        and quant_config.get_name() in _PACKED_LINEAR_QUANTIZATION_METHODS
+    )
+
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
@@ -565,14 +578,8 @@ class DeepseekV2MoE(nn.Module):
                     else {}
                 ),
             )
-            is_packed_weight = (
-                hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
-                and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
-                in {
-                    "awq",
-                    "awq_marlin",
-                    "moe_wna16",
-                }
+            is_packed_weight = _uses_packed_linear_weights(
+                self.shared_experts.gate_up_proj
             )
             self.shared_experts_is_int8 = (
                 not is_packed_weight
@@ -1721,11 +1728,8 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 weight_names=["w_kc", "w_vc"], transpose_dims=[[1, 2], [1, 2]]
             )
 
-        is_packed_weight = (
-            has_fused_proj
-            and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
-            and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+        is_packed_weight = has_fused_proj and _uses_packed_linear_weights(
+            self.fused_qkv_a_proj_with_mqa
         )
         self.use_min_latency_fused_a_gemm = (
             has_fused_proj
@@ -1766,6 +1770,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         self.init_mha_forward()
 
+    def _get_mla_kv_b_w8_method(self):
+        quant_method = getattr(self.kv_b_proj, "quant_method", None)
+        if getattr(quant_method, "is_mla_kv_b_w8", False):
+            return quant_method
+        return None
+
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
     ) -> AttnForwardMethod:
@@ -1786,7 +1796,19 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         self.current_attention_backend = attention_backend
 
         handler = AttentionBackendRegistry.get_handler(attention_backend)
-        return handler(self, forward_batch)
+        attn_forward_method = handler(self, forward_batch)
+        # The compact layout has no ordinary Linear orientation.  Fail closed
+        # on MHA and fused-RoPE variants; Ampere must stay on plain absorbed MLA.
+        if (
+            self._get_mla_kv_b_w8_method() is not None
+            and attn_forward_method != AttnForwardMethod.MLA
+        ):
+            raise RuntimeError(
+                "compact MLA kv_b W8 requires the absorbed MLA attention "
+                f"path, but backend {attention_backend!r} selected "
+                f"{attn_forward_method}"
+            )
+        return attn_forward_method
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
@@ -2106,7 +2128,10 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self.use_deep_gemm_bmm:
+        mla_kv_b_w8_method = self._get_mla_kv_b_w8_method()
+        if mla_kv_b_w8_method is not None:
+            q_nope_out = mla_kv_b_w8_method.apply_mla_k(self.kv_b_proj, q_nope)
+        elif self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             )
@@ -2283,7 +2308,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        if self.use_deep_gemm_bmm:
+        mla_kv_b_w8_method = self._get_mla_kv_b_w8_method()
+        if mla_kv_b_w8_method is not None:
+            attn_bmm_output = mla_kv_b_w8_method.apply_mla_v(
+                self.kv_b_proj, attn_output
+            )
+        elif self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(
                     attn_output.transpose(0, 1)
@@ -2429,7 +2459,10 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
             latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
-        if _is_hip:
+        mla_kv_b_w8_method = self._get_mla_kv_b_w8_method()
+        if mla_kv_b_w8_method is not None:
+            q_nope_out = mla_kv_b_w8_method.apply_mla_k(self.kv_b_proj, q_nope)
+        elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
             q_nope_out = torch.bmm(
                 q_nope.to(torch.bfloat16).transpose(0, 1),
@@ -2614,7 +2647,12 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        if _is_hip:
+        mla_kv_b_w8_method = self._get_mla_kv_b_w8_method()
+        if mla_kv_b_w8_method is not None:
+            attn_bmm_output = mla_kv_b_w8_method.apply_mla_v_bmm(
+                self.kv_b_proj, attn_output
+            )
+        elif _is_hip:
             # TODO(haishaw): add bmm_fp8 to ROCm
             attn_bmm_output = torch.bmm(
                 attn_output.to(torch.bfloat16).transpose(0, 1),

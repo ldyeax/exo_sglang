@@ -67,6 +67,43 @@ logger = logging.getLogger(__name__)
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 
+def _fuse_qkv_a_projection_tensors(
+    q_a_proj_weight: torch.Tensor,
+    kv_a_proj_weight: torch.Tensor,
+    *,
+    q_a_proj_name: str,
+    kv_a_proj_name: str,
+    cat_dim: int,
+) -> torch.Tensor:
+    """Fuse one matching q_a/kv_a checkpoint tensor pair."""
+
+    q_a_suffix = q_a_proj_name.rsplit(".", maxsplit=1)[-1]
+    kv_a_suffix = kv_a_proj_name.rsplit(".", maxsplit=1)[-1]
+    if q_a_suffix != kv_a_suffix:
+        raise ValueError(
+            "cannot fuse q_a_proj and kv_a_proj_with_mqa tensors with "
+            f"different suffixes: {q_a_proj_name}, {kv_a_proj_name}"
+        )
+    if q_a_suffix == "g_idx":
+        if (
+            q_a_proj_weight.shape != kv_a_proj_weight.shape
+            or q_a_proj_weight.dtype != kv_a_proj_weight.dtype
+            or not torch.equal(q_a_proj_weight, kv_a_proj_weight)
+        ):
+            raise ValueError(
+                "cannot fuse q_a_proj and kv_a_proj_with_mqa with different "
+                f"GPTQ g_idx tensors: {q_a_proj_name}, {kv_a_proj_name}"
+            )
+        # Both projections share the fused layer's input axis, so it has
+        # exactly one g_idx rather than a concatenation along the output axis.
+        return q_a_proj_weight
+    if q_a_proj_weight.shape == torch.Size([]) and kv_a_proj_weight.shape == torch.Size(
+        []
+    ):
+        return q_a_proj_weight
+    return torch.cat([q_a_proj_weight, kv_a_proj_weight], dim=cat_dim)
+
+
 @dataclass(frozen=True)
 class NextNEnabledConfig:
     num_nextn_layers: int
@@ -287,22 +324,26 @@ class DeepseekV2WeightLoaderMixin:
                                 q_a_proj_weight = cached_a_proj[q_a_proj_name]
                                 kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
 
-                                if q_a_proj_weight.shape == torch.Size(
-                                    []
-                                ) and kv_a_proj_weight.shape == torch.Size([]):
-                                    fused_weight = q_a_proj_weight
-                                else:
-                                    cat_dim = 0
-                                    if self.quant_config is not None and (
-                                        self.quant_config.get_name() == "awq"
-                                        or self.quant_config.get_name() == "awq_marlin"
-                                        or self.quant_config.get_name() == "moe_wna16"
-                                    ):
-                                        cat_dim = 1
+                                cat_dim = 0
+                                if self.quant_config is not None and (
+                                    self.quant_config.get_name()
+                                    in {
+                                        "awq",
+                                        "awq_marlin",
+                                        "gptq",
+                                        "gptq_marlin",
+                                        "moe_wna16",
+                                    }
+                                ):
+                                    cat_dim = 1
 
-                                    fused_weight = torch.cat(
-                                        [q_a_proj_weight, kv_a_proj_weight], dim=cat_dim
-                                    )
+                                fused_weight = _fuse_qkv_a_projection_tensors(
+                                    q_a_proj_weight,
+                                    kv_a_proj_weight,
+                                    q_a_proj_name=q_a_proj_name,
+                                    kv_a_proj_name=kv_a_proj_name,
+                                    cat_dim=cat_dim,
+                                )
 
                                 param_name = (
                                     name.replace(
@@ -413,18 +454,37 @@ class DeepseekV2WeightLoaderMixin:
             is_nextn: Whether processing NextN weights
             weight_names: Optional list of loaded weight names to determine which layers to process
         """
+        loaded_name_set = None if weight_names is None else set(weight_names)
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]
         else:
-            if weight_names is None:
-                layer_ids = range(self.model.start_layer, self.model.end_layer)
+            local_layer_ids = range(self.model.start_layer, self.model.end_layer)
+            if loaded_name_set is None:
+                layer_ids = local_layer_ids
             else:
                 layer_ids = set()
-                for name in weight_names:
-                    if "kv_b_proj" in name:
-                        layer_id = int(name.split(".")[2])
-                        if layer_id < self.config.num_hidden_layers:
-                            layer_ids.add(layer_id)
+                for name in loaded_name_set:
+                    if "kv_b_proj" not in name:
+                        continue
+                    layer_id = get_layer_id(name)
+                    if (
+                        layer_id is not None
+                        and layer_id < self.config.num_hidden_layers
+                    ):
+                        layer_ids.add(layer_id)
+
+                # The compact checkpoint has no legacy kv_b_proj.weight from
+                # which to discover a layer. Validate every local specialist
+                # even if all four of its canonical tensors were omitted.
+                for layer_id in local_layer_ids:
+                    self_attn = self.model.layers[layer_id].self_attn
+                    quant_method = getattr(
+                        self_attn.kv_b_proj,
+                        "quant_method",
+                        None,
+                    )
+                    if getattr(quant_method, "is_mla_kv_b_w8", False):
+                        layer_ids.add(layer_id)
 
         for layer_id in layer_ids:
             self_attn = (
@@ -432,6 +492,42 @@ class DeepseekV2WeightLoaderMixin:
                 if not is_nextn
                 else self.model.decoder.self_attn
             )
+
+            kv_b_quant_method = getattr(self_attn.kv_b_proj, "quant_method", None)
+            if getattr(kv_b_quant_method, "is_mla_kv_b_w8", False):
+                if loaded_name_set is None:
+                    raise ValueError(
+                        "cannot verify compact MLA kv_b W8 tensors without "
+                        "the loaded checkpoint names"
+                    )
+                parameter_names = (
+                    "kc_qweight",
+                    "kc_scales",
+                    "vc_qweight",
+                    "vc_scales",
+                )
+                missing_parameters = [
+                    name
+                    for name in parameter_names
+                    if not hasattr(self_attn.kv_b_proj, name)
+                ]
+                if missing_parameters:
+                    raise ValueError(
+                        "compact MLA kv_b W8 parameters are incomplete: "
+                        f"{missing_parameters}"
+                    )
+                checkpoint_prefix = f"model.layers.{layer_id}.self_attn.kv_b_proj."
+                missing_checkpoint_names = sorted(
+                    checkpoint_prefix + name
+                    for name in parameter_names
+                    if checkpoint_prefix + name not in loaded_name_set
+                )
+                if missing_checkpoint_names:
+                    raise ValueError(
+                        "compact MLA kv_b W8 checkpoint is incomplete: "
+                        f"{missing_checkpoint_names}"
+                    )
+                continue
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
