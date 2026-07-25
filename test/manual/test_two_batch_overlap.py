@@ -78,7 +78,9 @@ class TestTwoBatchOverlap(unittest.TestCase):
 class TestTwoBatchOverlapUnitTest(unittest.TestCase):
     def test_compute_split_seq_and_token_index(self):
         for num_tokens, expect in [
-            (0, 0),
+            (0, None),
+            (1, None),
+            (2, 1),
             (100, 50),
             (99, 49),
         ]:

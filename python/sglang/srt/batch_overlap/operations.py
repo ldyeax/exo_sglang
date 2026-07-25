@@ -29,8 +29,12 @@ if TYPE_CHECKING:
 def execute_operations(inputs, operations):
     stages = _convert_operations_to_stages(operations)
     executor = _StageExecutor("primary", stages, inputs=inputs)
-    for _ in range(executor.num_stages):
-        executor.next()
+    try:
+        for _ in range(executor.num_stages):
+            executor.next()
+    except BaseException:
+        executor.abort_on_error()
+        raise
     assert executor.done
     return executor.output
 
@@ -57,15 +61,24 @@ def execute_overlapped_operations(
     executor_a = _StageExecutor("a", stages_a, inputs=inputs_a, child_ctx=child_ctx_a)
     executor_b = _StageExecutor("b", stages_b, inputs=inputs_b, child_ctx=child_ctx_b)
 
-    for _ in range(delta_stage):
-        executor_a.next()
+    try:
+        for _ in range(delta_stage):
+            executor_a.next()
 
-    for _ in range(executor_a.num_stages - delta_stage):
-        executor_a.next()
-        executor_b.next()
+        for _ in range(executor_a.num_stages - delta_stage):
+            executor_a.next()
+            executor_b.next()
 
-    for _ in range(delta_stage):
-        executor_b.next()
+        for _ in range(delta_stage):
+            executor_b.next()
+    except BaseException:
+        # Resource-bearing state (notably an asynchronous KT CPU-MoE handle)
+        # must be drained before another request can reuse its global staging
+        # buffer.  Preserve the original execution exception; cleanup failures
+        # deliberately leave the resource fail-closed.
+        executor_a.abort_on_error()
+        executor_b.abort_on_error()
+        raise
 
     assert executor_a.done and executor_b.done
     return [executor_a.output, executor_b.output]
@@ -182,6 +195,9 @@ class _StageExecutor:
     def num_stages(self):
         return len(self._stages)
 
+    def abort_on_error(self):
+        self._stage_state.abort_on_error()
+
 
 class _StateDict:
     def __init__(self):
@@ -219,6 +235,19 @@ class _StateDict:
             )
 
         self._data.clear()
+
+    def abort_on_error(self):
+        for value in list(self._data.values()):
+            abort = getattr(value, "abort_on_error", None)
+            if abort is None:
+                continue
+            try:
+                abort()
+            except BaseException:
+                # Do not replace the model-forward exception.  Resource
+                # implementations retain ownership when cleanup fails so the
+                # next writer will fail closed.
+                pass
 
 
 def _convert_operations_to_stages(operations: List[Operation]) -> List[Stage]:

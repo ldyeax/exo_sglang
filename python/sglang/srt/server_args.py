@@ -5089,20 +5089,6 @@ class ServerArgs:
                 # The "dsa" attention fill moved to the override registry
                 # (arg_groups/overrides.py: _deepseek_family_overrides).
 
-                index_topk_freq = getattr(hf_config, "index_topk_freq", 1) or 1
-                index_topk_pattern = getattr(hf_config, "index_topk_pattern", None)
-                if self.enable_two_batch_overlap and (
-                    index_topk_freq > 1
-                    or (index_topk_pattern is not None and "S" in index_topk_pattern)
-                ):
-                    raise ValueError(
-                        "--enable-two-batch-overlap is not supported with DSA "
-                        "index-topk sharing (index_topk_freq > 1 or an "
-                        "index_topk_pattern containing shared layers): the TBO op "
-                        "path does not propagate topk indices across layers, so "
-                        "shared layers would run sparse attention without indices."
-                    )
-
                 if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
                     if self.enable_prefill_cp:
                         # The DSA CP field declarations moved to the override
@@ -8456,13 +8442,24 @@ class ServerArgs:
         return self._mamba_cache_chunk_size
 
     def _check_two_batch_overlap(self):
+        if not self.enable_two_batch_overlap:
+            return
+
+        if self.kt_weight_path is not None:
+            if self.moe_a2a_backend != "none":
+                raise ValueError(
+                    "KTransformers two-batch overlap requires "
+                    "--moe-a2a-backend none because its CPU expert job is owned "
+                    "by tensor-parallel rank 0 and consumes StandardDispatchOutput."
+                )
+            return
+
         # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
         # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
         # the other ubatch's compute), which requires DP attention. Enabling it
         # there needs no extra opt-in env flag.
         if (
-            self.enable_two_batch_overlap
-            and self.moe_a2a_backend == "none"
+            self.moe_a2a_backend == "none"
             and not self.enable_dp_attention
         ):
             raise ValueError(

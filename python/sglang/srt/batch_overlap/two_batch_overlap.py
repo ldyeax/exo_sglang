@@ -86,7 +86,11 @@ def compute_split_seq_index(
         return _split_extend_seqs(extend_lens)
     elif forward_mode.is_target_verify() or forward_mode.is_decode():
         assert token_num_per_seq is not None
-        return (num_tokens // token_num_per_seq) // 2
+        num_seqs = num_tokens // token_num_per_seq
+        # There is nothing to overlap for a single sequence.  Splitting it as
+        # (empty, non-empty) still runs the full TBO state machine and is a
+        # measurable regression at the low-concurrency operating point.
+        return num_seqs // 2 if num_seqs >= 2 else None
     elif forward_mode.is_idle() or forward_mode.is_prebuilt():
         assert num_tokens == 0
         return 0
@@ -321,6 +325,12 @@ def compute_split_indices_for_cuda_graph_replay(
         extend_lens=None,
         token_num_per_seq=token_num_per_seq,
     )
+    # Fixed-shape CUDA graphs may need an empty placeholder child (including
+    # on an idle DP rank).  This does not opt a real c1 request into TBO:
+    # runtime admission still uses compute_split_seq_index() directly and
+    # rejects that request before graph selection.
+    if tbo_split_seq_index is None:
+        tbo_split_seq_index = 0
     tbo_split_token_index = compute_split_token_index(
         split_seq_index=tbo_split_seq_index,
         forward_mode=forward_mode_for_tbo_split,
@@ -353,7 +363,8 @@ class TboCudaGraphRunnerPlugin:
             token_num_per_seq=token_num_per_seq,
         )
         # For simplicity, when two_batch_overlap is enabled, we only capture CUDA Graph for tbo=true
-        assert batch.tbo_split_seq_index is not None, f"{num_tokens=}"
+        if batch.tbo_split_seq_index is None:
+            batch.tbo_split_seq_index = 0
 
         self._tbo_children_num_token_non_padded[...] = (
             TboForwardBatchPreparer.compute_tbo_children_num_token_non_padded(batch)
@@ -663,8 +674,15 @@ class TboForwardBatchPreparer:
             "input_ids",
             "positions",
             "out_cache_loc",
+            # DSA/IndexShare computes indices in an earlier dense layer and
+            # carries them across several sparse-attention layers.  GLM-5.2
+            # enters TBO after those dense layers, so each child must receive
+            # the rows corresponding to its token slice.
+            "topk_indices",
         ]:
             old_value = getattr(batch, key)
+            if old_value is None:
+                continue
             assert (
                 old_value.shape[0] == num_tokens
             ), f"{key=} {old_value=} {num_tokens=} {batch=}"
@@ -992,6 +1010,7 @@ def _model_forward_tbo_split_inputs_raw(
     forward_batch: ForwardBatch,
     zero_allocator: Optional[BumpAllocator],
 ) -> List[Dict]:
+    _refresh_tbo_child_token_state(forward_batch)
     return [
         dict(
             **_model_forward_filter_inputs(
@@ -1011,6 +1030,41 @@ def _model_forward_tbo_split_inputs_raw(
             forward_batch.tbo_children
         )
     ]
+
+
+def _refresh_tbo_child_token_state(forward_batch: ForwardBatch) -> None:
+    """Copy token-indexed state produced before the TBO boundary to children.
+
+    Children are initially built by :class:`TboForwardBatchPreparer`, before
+    model execution starts.  IndexShare can produce ``topk_indices`` in one of
+    the dense layers that runs after that preparation but before the sparse
+    layers enter TBO.  Refresh here, at the actual boundary, so each child sees
+    exactly its own rows.  State subsequently produced inside TBO stays on the
+    child and is reused by that child's later sparse-attention layers.
+    """
+    if forward_batch.tbo_children is None:
+        raise RuntimeError("TBO input split requires two prepared child batches")
+    if len(forward_batch.tbo_children) != 2:
+        raise RuntimeError(
+            "TBO input split requires exactly two prepared child batches"
+        )
+
+    topk_indices = forward_batch.topk_indices
+    if topk_indices is None:
+        return
+
+    num_tokens = forward_batch.input_ids.shape[0]
+    if topk_indices.shape[0] != num_tokens:
+        raise RuntimeError(
+            "IndexShare topk_indices must have one row per parent token at "
+            f"the TBO boundary, got {topk_indices.shape[0]} rows for "
+            f"{num_tokens} tokens"
+        )
+    for child in forward_batch.tbo_children:
+        if child.tbo_parent_token_range is None:
+            raise RuntimeError("TBO child is missing its parent token range")
+        start_token_index, end_token_index = child.tbo_parent_token_range
+        child.topk_indices = topk_indices[start_token_index:end_token_index]
 
 
 def _model_forward_filter_inputs(

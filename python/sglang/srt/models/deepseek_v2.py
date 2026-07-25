@@ -1772,6 +1772,57 @@ class DeepseekV2MoE(nn.Module):
             dispatch_output=state.dispatch_output,
         )
 
+    def _get_kt_quant_method(self):
+        method = self.experts.quant_method
+        if not isinstance(method, KTEPWrapperMethod):
+            raise RuntimeError(
+                f"Layer {self.layer_id} entered the KT TBO path without a "
+                "KTransformers expert wrapper"
+            )
+        return method
+
+    def op_kt_dispatch(self, state):
+        if not get_moe_a2a_backend().is_none():
+            raise RuntimeError(
+                "KT two-batch overlap requires --moe-a2a-backend none: "
+                "KTransformers consumes StandardDispatchOutput on TP rank 0, "
+                "not a DeepEP-dispatched expert shard"
+            )
+        state.dispatch_output = self.experts.dispatcher.dispatch(
+            hidden_states=state.hidden_states_mlp_input,
+            topk_output=state.pop("topk_output"),
+        )
+
+    def op_kt_submit(self, state):
+        state.kt_async_handle = self._get_kt_quant_method().begin_tbo_apply(
+            self.experts, state.pop("dispatch_output")
+        )
+
+    def op_kt_overlap_window(self, state):
+        # A real stage (rather than adjacent YieldOperation objects) keeps the
+        # child executors staggered while the other child launches attention.
+        pass
+
+    def op_kt_sync(self, state):
+        state.combine_input = self._get_kt_quant_method().finish_tbo_apply(
+            state.pop("kt_async_handle")
+        )
+
+    def op_kt_combine(self, state):
+        state.hidden_states_after_combine = self.experts.dispatcher.combine(
+            state.pop("combine_input")
+        )
+
+    def op_kt_output(self, state):
+        self.op_output(state)
+        if (
+            self.tp_size > 1
+            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        ):
+            state.hidden_states_mlp_output = tensor_model_parallel_all_reduce(
+                state.pop("hidden_states_mlp_output")
+            )
+
     def op_combine_a(self, state):
         if self.ep_size > 1:
             self.experts.dispatcher.combine_a(
