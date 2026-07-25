@@ -35,6 +35,24 @@ _EXPECTED_OMITTED_EXPERT_COUNT: Final = 58_368
 _EXPECTED_OMITTED_EXPERT_NAMES_SHA256: Final = (
     "dc2323c334d9af5eebbce9dd266059d4b9927945eeeff1b57cae9139f30ae1cc"
 )
+_EXPECTED_HYBRID_OUTPUT: Final[Mapping[str, object]] = {
+    "payload_bytes": 20_056_714_112,
+    "shard_count": 5,
+    "tensor_count": 2_052,
+}
+_EXPECTED_HYBRID_QUANTIZATION: Final[Mapping[str, object]] = {
+    "activation_dtype": "BF16",
+    "checkpoint_layout": {
+        "mla_kv_b": "gptq_packed_rows_per_head_v1",
+        "ordinary_linear": "gptq_packed_rows",
+    },
+    "mla_kv_b_compact_to_compact_marlin_repack_at_load": True,
+    "mla_kv_b_triton_uses_serialized_words_directly": True,
+    "ordinary_linear_compact_to_compact_marlin_repack_at_load": True,
+    "serialized_scale_dtype": "BF16",
+    "serialized_weight_dtype": "INT8_biased_by_128_packed_in_INT32",
+    "temporary_bf16_expansion_at_load": False,
+}
 _MLA_KV_B_W8_FORMAT: Final[Mapping[str, object]] = {
     "bits": 8,
     "block_size_m": 8,
@@ -269,6 +287,30 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _require_effectively_read_only(
+    path: Path,
+    *,
+    description: str,
+    directory: bool,
+) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise KTMTPAdmissionError(
+            f"Cannot stat {description} at {path}: {error}"
+        ) from error
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if path.is_symlink() or not expected_type(metadata.st_mode):
+        expected_description = "directory" if directory else "regular file"
+        raise KTMTPAdmissionError(
+            f"{description} must be a non-symlink {expected_description}: {path}"
+        )
+    mount_read_only = bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    mode_read_only = metadata.st_mode & 0o222 == 0
+    if not mount_read_only and not mode_read_only:
+        raise KTMTPAdmissionError(f"{description} is not immutable: {path}")
+
+
 def _parse_manifest_files(
     value: object,
     *,
@@ -466,15 +508,16 @@ def _validate_glm52_fingerprint(config: Any, *, description: str) -> None:
 
 def _validate_hybrid_quantization_config(model_path: Path) -> bool:
     config = _load_json(model_path / "config.json", "target checkpoint config")
+    hybrid_manifest_is_named = os.path.lexists(model_path / _HYBRID_MANIFEST_FILENAME)
     raw_quantization = config.get("quantization_config")
     if not isinstance(raw_quantization, dict):
-        if (model_path / _HYBRID_MANIFEST_FILENAME).exists():
+        if hybrid_manifest_is_named:
             raise KTMTPAdmissionError(
                 "Hybrid target manifest is present but quantization_config is absent"
             )
         return False
     if "exo_mla_kv_b_w8" not in raw_quantization:
-        if (model_path / _HYBRID_MANIFEST_FILENAME).exists():
+        if hybrid_manifest_is_named:
             raise KTMTPAdmissionError(
                 "Hybrid target manifest is present but exo_mla_kv_b_w8 "
                 "metadata is absent"
@@ -537,7 +580,7 @@ def _validate_compact_kv_b_headers(
 def _validate_source_checkpoint(
     model_path: Path,
     physical_layer_index: int,
-) -> bool:
+) -> tuple[bool, set[str]]:
     index_path = model_path / "model.safetensors.index.json"
     index = _load_json(index_path, "target checkpoint index")
     weight_map = index.get("weight_map")
@@ -563,13 +606,13 @@ def _validate_source_checkpoint(
             prefix + "mlp.experts.255.down_proj.weight",
             prefix + "self_attn.kv_b_proj.weight",
         )
-        _validate_index_entries(
+        required_shards = _validate_index_entries(
             model_path,
             weight_map,
             legacy_required,
             "target checkpoint",
         )
-        return False
+        return False, required_shards
 
     expected_names = {prefix + suffix for suffix in _HYBRID_LAYER_SUFFIXES}
     actual_names = {name for name in weight_map if name.startswith(prefix)}
@@ -594,18 +637,19 @@ def _validate_source_checkpoint(
             "Hybrid target layer-78 tensor set differs from the admitted "
             f"35-tensor contract: missing={missing[:3]}, unexpected={unexpected[:3]}"
         )
-    _validate_index_entries(
+    required_shards = _validate_index_entries(
         model_path,
         weight_map,
         sorted(expected_names),
         "hybrid target checkpoint",
+        require_flat_shards=True,
     )
     _validate_compact_kv_b_headers(
         model_path,
         weight_map,
         physical_layer_index=physical_layer_index,
     )
-    return True
+    return True, required_shards
 
 
 def _validate_kt_artifact(
@@ -642,6 +686,8 @@ def _validate_index_entries(
     weight_map: Mapping[str, Any],
     required: tuple[str, ...] | list[str],
     description: str,
+    *,
+    require_flat_shards: bool = False,
 ) -> set[str]:
     missing = [name for name in required if name not in weight_map]
     if missing:
@@ -668,6 +714,7 @@ def _validate_index_entries(
             or "." in path.parts
             or ".." in path.parts
             or path.as_posix() != shard
+            or (require_flat_shards and len(path.parts) != 1)
             or "\x00" in shard
         )
     )
@@ -715,8 +762,20 @@ def _require_manifest_file_hashes(
 
 def _validate_hybrid_checkpoint_manifest(
     model_path: Path,
+    *,
+    required_shards: set[str],
 ) -> Mapping[str, Any]:
     manifest_path = model_path / _HYBRID_MANIFEST_FILENAME
+    _require_effectively_read_only(
+        model_path,
+        description="hybrid checkpoint root",
+        directory=True,
+    )
+    _require_effectively_read_only(
+        manifest_path,
+        description="hybrid checkpoint manifest",
+        directory=False,
+    )
     manifest = _load_json(manifest_path, "hybrid checkpoint manifest")
     if (
         manifest.get("schema_version") != _MANIFEST_SCHEMA_VERSION
@@ -724,6 +783,26 @@ def _validate_hybrid_checkpoint_manifest(
     ):
         raise KTMTPAdmissionError(
             "Hybrid target has an unsupported checkpoint manifest schema"
+        )
+    if manifest.get("immutability") != {
+        "directory_mode": "0555",
+        "file_mode": "0444",
+        "materialized_offline": True,
+    }:
+        raise KTMTPAdmissionError(
+            "Hybrid target manifest has an invalid immutability contract"
+        )
+    if manifest.get("output") != _EXPECTED_HYBRID_OUTPUT:
+        raise KTMTPAdmissionError(
+            "Hybrid target manifest has an unexpected output contract"
+        )
+    raw_quantization = manifest.get("quantization")
+    if not isinstance(raw_quantization, dict) or any(
+        raw_quantization.get(name) != expected
+        for name, expected in _EXPECTED_HYBRID_QUANTIZATION.items()
+    ):
+        raise KTMTPAdmissionError(
+            "Hybrid target manifest does not prove direct compact W8 consumption"
         )
     content_id = manifest.get("content_id")
     if not isinstance(content_id, str) or _SHA256.fullmatch(content_id) is None:
@@ -744,6 +823,12 @@ def _validate_hybrid_checkpoint_manifest(
         manifest.get("files"),
         description="hybrid checkpoint manifest",
     )
+    missing_shards = sorted(required_shards - set(_files_by_path(files)))
+    if missing_shards:
+        raise KTMTPAdmissionError(
+            "Hybrid checkpoint manifest does not attest target layer-78 shards: "
+            + ", ".join(missing_shards[:3])
+        )
     _verify_manifest_file_metadata(
         model_path,
         files,
@@ -829,10 +914,14 @@ def _validate_hybrid_expert_contract(
     *,
     model_path: Path,
     weight_path: Path,
+    target_required_shards: set[str],
     required_shards: set[str],
     numa_nodes: tuple[int, ...],
 ) -> None:
-    expert_checkpoint = _validate_hybrid_checkpoint_manifest(model_path)
+    expert_checkpoint = _validate_hybrid_checkpoint_manifest(
+        model_path,
+        required_shards=target_required_shards,
+    )
     if expert_checkpoint.get("method") != "AMXINT4":
         raise KTMTPAdmissionError("Hybrid target expert contract must use AMXINT4")
     configured_weight_path = expert_checkpoint.get("weight_path")
@@ -1028,7 +1117,7 @@ def admit_glm52_kt_mtp(
     for name in ("load_format", "speculative_draft_load_format"):
         actual = _get(server_args, name)
         normalized = getattr(actual, "value", actual)
-        if normalized is not None and normalized != "safetensors":
+        if normalized != "safetensors":
             mismatches.append(f"{name}={actual!r} (expected 'safetensors')")
 
     incompatible_environment = (
@@ -1069,11 +1158,20 @@ def admit_glm52_kt_mtp(
 
     numa_nodes = _get(server_args, "kt_numa_nodes")
     threadpool_count = _get(server_args, "kt_threadpool_count")
-    if not isinstance(threadpool_count, int) or threadpool_count <= 0:
+    if (
+        isinstance(threadpool_count, bool)
+        or not isinstance(threadpool_count, int)
+        or threadpool_count <= 0
+    ):
         mismatches.append("kt_threadpool_count must be a positive integer")
     if (
         not isinstance(numa_nodes, (list, tuple))
+        or any(
+            isinstance(node, bool) or not isinstance(node, int) or node < 0
+            for node in numa_nodes
+        )
         or not isinstance(threadpool_count, int)
+        or isinstance(threadpool_count, bool)
         or len(numa_nodes) != threadpool_count
         or len(set(numa_nodes)) != len(numa_nodes)
     ):
@@ -1092,7 +1190,7 @@ def admit_glm52_kt_mtp(
         assert isinstance(threadpool_count, int)
         model_path_object = Path(model_path)
         weight_path_object = Path(_get(server_args, "kt_weight_path"))
-        compact_mla_kv_b_w8 = _validate_source_checkpoint(
+        compact_mla_kv_b_w8, target_required_shards = _validate_source_checkpoint(
             model_path_object,
             physical_layer_index,
         )
@@ -1106,6 +1204,7 @@ def admit_glm52_kt_mtp(
             _validate_hybrid_expert_contract(
                 model_path=model_path_object,
                 weight_path=weight_path_object,
+                target_required_shards=target_required_shards,
                 required_shards=required_expert_shards,
                 numa_nodes=tuple(numa_nodes),
             )
