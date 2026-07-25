@@ -41,6 +41,7 @@ from typing import (
 import huggingface_hub
 import numpy as np
 import torch
+
 from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -63,6 +64,10 @@ except ImportError:
     get_max_memory = None
 
 from huggingface_hub import HfApi, hf_hub_download
+from torch import nn
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
+
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.connector import (
     ConnectorType,
@@ -83,9 +88,6 @@ from sglang.srt.model_loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.srt.utils.common import is_cuda_alike
-from torch import nn
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -738,10 +740,8 @@ class DefaultModelLoader(BaseModelLoader):
         )
 
         try:
-            allowed_weight_names, required_shards = (
-                select_glm52_mtp_nonexpert_weights(
-                    weight_map, physical_layer_index
-                )
+            allowed_weight_names, required_shards = select_glm52_mtp_nonexpert_weights(
+                weight_map, physical_layer_index
             )
         except ValueError as error:
             raise RuntimeError(
@@ -754,8 +754,7 @@ class DefaultModelLoader(BaseModelLoader):
             if os.path.basename(path) in required_shards
         ]
         missing_shards = sorted(
-            required_shards
-            - {os.path.basename(path) for path in filtered_files}
+            required_shards - {os.path.basename(path) for path in filtered_files}
         )
         if missing_shards:
             raise RuntimeError(
@@ -921,6 +920,8 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        from sglang.srt.speculative.kt_mtp import is_glm52_kt_mtp_shared_module
+
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -957,6 +958,8 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         for _, module in model.named_modules():
+            if is_glm52_kt_mtp_shared_module(module, owner_model=model):
+                continue
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 # When quant methods need to process weights after loading

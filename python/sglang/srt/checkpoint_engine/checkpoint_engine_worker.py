@@ -123,9 +123,17 @@ class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExte
             # Perform post-processing after weight loading similar to DefaultModelLoader
             try:
                 from sglang.srt.model_loader.loader import device_loading_context
+                from sglang.srt.speculative.kt_mtp import (
+                    is_glm52_kt_mtp_shared_module,
+                )
 
                 # Process quantization methods after loading weights
                 for _, module in self.model_runner.model.named_modules():
+                    if is_glm52_kt_mtp_shared_module(
+                        module,
+                        owner_model=self.model_runner.model,
+                    ):
+                        continue
                     quant_method = getattr(module, "quant_method", None)
                     if quant_method is not None:
                         # Move parameters to device if needed for quantization processing

@@ -194,7 +194,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner = self.draft_worker.model_runner
         if self.kt_mtp_admission.enabled:
             receipt = validate_loaded_glm52_kt_mtp(
-                self.draft_runner.model, self.kt_mtp_admission
+                self.draft_runner.model,
+                self.kt_mtp_admission,
+                target_model=self.target_worker.model_runner.model,
             )
             if ps.tp_rank == 0:
                 logger.info("GLM52_KT_MTP_LOADED %s", receipt)
@@ -323,6 +325,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
+        if self.kt_mtp_admission.enabled:
+            # The admitted GLM-5.2 path installed the exact target modules
+            # during construction and proved their identities after loading.
+            return
+
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         target_lm_head = getattr(self.target_worker.model_runner.model, "lm_head", None)
 

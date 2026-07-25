@@ -401,6 +401,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.kt_mtp_shared_embed_and_head_at_construction = (
             kt_mtp_shared_modules is not None
         )
+        self.kt_mtp_borrowed_module_ids_at_construction = (
+            kt_mtp_shared_modules.borrowed_module_ids
+            if kt_mtp_shared_modules is not None
+            else frozenset()
+        )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
