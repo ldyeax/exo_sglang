@@ -1797,11 +1797,16 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         handler = AttentionBackendRegistry.get_handler(attention_backend)
         attn_forward_method = handler(self, forward_batch)
-        # The compact layout has no ordinary Linear orientation.  Fail closed
-        # on MHA and fused-RoPE variants; Ampere must stay on plain absorbed MLA.
+        # The compact layout has no ordinary Linear orientation.  Both GPU
+        # absorbed-MLA paths call the compact KC/VC specialists directly;
+        # MHA and the CPU fused-RoPE path still dereference legacy weights.
+        compact_kv_b_supported_methods = {
+            AttnForwardMethod.MLA,
+            AttnForwardMethod.MLA_FUSED_ROPE,
+        }
         if (
             self._get_mla_kv_b_w8_method() is not None
-            and attn_forward_method != AttnForwardMethod.MLA
+            and attn_forward_method not in compact_kv_b_supported_methods
         ):
             raise RuntimeError(
                 "compact MLA kv_b W8 requires the absorbed MLA attention "

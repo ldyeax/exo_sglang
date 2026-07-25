@@ -69,17 +69,25 @@ def test_gptq_body_linears_are_recognized_as_packed(
     assert not hasattr(layer, "weight")
 
 
-def test_compact_w8_dispatch_allows_absorbed_mla(
+@pytest.mark.parametrize(
+    "selected_method",
+    [
+        AttnForwardMethod.MLA,
+        AttnForwardMethod.MLA_FUSED_ROPE,
+    ],
+)
+def test_compact_w8_dispatch_allows_gpu_absorbed_mla(
     monkeypatch: pytest.MonkeyPatch,
+    selected_method: AttnForwardMethod,
 ) -> None:
     attention = _attention(compact_w8=True)
-    _select_method(monkeypatch, AttnForwardMethod.MLA)
+    _select_method(monkeypatch, selected_method)
 
     selected = attention.dispatch_attn_forward_method(
         SimpleNamespace(forward_mode=_DecodeForwardMode())
     )
 
-    assert selected == AttnForwardMethod.MLA
+    assert selected == selected_method
     assert attention.current_attention_backend == "test_decode"
 
 
@@ -87,7 +95,6 @@ def test_compact_w8_dispatch_allows_absorbed_mla(
     "selected_method",
     [
         AttnForwardMethod.MHA,
-        AttnForwardMethod.MLA_FUSED_ROPE,
         AttnForwardMethod.MLA_FUSED_ROPE_CPU,
     ],
 )
