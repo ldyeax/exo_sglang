@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import sys
 import threading
+import types
+from types import SimpleNamespace
 
 import pytest
 import torch
 from sglang.srt.layers.moe.kt_stream_prefill import (
     KTStreamPrefillAdmissionError,
     KTStreamPrefillConfig,
+    KTStreamPrefillExecutor,
     KTStreamPrefillFacts,
     ReusableAsyncRing,
     admit_kt_stream_prefill,
     iter_expert_chunks,
     iter_rank_expert_chunks,
+)
+from sglang.srt.layers.moe.kt_stream_prefill_contract import (
+    validate_shared_full_context_host_buffer,
 )
 
 
@@ -62,6 +69,87 @@ def test_glm52_tp1_four_expert_ring_sizing_for_pd_prefill() -> None:
     assert plan.device_ring_bytes == 576 * 1024**2
     assert plan.host_ring_bytes_per_rank == 576 * 1024**2
     assert plan.chunks_per_layer == 64
+
+
+def test_glm52_tp1_one_expert_ring_sizing_for_pd_prefill() -> None:
+    plan = admit_kt_stream_prefill(
+        KTStreamPrefillConfig(enabled=True, experts_per_chunk=1),
+        _glm52_facts(tensor_parallel_size=1),
+    )
+
+    assert plan.tensor_parallel_size == 1
+    assert plan.experts_per_chunk == 1
+    assert plan.per_expert_device_bytes == 72 * 1024**2
+    assert plan.device_ring_bytes == 144 * 1024**2
+    assert plan.host_ring_bytes_per_rank == 144 * 1024**2
+    assert plan.chunks_per_layer == 256
+    assert tuple(iter_rank_expert_chunks(plan, 0))[:2] == ((0,), (1,))
+
+
+def test_one_expert_host_buffer_requires_stream_prefill_ring_mode() -> None:
+    with pytest.raises(ValueError, match="per-expert double buffering"):
+        validate_shared_full_context_host_buffer(
+            host_buffer_experts=1,
+            global_num_experts=1,
+            host_buffer_mode="legacy_double_buffer",
+        )
+
+    validate_shared_full_context_host_buffer(
+        host_buffer_experts=1,
+        global_num_experts=1,
+        host_buffer_mode="stream_prefill_ring_slot",
+    )
+
+    with pytest.raises(ValueError, match="every expert in its GPU chunk"):
+        validate_shared_full_context_host_buffer(
+            host_buffer_experts=1,
+            global_num_experts=256,
+            host_buffer_mode="stream_prefill_ring_slot",
+        )
+
+
+def test_one_expert_executor_selects_stream_prefill_ring_mode(monkeypatch) -> None:
+    plan = admit_kt_stream_prefill(
+        KTStreamPrefillConfig(enabled=True, experts_per_chunk=1),
+        _glm52_facts(tensor_parallel_size=1),
+    )
+    context_arguments: list[dict[str, object]] = []
+
+    class FakeSharedFullContext:
+        is_bf16_quant = True
+
+        def __init__(self, **kwargs) -> None:
+            context_arguments.append(kwargs)
+
+    fake_wrapper_module = types.ModuleType("sglang.srt.layers.moe.kt_ep_wrapper")
+    fake_wrapper_module.SharedFullContext = FakeSharedFullContext
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.moe.kt_ep_wrapper",
+        fake_wrapper_module,
+    )
+    monkeypatch.setattr(torch.cuda, "Stream", lambda *, device: object())
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+
+    class FakeLayer:
+        def parameters(self):
+            yield SimpleNamespace(device=torch.device("cpu"))
+
+    owner = SimpleNamespace(
+        _full_init_args=(6144, 2048, torch.bfloat16),
+        moe_runner_config=object(),
+    )
+    executor = KTStreamPrefillExecutor(plan, owner, FakeLayer())
+    try:
+        assert len(context_arguments) == 2
+        assert all(
+            arguments["host_buffer_experts"] == 1
+            and arguments["global_num_experts"] == 1
+            and arguments["host_buffer_mode"] == "stream_prefill_ring_slot"
+            for arguments in context_arguments
+        )
+    finally:
+        executor._ring.close()
 
 
 def test_glm52_small_ep_loads_complete_disjoint_experts() -> None:
