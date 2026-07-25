@@ -605,6 +605,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
+        # The controller owns plans and reservations only. A future router must
+        # supply executor, shared-host-weight, and live capacity contracts.
+        self.glm52_intra_node_pd_controller = (
+            self.server_args.create_glm52_intra_node_pd_controller()
+        )
 
         # Encoder Disaggregation
         self.encoder_bootstrap_server = None

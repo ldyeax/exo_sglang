@@ -75,3 +75,25 @@ reference tests. It is not yet selected by the GLM model. The remaining
 model-level work is to combine context-parallel attention with full (not
 tensor-sliced) local expert ownership and a fused local-expert runner. Enabling
 ordinary SGLang EP or TP does not implicitly provide SmallEP.
+
+## Intra-node prefill/decode planner
+
+`--enable-glm52-intra-node-pd-planner` installs a tokenizer-manager-owned
+admission controller. It derives the long-prompt boundary from
+`--kt-gpu-prefill-token-threshold` and emits one of three executable-facing
+plans:
+
+- short prompt: run chunked prefill on the unified TP=2 worker;
+- isolated long prompt: run distributed SLP on both GPUs, but only with a
+  successful bounded-SLP admission receipt and live capacity proof;
+- long prompt while decode is active: run TP=1 SLP on one GPU, transfer KV,
+  and continue TP=1 decode on the other GPU, but only with explicit TP=1
+  executor, KV-transfer, shared-host-weight, and per-role capacity proofs.
+
+The controller atomically accounts for SLP and decode reservations and exposes
+external-state, prefill-complete, and release hooks. The policy code and the
+existing TP=2 SLP executor are executable. The TP=1+TP=1 process/model wiring,
+shared KT host-weight attachment, and KV handoff are not implemented; the
+split route therefore fails closed unless a future launcher supplies all of
+those contracts. The planner flag does not launch workers or alter request
+routing by itself.

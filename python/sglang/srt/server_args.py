@@ -2956,6 +2956,15 @@ class ServerArgs:
         "[experimental ktransformers parameter] VRAM headroom retained after ring allocation, in MiB.",
         NS("exec.moe"),
     ] = 512
+    enable_glm52_intra_node_pd_planner: A[
+        bool,
+        (
+            "[experimental ktransformers parameter] Install the fail-closed "
+            "GLM-5.2 intra-node routing/admission planner. This exposes plans "
+            "and state hooks only; it does not launch split TP=1 executors."
+        ),
+        NS("exec.moe"),
+    ] = False
     kt_enable_dynamic_expert_update: A[
         bool,
         "[experimental ktransformers parameter] Update resident GPU experts from observed routes.",
@@ -8535,6 +8544,70 @@ class ServerArgs:
                 "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
+    def create_glm52_intra_node_pd_controller(self):
+        """Build the tokenizer-owned planner hook without claiming split wiring."""
+
+        if not self.enable_glm52_intra_node_pd_planner:
+            return None
+
+        from sglang.srt.disaggregation.glm52_intra_node_policy import (
+            GLM52IntraNodeAdmissionController,
+            GLM52IntraNodePolicyConfig,
+        )
+
+        assert self.kt_gpu_prefill_token_threshold is not None
+        assert self.chunked_prefill_size is not None
+        return GLM52IntraNodeAdmissionController(
+            GLM52IntraNodePolicyConfig(
+                enabled=True,
+                long_prompt_threshold=self.kt_gpu_prefill_token_threshold,
+                chunked_prefill_size=self.chunked_prefill_size,
+                gpu_ids=(
+                    self.base_gpu_id,
+                    self.base_gpu_id + self.gpu_id_step,
+                ),
+            )
+        )
+
+    def _check_glm52_intra_node_pd_planner(self) -> None:
+        if not self.enable_glm52_intra_node_pd_planner:
+            return
+
+        errors = []
+        if not self.kt_stream_prefill:
+            errors.append("--kt-stream-prefill is required")
+        if self.pp_size != 1 or self.tp_size != 2:
+            errors.append(
+                "--pipeline-parallel-size 1 and --tensor-parallel-size 2 are required"
+            )
+        if self.chunked_prefill_size is None or self.chunked_prefill_size <= 0:
+            errors.append("chunked prefill must be enabled")
+        if (
+            self.kt_gpu_prefill_token_threshold is None
+            or self.kt_gpu_prefill_token_threshold <= 0
+        ):
+            errors.append("--kt-gpu-prefill-token-threshold must be positive")
+        elif (
+            self.max_prefill_tokens > 0
+            and self.kt_gpu_prefill_token_threshold > self.max_prefill_tokens
+        ):
+            errors.append(
+                "--kt-gpu-prefill-token-threshold must not exceed "
+                "--max-prefill-tokens"
+            )
+        if self.disaggregation_mode != "null":
+            errors.append(
+                "--disaggregation-mode must be null; the intra-node planner "
+                "owns a separate routing contract"
+            )
+        if self.enable_pdmux:
+            errors.append("--enable-pdmux is incompatible")
+        if errors:
+            raise ValueError(
+                "GLM-5.2 intra-node PD planner admission failed: "
+                + "; ".join(errors)
+            )
+
     def _check_kt_stream_prefill(self) -> None:
         if not self.kt_stream_prefill:
             return
@@ -8778,6 +8851,7 @@ class ServerArgs:
         # Check two batch overlap backend requirement.
         self._check_two_batch_overlap()
         self._check_kt_stream_prefill()
+        self._check_glm52_intra_node_pd_planner()
 
         # Check communications compression
         if self.enable_quant_communications and self.tp_size == 1:
