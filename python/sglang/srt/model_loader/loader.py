@@ -489,6 +489,16 @@ class DefaultModelLoader(BaseModelLoader):
                 source.model_config.hf_config,
             )
 
+        allowed_weight_names: Optional[set[str]] = None
+        mtp_filter = self._get_glm52_kt_mtp_weight_filter(
+            source=source,
+            hf_folder=hf_folder,
+            hf_weights_files=hf_weights_files,
+            use_safetensors=use_safetensors,
+        )
+        if mtp_filter is not None:
+            hf_weights_files, allowed_weight_names = mtp_filter
+
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -506,6 +516,7 @@ class DefaultModelLoader(BaseModelLoader):
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
+                    allowed_weight_names=allowed_weight_names,
                 )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
@@ -514,10 +525,13 @@ class DefaultModelLoader(BaseModelLoader):
                         "num_threads", self.DEFAULT_NUM_THREADS
                     ),
                     disable_mmap=weight_loader_disable_mmap,
+                    allowed_weight_names=allowed_weight_names,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
-                    hf_weights_files, disable_mmap=weight_loader_disable_mmap
+                    hf_weights_files,
+                    disable_mmap=weight_loader_disable_mmap,
+                    allowed_weight_names=allowed_weight_names,
                 )
 
         else:
@@ -540,6 +554,92 @@ class DefaultModelLoader(BaseModelLoader):
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+    @staticmethod
+    def _get_glm52_kt_mtp_weight_filter(
+        *,
+        source: "DefaultModelLoader.Source",
+        hf_folder: str,
+        hf_weights_files: List[str],
+        use_safetensors: bool,
+    ) -> Optional[Tuple[List[str], set[str]]]:
+        """Select only layer-78 non-routed weights before materializing tensors.
+
+        The persistent AMXINT4 artifact supplies all routed expert tensors.
+        Filtering at the safetensors key boundary avoids rereading the other 78
+        model layers and avoids materializing the 13.5-GiB BF16 copy of the MTP
+        experts merely for the model loader to discard it.
+        """
+        model_config = source.model_config
+        if model_config is None or not model_config.is_draft_model:
+            return None
+
+        from sglang.srt.layers.moe.utils import get_kt_ep_weight_layer_index
+
+        physical_layer_index = get_kt_ep_weight_layer_index(0)
+        if physical_layer_index == 0:
+            return None
+        hf_config = model_config.hf_config
+        if (
+            getattr(hf_config, "model_type", None) != "glm_moe_dsa"
+            or physical_layer_index != 78
+        ):
+            raise RuntimeError(
+                "A speculative KT layer override is only supported for "
+                "GLM-5.2 physical layer 78"
+            )
+        if not use_safetensors:
+            raise RuntimeError(
+                "GLM-5.2 KT MTP requires a safetensors target checkpoint so "
+                "layer-78 weights can be filtered before tensor materialization"
+            )
+
+        index_path = os.path.join(hf_folder, SAFE_WEIGHTS_INDEX_NAME)
+        try:
+            with open(index_path) as index_file:
+                index = json.load(index_file)
+            weight_map = index["weight_map"]
+        except (OSError, KeyError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"Cannot build GLM-5.2 KT MTP weight filter from {index_path}: "
+                f"{error}"
+            ) from error
+
+        from sglang.srt.speculative.kt_mtp import (
+            select_glm52_mtp_nonexpert_weights,
+        )
+
+        try:
+            allowed_weight_names, required_shards = (
+                select_glm52_mtp_nonexpert_weights(
+                    weight_map, physical_layer_index
+                )
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                f"Cannot select GLM-5.2 KT MTP weights from {index_path}: {error}"
+            ) from error
+        filtered_files = [
+            path
+            for path in hf_weights_files
+            if os.path.basename(path) in required_shards
+        ]
+        missing_shards = sorted(
+            required_shards - {os.path.basename(path) for path in filtered_files}
+        )
+        if missing_shards:
+            raise RuntimeError(
+                "GLM-5.2 KT MTP checkpoint is missing selected shards: "
+                + ", ".join(missing_shards)
+            )
+        logger.info(
+            "GLM52_KT_MTP_WEIGHT_FILTER physical_layer=%d tensors=%d "
+            "shards=%s routed_experts=persistent_AMXINT4",
+            physical_layer_index,
+            len(allowed_weight_names),
+            sorted(required_shards),
+        )
+        return filtered_files, allowed_weight_names
 
     @classmethod
     def _filter_mtp_weights(

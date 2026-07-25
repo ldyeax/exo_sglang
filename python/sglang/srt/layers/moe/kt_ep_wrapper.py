@@ -2211,10 +2211,15 @@ def create_kt_config_from_server_args(
         KTConfig if KT is configured and not disabled, None otherwise
     """
     # Check if KT EP wrapper is disabled (e.g., for draft models in speculative decoding)
-    from sglang.srt.layers.moe.utils import is_kt_ep_wrapper_disabled
+    from sglang.srt.layers.moe.utils import (
+        get_kt_ep_weight_layer_index,
+        is_kt_ep_wrapper_disabled,
+    )
 
     if is_kt_ep_wrapper_disabled():
         return None
+    local_layer_idx = layer_idx
+    layer_idx = get_kt_ep_weight_layer_index(local_layer_idx)
 
     if server_args.kt_weight_path is None:
         return None
@@ -2229,14 +2234,38 @@ def create_kt_config_from_server_args(
     if hasattr(hf_config, "text_config"):
         hf_config = hf_config.text_config
     num_layers = getattr(hf_config, "num_hidden_layers", None)
+    num_nextn_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
 
     # NOTE: hash-layer skip experiment was tried here (return None when
     # layer_idx < num_hash_layers); it didn't help because the underlying
     # fused_moe shape-mismatch in V4 hash MoE happens with or without KT wrap.
     # Reverted; root cause is in V4 MoE weight layout vs sglang fused_moe.
 
-    # Get mask for this specific layer
-    gpu_experts_mask = masks[layer_idx]
+    # Target-model masks have one row per normal decoder layer.  GLM-5.2's
+    # admitted draft model is locally layer 0 but persists as checkpoint layer
+    # 78 (the first layer after the 78 target layers).  It is deliberately an
+    # all-CPU AMXINT4 layer; do not borrow a target layer's placement mask.
+    if layer_idx < masks.shape[0]:
+        gpu_experts_mask = masks[layer_idx]
+    else:
+        is_admitted_nextn_layer = (
+            layer_idx != local_layer_idx
+            and num_layers is not None
+            and layer_idx == num_layers
+            and num_nextn_layers == 1
+            and server_args.kt_num_gpu_experts == 0
+            and server_args.kt_gpu_experts_ratio is None
+        )
+        if not is_admitted_nextn_layer:
+            raise RuntimeError(
+                "KT layer-index override is outside the initialized expert "
+                f"mask: local={local_layer_idx}, physical={layer_idx}, "
+                f"mask_layers={masks.shape[0]}"
+            )
+        gpu_experts_mask = torch.zeros(
+            masks.shape[1], dtype=torch.bool, device="cpu"
+        )
+        num_layers += num_nextn_layers
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -2799,6 +2828,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if (
                 metadata is not None
                 and getattr(metadata, "physical_to_logical_map_cpu", None) is not None
+                and self.kt_config.layer_idx
+                < metadata.physical_to_logical_map_cpu.shape[0]
             ):
                 physical_to_logical_map_cpu = (
                     metadata.physical_to_logical_map_cpu[self.kt_config.layer_idx]

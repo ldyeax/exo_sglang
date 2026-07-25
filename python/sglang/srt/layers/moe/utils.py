@@ -162,6 +162,7 @@ DEEPEP_CONFIG: Optional[str] = None
 DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER: Optional[bool] = None
 MOE_QUANTIZATION: Optional[str] = None
 DISABLE_KT_EP_WRAPPER: bool = False
+KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE: Optional[int] = None
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -177,6 +178,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global DISABLE_FLASHINFER_CUTLASS_MOE_FP4_ALLGATHER
     global MOE_QUANTIZATION
     global DISABLE_KT_EP_WRAPPER
+    global KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
@@ -200,6 +202,7 @@ def initialize_moe_config(server_args: ServerArgs):
     )
     MOE_QUANTIZATION = server_args.quantization
     DISABLE_KT_EP_WRAPPER = False
+    KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE = None
 
 
 def get_moe_a2a_backend() -> MoeA2ABackend:
@@ -346,6 +349,46 @@ def is_kt_ep_wrapper_disabled() -> bool:
     return DISABLE_KT_EP_WRAPPER
 
 
+def get_kt_ep_weight_layer_index(local_layer_index: int) -> int:
+    """Map a local draft-layer index to its persistent KT checkpoint index."""
+    global KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE
+    if KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE is None:
+        return local_layer_index
+    if local_layer_index != 0:
+        raise RuntimeError(
+            "A speculative KT layer-index override may only map local layer zero"
+        )
+    return KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE
+
+
+@contextmanager
+def speculative_kt_ep_context(
+    *,
+    enabled: bool,
+    physical_layer_index: Optional[int] = None,
+):
+    """Configure KT wrapping while constructing or running a draft model.
+
+    Draft models remain GPU-only unless an admission check explicitly enables
+    KT and supplies the physical checkpoint layer number.
+    """
+    global DISABLE_KT_EP_WRAPPER
+    global KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE
+    if enabled != (physical_layer_index is not None):
+        raise ValueError(
+            "Enabled speculative KT requires exactly one physical layer index"
+        )
+    original_disabled = DISABLE_KT_EP_WRAPPER
+    original_override = KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE
+    try:
+        DISABLE_KT_EP_WRAPPER = not enabled
+        KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE = physical_layer_index
+        yield
+    finally:
+        DISABLE_KT_EP_WRAPPER = original_disabled
+        KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE = original_override
+
+
 @contextmanager
 def speculative_kt_ep_disabled_context():
     """
@@ -353,13 +396,8 @@ def speculative_kt_ep_disabled_context():
     Ensures draft models use pure GPU MoE instead of CPU-GPU hybrid computation
     via kt_ep_wrapper.
     """
-    global DISABLE_KT_EP_WRAPPER
-    original_value = DISABLE_KT_EP_WRAPPER
-    try:
-        DISABLE_KT_EP_WRAPPER = True
+    with speculative_kt_ep_context(enabled=False):
         yield
-    finally:
-        DISABLE_KT_EP_WRAPPER = original_value
 
 
 # The type of method in top-K routing, for use in torch custom op

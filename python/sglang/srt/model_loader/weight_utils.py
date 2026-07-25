@@ -713,6 +713,7 @@ def np_cache_weights_iterator(
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
+    allowed_weight_names: Optional[set[str]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -729,15 +730,18 @@ def safetensors_weights_iterator(
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
                 for name in sorted(result.keys()):
-                    yield name, result[name]
+                    if allowed_weight_names is None or name in allowed_weight_names:
+                        yield name, result[name]
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
-                    yield name, f.get_tensor(name)
+                    if allowed_weight_names is None or name in allowed_weight_names:
+                        yield name, f.get_tensor(name)
 
 
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
+    allowed_weight_names: Optional[set[str]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
@@ -783,8 +787,9 @@ def fastsafetensors_weights_iterator(
             try:
                 keys = list(fb.key_to_rank_lidx.keys())
                 for k in keys:
-                    t = fb.get_tensor(k)
-                    yield k, t
+                    if allowed_weight_names is None or k in allowed_weight_names:
+                        t = fb.get_tensor(k)
+                        yield k, t
             finally:
                 pass
         finally:
@@ -831,6 +836,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
     disable_mmap: bool = False,
+    allowed_weight_names: Optional[set[str]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -848,7 +854,11 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 result = safetensors.torch.load(f.read())
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {
+                    k: f.get_tensor(k)
+                    for k in f.keys()
+                    if allowed_weight_names is None or k in allowed_weight_names
+                }
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.

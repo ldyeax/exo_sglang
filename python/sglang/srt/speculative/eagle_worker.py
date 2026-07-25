@@ -11,7 +11,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
-    speculative_kt_ep_disabled_context,
+    speculative_kt_ep_context,
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
@@ -48,6 +48,11 @@ from sglang.srt.speculative.eagle_utils import (
     organize_draft_results,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.kt_mtp import (
+    KTMTPAdmission,
+    admit_glm52_kt_mtp,
+    validate_loaded_glm52_kt_mtp,
+)
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
     detect_nan,
@@ -103,6 +108,16 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.kt_mtp_admission = admit_glm52_kt_mtp(
+            server_args,
+            target_worker.model_runner.model_config.hf_config,
+        )
+        if self.kt_mtp_admission.enabled and tp_rank == 0:
+            logger.info(
+                "GLM52_KT_MTP_ADMISSION physical_layer=%d reason=%s",
+                self.kt_mtp_admission.physical_layer_index,
+                self.kt_mtp_admission.reason,
+            )
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -139,7 +154,7 @@ class EAGLEWorker(TpModelWorker):
             ctx = empty_context()
         with (
             ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), self._kt_mtp_context():
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -154,6 +169,12 @@ class EAGLEWorker(TpModelWorker):
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             )
+        if self.kt_mtp_admission.enabled:
+            kt_mtp_receipt = validate_loaded_glm52_kt_mtp(
+                self.draft_model_runner.model, self.kt_mtp_admission
+            )
+            if tp_rank == 0:
+                logger.info("GLM52_KT_MTP_LOADED %s", kt_mtp_receipt)
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
@@ -276,6 +297,13 @@ class EAGLEWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
+    def _kt_mtp_context(self):
+        admission: KTMTPAdmission = self.kt_mtp_admission
+        return speculative_kt_ep_context(
+            enabled=admission.enabled,
+            physical_layer_index=admission.physical_layer_index,
+        )
+
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run speculative decoding forward.
 
@@ -294,7 +322,7 @@ class EAGLEWorker(TpModelWorker):
             )
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), self._kt_mtp_context():
                 self.forward_draft_extend(
                     batch,
                     logits_output.hidden_states,
@@ -311,7 +339,7 @@ class EAGLEWorker(TpModelWorker):
         else:
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), self._kt_mtp_context():
                 spec_info = self.draft(batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
@@ -319,7 +347,7 @@ class EAGLEWorker(TpModelWorker):
 
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), speculative_kt_ep_disabled_context():
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), self._kt_mtp_context():
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
