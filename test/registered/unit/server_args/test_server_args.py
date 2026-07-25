@@ -1910,5 +1910,17 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestKTransformersAdmission(CustomTestCase):
+    def test_stream_prefill_rejects_two_batch_overlap(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.kt_stream_prefill = True
+        server_args.enable_two_batch_overlap = True
+
+        with self.assertRaisesRegex(
+            ValueError, "--enable-two-batch-overlap is incompatible"
+        ):
+            server_args._check_kt_stream_prefill()
+
+
 if __name__ == "__main__":
     unittest.main()
