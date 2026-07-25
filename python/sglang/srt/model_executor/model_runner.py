@@ -499,6 +499,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Load the model
         self.sampler = create_sampler()
         self.load_model()
+        self.configure_compact_mla_kv_b_attention()
         if self.server_args.kt_lora_path:
             if not hasattr(self.model, "load_kt_lora"):
                 raise ValueError(
@@ -949,6 +950,46 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     or self.server_args.mooncake_ib_device
                 ),
             )
+
+    def configure_compact_mla_kv_b_attention(self) -> None:
+        """Keep FlashInfer metadata on absorbed MLA for compact ``kv_b``."""
+
+        compact_attention_modules: list[torch.nn.Module] = []
+        for module in self.model.modules():
+            kv_b_projection = getattr(module, "kv_b_proj", None)
+            quant_method = getattr(kv_b_projection, "quant_method", None)
+            if not getattr(quant_method, "is_mla_kv_b_w8", False):
+                continue
+            if not getattr(quant_method, "requires_mla_absorb", False):
+                raise RuntimeError(
+                    "compact MLA kv_b W8 method does not declare its absorbed-MLA "
+                    "requirement"
+                )
+            if not hasattr(module, "flashinfer_mla_disable_ragged"):
+                raise RuntimeError(
+                    "compact MLA kv_b W8 is attached outside a DeepSeek MLA "
+                    "attention module"
+                )
+            compact_attention_modules.append(module)
+
+        if not compact_attention_modules:
+            return
+
+        # FlashInfer decides between its ordinary-MHA ragged wrapper and its
+        # absorbed-MLA paged wrapper before model.forward dispatches individual
+        # attention layers.  Keep every view of this setting coherent before
+        # the attention backend is constructed or plans any batch metadata.
+        global_server_args = get_global_server_args()
+        self.server_args.flashinfer_mla_disable_ragged = True
+        global_server_args.flashinfer_mla_disable_ragged = True
+        for module in compact_attention_modules:
+            module.flashinfer_mla_disable_ragged = True
+
+        logger.info(
+            "Compact MLA kv_b W8 requires absorbed MLA; disabled FlashInfer "
+            "ragged MHA prefill for %d attention modules",
+            len(compact_attention_modules),
+        )
 
     def load_model(self):
         tic_total = time.perf_counter()
