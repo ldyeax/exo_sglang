@@ -730,6 +730,10 @@ class ServerArgs:
     kt_gpu_experts_ratio: Optional[float] = None
     kt_max_deferred_experts_per_token: Optional[int] = None
     kt_gpu_prefill_token_threshold: Optional[int] = None
+    kt_stream_prefill: bool = False
+    kt_stream_prefill_experts_per_chunk: int = 4
+    kt_stream_prefill_ring_slots: int = 2
+    kt_stream_prefill_safety_margin_mb: int = 512
     record_kt_gpu_expert_distribution: bool = False
     kt_enable_dynamic_expert_update: bool = False
     kt_expert_placement_strategy: str = "uniform"
@@ -4869,6 +4873,37 @@ class ServerArgs:
             help="[ktransformers parameter] Token threshold for loading full layer from disk to GPU during prefill. When batch token count exceeds this threshold, temporarily load complete layer from disk instead of using CPU experts.",
         )
         parser.add_argument(
+            "--kt-stream-prefill",
+            action="store_true",
+            default=ServerArgs.kt_stream_prefill,
+            help="[experimental ktransformers parameter] Replace the complete-layer "
+            "GPU prefill fallback with a bounded two-slot BF16 expert-chunk ring. "
+            "The first implementation is admitted only for GLM-5.2 PP=1/TP=2 "
+            "with AMXINT4 CPU weights and zero resident/deferred experts.",
+        )
+        parser.add_argument(
+            "--kt-stream-prefill-experts-per-chunk",
+            type=int,
+            default=ServerArgs.kt_stream_prefill_experts_per_chunk,
+            help="[experimental ktransformers parameter] Routed experts held in "
+            "each stream-prefill ring slot (power of two, at most 16; default 4 "
+            "for 24 GiB RTX 3090 headroom).",
+        )
+        parser.add_argument(
+            "--kt-stream-prefill-ring-slots",
+            type=int,
+            default=ServerArgs.kt_stream_prefill_ring_slots,
+            help="[experimental ktransformers parameter] Reusable stream-prefill "
+            "GPU slots. The first event scheduler requires exactly 2.",
+        )
+        parser.add_argument(
+            "--kt-stream-prefill-safety-margin-mb",
+            type=int,
+            default=ServerArgs.kt_stream_prefill_safety_margin_mb,
+            help="[experimental ktransformers parameter] Minimum VRAM left after "
+            "allocating the BF16 expert ring (default 512 MiB).",
+        )
+        parser.add_argument(
             "--record-kt-gpu-expert-distribution",
             action="store_true",
             help="[ktransformers parameter] Record GPU expert distribution (which experts are on GPU) for each forward pass. Recorded data is dumped with expert distribution stats.",
@@ -5829,6 +5864,76 @@ class ServerArgs:
                 "--moe-a2a-backend none because its CPU expert job is owned "
                 "by tensor-parallel rank 0 and consumes StandardDispatchOutput."
             )
+
+        if self.kt_stream_prefill:
+            stream_prefill_errors = []
+            if self.kt_weight_path is None:
+                stream_prefill_errors.append("--kt-weight-path is required")
+            if (self.kt_method or "").upper() != "AMXINT4":
+                stream_prefill_errors.append("--kt-method must be AMXINT4")
+            if self.pp_size != 1 or self.tp_size != 2:
+                stream_prefill_errors.append(
+                    "--pipeline-parallel-size 1 and --tensor-parallel-size 2 "
+                    "are required"
+                )
+            if self.kt_threadpool_count != 2:
+                stream_prefill_errors.append("--kt-threadpool-count must be 2")
+            if self.kt_numa_nodes is None or len(self.kt_numa_nodes) != 2:
+                stream_prefill_errors.append(
+                    "--kt-numa-nodes must name exactly two NUMA nodes"
+                )
+            elif len(set(self.kt_numa_nodes)) != 2:
+                stream_prefill_errors.append(
+                    "--kt-numa-nodes entries must be distinct"
+                )
+            if self.kt_num_gpu_experts != 0:
+                stream_prefill_errors.append("--kt-num-gpu-experts must be 0")
+            if self.kt_gpu_experts_ratio is not None:
+                stream_prefill_errors.append(
+                    "--kt-gpu-experts-ratio must not be set"
+                )
+            if self.kt_max_deferred_experts_per_token != 0:
+                stream_prefill_errors.append(
+                    "--kt-max-deferred-experts-per-token must be 0"
+                )
+            if self.kt_enable_dynamic_expert_update:
+                stream_prefill_errors.append(
+                    "--kt-enable-dynamic-expert-update is incompatible"
+                )
+            if self.kt_expert_lora_path is not None:
+                stream_prefill_errors.append(
+                    "--kt-expert-lora-path is not admitted"
+                )
+            if (
+                self.kt_gpu_prefill_token_threshold is None
+                or self.kt_gpu_prefill_token_threshold <= 0
+            ):
+                stream_prefill_errors.append(
+                    "--kt-gpu-prefill-token-threshold must be positive"
+                )
+            if self.kt_stream_prefill_ring_slots != 2:
+                stream_prefill_errors.append(
+                    "--kt-stream-prefill-ring-slots must be 2"
+                )
+            experts_per_chunk = self.kt_stream_prefill_experts_per_chunk
+            if (
+                experts_per_chunk <= 0
+                or experts_per_chunk > 16
+                or experts_per_chunk & (experts_per_chunk - 1)
+            ):
+                stream_prefill_errors.append(
+                    "--kt-stream-prefill-experts-per-chunk must be a power "
+                    "of two in [1, 16]"
+                )
+            if self.kt_stream_prefill_safety_margin_mb < 0:
+                stream_prefill_errors.append(
+                    "--kt-stream-prefill-safety-margin-mb must be non-negative"
+                )
+            if stream_prefill_errors:
+                raise ValueError(
+                    "KT stream-prefill admission failed: "
+                    + "; ".join(stream_prefill_errors)
+                )
 
     def check_torch_2_9_1_cudnn_compatibility(self):
         if get_bool_env_var("SGLANG_DISABLE_CUDNN_CHECK"):

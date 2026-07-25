@@ -137,6 +137,10 @@ class KTConfig:
     numa_nodes: Optional[List[int]] = None
     num_layers: Optional[int] = None
     gpu_prefill_token_threshold: Optional[int] = None
+    stream_prefill: bool = False
+    stream_prefill_experts_per_chunk: int = 4
+    stream_prefill_ring_slots: int = 2
+    stream_prefill_safety_margin_mb: int = 512
     kt_enable_dynamic_expert_update: bool = False
     expert_lora_path: Optional[str] = None
 
@@ -498,7 +502,11 @@ class SharedFullContext:
         init_args: tuple,
         global_num_experts: int,
         moe_runner_config: "MoeRunnerConfig",
+        host_buffer_experts: int = 2,
     ):
+        if host_buffer_experts < 2:
+            raise ValueError("host_buffer_experts must be at least 2")
+        self.host_buffer_experts = host_buffer_experts
         self._build_layers(layer, init_args, global_num_experts, moe_runner_config)
 
         # Capture original tensors to support restoration before loading
@@ -901,8 +909,10 @@ class SharedFullContext:
     def _create_cpu_buffers(self):
         """Create CPU buffers in POSIX shared memory and register as pinned memory.
 
-        Uses double buffering (2 experts) to reduce memory usage while maintaining
-        pipeline efficiency: write(e+1) || copy(e) only needs 2 buffers.
+        The ordinary layerwise path uses two experts for its write/copy
+        pipeline.  Stream-loading prefill can request one whole expert chunk
+        per reusable ring slot so rank 0 can fill the chunk and publish it with
+        a single host collective.
         """
         # Set NUMA local allocation policy to allocate on local NUMA node
         libnuma = ctypes.CDLL("libnuma.so.1")
@@ -926,7 +936,8 @@ class SharedFullContext:
 
         for name in self.weight_names:
             gpu_tensor = getattr(self.gpu_layer, name)
-            # Only allocate 2 experts worth of buffer (double buffering)
+            # Default is two experts (double buffering).  Stream-prefill ring
+            # contexts request one complete expert chunk.
             expert_shape = gpu_tensor.shape[1:]  # Shape per expert
             if (
                 getattr(self, "is_mxfp4_quant", False)
@@ -937,23 +948,23 @@ class SharedFullContext:
                 buf_dtype = gpu_tensor.dtype
             element_size = torch.empty((), dtype=buf_dtype).element_size()
             expert_nbytes = gpu_tensor.numel() // num_experts * element_size
-            double_buf_nbytes = expert_nbytes * 2
+            host_buffer_nbytes = expert_nbytes * self.host_buffer_experts
 
             shm_name = f"kt_buf_{name}_r{tp_rank}_{self.shm_unique_id}"
             shm = shared_memory.SharedMemory(
-                name=shm_name, create=True, size=double_buf_nbytes
+                name=shm_name, create=True, size=host_buffer_nbytes
             )
             self.shm_handles[name] = shm
 
-            # Shape: [2, ...expert_shape...]
+            # Shape: [host_buffer_experts, ...expert_shape...]
             cpu_buffer = torch.frombuffer(shm.buf, dtype=buf_dtype).reshape(
-                (2,) + expert_shape
+                (self.host_buffer_experts,) + expert_shape
             )
 
             # Register as pinned memory for fast DMA
             if torch.cuda.is_available():
                 torch.cuda.cudart().cudaHostRegister(
-                    cpu_buffer.data_ptr(), double_buf_nbytes, 0
+                    cpu_buffer.data_ptr(), host_buffer_nbytes, 0
                 )
 
             self.cpu_buffers[name] = cpu_buffer
@@ -2279,6 +2290,14 @@ def create_kt_config_from_server_args(
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=num_layers,
         gpu_prefill_token_threshold=server_args.kt_gpu_prefill_token_threshold,
+        stream_prefill=server_args.kt_stream_prefill,
+        stream_prefill_experts_per_chunk=(
+            server_args.kt_stream_prefill_experts_per_chunk
+        ),
+        stream_prefill_ring_slots=server_args.kt_stream_prefill_ring_slots,
+        stream_prefill_safety_margin_mb=(
+            server_args.kt_stream_prefill_safety_margin_mb
+        ),
         kt_enable_dynamic_expert_update=server_args.kt_enable_dynamic_expert_update,
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
     )
@@ -3265,6 +3284,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         _kt_t_after_merge = None
         _kt_t_cpu_wait_ms = 0.0
 
+        if (
+            self.kt_config.stream_prefill
+            and self.gpu_prefill_token_threshold > 0
+            and num_tokens >= self.gpu_prefill_token_threshold
+        ):
+            return self._apply_stream_prefill(layer, dispatch_output)
+
         # Check for full GPU fallback. The full-GPU path's _build_full_context →
         # _prepare_weight_{mxfp4,fp8,fp8_channel,bf16,int4} helpers read flat
         # `w13_weight` / `w13_weight_packed` attributes off `layer`. V4-Flash
@@ -3623,6 +3649,83 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             logical_to_gpu_index=self.logical_to_gpu_index,
         )
         return _SHARED_FULL_CONTEXT
+
+    def _apply_stream_prefill(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> "CombineInput":
+        """Run the admitted OSDI'26-style bounded expert ring."""
+
+        from sglang.srt.layers.moe.kt_stream_prefill import (
+            KTStreamPrefillConfig,
+            KTStreamPrefillFacts,
+            collectively_admit_kt_stream_prefill,
+            get_existing_kt_stream_prefill_executor,
+            get_or_create_kt_stream_prefill_executor,
+        )
+        from sglang.srt.server_args import get_global_server_args
+
+        executor = get_existing_kt_stream_prefill_executor()
+        if executor is None:
+            server_args = get_global_server_args()
+            hf_config = server_args.get_hf_config()
+            if hasattr(hf_config, "text_config"):
+                hf_config = hf_config.text_config
+            architectures = getattr(hf_config, "architectures", None) or ()
+            architecture = architectures[0] if architectures else ""
+            free_device_bytes, _ = torch.cuda.mem_get_info(
+                next(layer.parameters()).device
+            )
+            hidden_size, intermediate_size_per_partition, parameter_dtype = (
+                self._full_init_args
+            )
+            plan = collectively_admit_kt_stream_prefill(
+                KTStreamPrefillConfig(
+                    enabled=True,
+                    experts_per_chunk=(
+                        self.kt_config.stream_prefill_experts_per_chunk
+                    ),
+                    ring_slots=self.kt_config.stream_prefill_ring_slots,
+                    safety_margin_bytes=(
+                        self.kt_config.stream_prefill_safety_margin_mb
+                        * 1024
+                        * 1024
+                    ),
+                ),
+                KTStreamPrefillFacts(
+                    architecture=architecture,
+                    method=self.kt_config.method,
+                    pipeline_parallel_size=server_args.pp_size,
+                    tensor_parallel_size=get_tensor_model_parallel_world_size(),
+                    threadpool_count=self.kt_config.threadpool_count,
+                    numa_nodes=tuple(self.kt_config.numa_nodes or ()),
+                    num_gpu_experts=self.num_gpu_experts,
+                    max_deferred_experts_per_token=(
+                        self.kt_config.max_deferred_experts_per_token or 0
+                    ),
+                    dynamic_expert_update=(
+                        self.kt_config.kt_enable_dynamic_expert_update
+                    ),
+                    expert_lora_enabled=self.kt_expert_lora_enabled,
+                    prefill_token_threshold=self.gpu_prefill_token_threshold,
+                    num_experts=self.global_num_experts,
+                    top_k=layer.top_k,
+                    hidden_size=hidden_size,
+                    moe_intermediate_size=(
+                        intermediate_size_per_partition
+                        * get_tensor_model_parallel_world_size()
+                    ),
+                    parameter_dtype=parameter_dtype,
+                    available_device_bytes=free_device_bytes,
+                ),
+            )
+            executor = get_or_create_kt_stream_prefill_executor(
+                plan,
+                self,
+                layer,
+            )
+        return executor.apply(self, dispatch_output)
 
 
 # ---------------------------------------------------------------------------
