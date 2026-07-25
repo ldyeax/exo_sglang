@@ -2921,9 +2921,59 @@ class ServerArgs:
         "[ktransformers parameter] The number of GPU experts.",
         NS("exec.moe"),
     ] = None
+    kt_gpu_experts_ratio: A[
+        Optional[float],
+        "[ktransformers parameter] Fraction of routed experts placed on GPU.",
+        NS("exec.moe"),
+    ] = None
     kt_max_deferred_experts_per_token: A[
         Optional[int],
         "[ktransformers parameter] Maximum number of experts deferred to CPU per token. All MoE layers except the final one use this value; the final layer always uses 0.",
+        NS("exec.moe"),
+    ] = None
+    kt_gpu_prefill_token_threshold: A[
+        Optional[int],
+        "[ktransformers parameter] Token threshold for loading routed experts onto GPU during prefill.",
+        NS("exec.moe"),
+    ] = None
+    kt_stream_prefill: A[
+        bool,
+        "[experimental ktransformers parameter] Use a bounded BF16 expert-chunk ring for long-prefill GPU fallback.",
+        NS("exec.moe"),
+    ] = False
+    kt_stream_prefill_experts_per_chunk: A[
+        int,
+        "[experimental ktransformers parameter] Experts held in each stream-prefill ring slot.",
+        NS("exec.moe"),
+    ] = 4
+    kt_stream_prefill_ring_slots: A[
+        int,
+        "[experimental ktransformers parameter] Reusable GPU stream-prefill ring slots.",
+        NS("exec.moe"),
+    ] = 2
+    kt_stream_prefill_safety_margin_mb: A[
+        int,
+        "[experimental ktransformers parameter] VRAM headroom retained after ring allocation, in MiB.",
+        NS("exec.moe"),
+    ] = 512
+    kt_enable_dynamic_expert_update: A[
+        bool,
+        "[experimental ktransformers parameter] Update resident GPU experts from observed routes.",
+        NS("exec.moe"),
+    ] = False
+    kt_expert_placement_strategy: A[
+        str,
+        Arg(choices=["uniform", "front-loading", "frequency", "random"]),
+        NS("exec.moe"),
+    ] = "uniform"
+    kt_lora_path: A[
+        Optional[str],
+        "[deprecated ktransformers parameter] Alias for --kt-expert-lora-path.",
+        NS("exec.moe"),
+    ] = None
+    kt_expert_lora_path: A[
+        Optional[str],
+        "[experimental ktransformers parameter] PEFT adapter for CPU expert LoRA weights.",
         NS("exec.moe"),
     ] = None
 
@@ -3929,6 +3979,23 @@ class ServerArgs:
                     )
 
     def _handle_deprecated_args(self):
+        if self.kt_lora_path:
+            if (
+                self.kt_expert_lora_path
+                and self.kt_expert_lora_path != self.kt_lora_path
+            ):
+                raise ValueError(
+                    "--kt-lora-path and --kt-expert-lora-path cannot point to "
+                    "different adapters"
+                )
+            self.kt_expert_lora_path = self.kt_lora_path
+        if self.kt_expert_lora_path and not self.disable_cuda_graph:
+            logger.warning(
+                "CUDA graph is disabled because KT expert LoRA uses host-side "
+                "CPU expert input copies."
+            )
+            self.disable_cuda_graph = True
+
         # Handle deprecated tool call parsers
         deprecated_tool_call_parsers = {"qwen25": "qwen", "glm45": "glm"}
         if self.tool_call_parser in deprecated_tool_call_parsers:
@@ -8468,6 +8535,85 @@ class ServerArgs:
                 "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
+    def _check_kt_stream_prefill(self) -> None:
+        if not self.kt_stream_prefill:
+            return
+
+        errors = []
+        if self.kt_weight_path is None:
+            errors.append("--kt-weight-path is required")
+        if (self.kt_method or "").upper() != "AMXINT4":
+            errors.append("--kt-method must be AMXINT4")
+        if self.pp_size != 1 or self.tp_size != 2:
+            errors.append(
+                "--pipeline-parallel-size 1 and --tensor-parallel-size 2 are required"
+            )
+        if self.kt_threadpool_count != 2:
+            errors.append("--kt-threadpool-count must be 2")
+        if self.kt_numa_nodes is None or len(self.kt_numa_nodes) != 2:
+            errors.append("--kt-numa-nodes must name exactly two NUMA nodes")
+        elif len(set(self.kt_numa_nodes)) != 2:
+            errors.append("--kt-numa-nodes entries must be distinct")
+        if self.kt_num_gpu_experts != 0:
+            errors.append("--kt-num-gpu-experts must be 0")
+        if self.kt_gpu_experts_ratio is not None:
+            errors.append("--kt-gpu-experts-ratio must not be set")
+        if self.kt_max_deferred_experts_per_token != 0:
+            errors.append("--kt-max-deferred-experts-per-token must be 0")
+        if self.kt_enable_dynamic_expert_update:
+            errors.append("--kt-enable-dynamic-expert-update is incompatible")
+        if self.kt_expert_lora_path is not None:
+            errors.append("--kt-expert-lora-path is not admitted")
+        if (
+            self.kt_gpu_prefill_token_threshold is None
+            or self.kt_gpu_prefill_token_threshold <= 0
+        ):
+            errors.append("--kt-gpu-prefill-token-threshold must be positive")
+        elif (
+            self.max_prefill_tokens > 0
+            and self.kt_gpu_prefill_token_threshold > self.max_prefill_tokens
+        ):
+            errors.append(
+                "--kt-gpu-prefill-token-threshold must not exceed "
+                "--max-prefill-tokens"
+            )
+        if self.enable_two_batch_overlap:
+            errors.append("--enable-two-batch-overlap is incompatible")
+        if self.kt_stream_prefill_ring_slots != 2:
+            errors.append("--kt-stream-prefill-ring-slots must be 2")
+        experts_per_chunk = self.kt_stream_prefill_experts_per_chunk
+        if (
+            experts_per_chunk <= 0
+            or experts_per_chunk > 16
+            or experts_per_chunk & (experts_per_chunk - 1)
+        ):
+            errors.append(
+                "--kt-stream-prefill-experts-per-chunk must be a power of two in [1, 16]"
+            )
+        if self.kt_stream_prefill_safety_margin_mb < 0:
+            errors.append(
+                "--kt-stream-prefill-safety-margin-mb must be non-negative"
+            )
+
+        incompatible_environment = (
+            "SGLANG_KT_REMOTE_EXPERT_ENDPOINT",
+            "SGLANG_KT_REMOTE_EXPERT_PLAN",
+            "SGLANG_KT_REMOTE_EXPERT_ENDPOINTS",
+            "SGLANG_KT_REMOTE_EXPERT_PLANS",
+            "SGLANG_KT_CPU_EXPERT_SHARD_PLAN",
+            "SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN",
+            "SGLANG_KT_GPU_EXPERT_MASK_PLAN",
+            "SGLANG_KT_EXPERT_PROFILE",
+        )
+        configured = [name for name in incompatible_environment if os.environ.get(name)]
+        if configured:
+            errors.append(
+                "unsupported KT placement/offload environment is set: "
+                + ", ".join(configured)
+            )
+        if errors:
+            raise ValueError("KT stream-prefill admission failed: " + "; ".join(errors))
+
     def check_server_args(self):
         # Check parallel size constraints
         if self.ep_join_mode != "scale":
@@ -8631,6 +8777,7 @@ class ServerArgs:
 
         # Check two batch overlap backend requirement.
         self._check_two_batch_overlap()
+        self._check_kt_stream_prefill()
 
         # Check communications compression
         if self.enable_quant_communications and self.tp_size == 1:

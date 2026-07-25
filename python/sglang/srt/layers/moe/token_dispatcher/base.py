@@ -200,7 +200,10 @@ class DispatchOutputFormat(Enum):
 class DispatchOutput(Protocol):
     """Protocol for dispatch outputs in different formats."""
 
-    hidden_states: torch.Tensor
+    # Dispatch outputs are NamedTuples in every current backend, so this must
+    # be a read-only property rather than a writable protocol attribute.
+    @property
+    def hidden_states(self) -> torch.Tensor: ...
 
     @property
     def format(self) -> DispatchOutputFormat: ...
