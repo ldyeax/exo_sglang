@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.batch_overlap import operations
 from sglang.srt.batch_overlap.operations import Operation
+from sglang.srt.layers.moe.quant_method_registry import is_wrapped_method
 from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import is_hip
@@ -81,6 +82,8 @@ def _compute_moe_deepseek_layer_operations_strategy_tbo(
     forward_mode: ForwardMode,
 ) -> OperationsStrategy:
     assert layer.is_layer_sparse, "dense layer TBO not yet implemented"
+    if is_wrapped_method(layer.mlp.experts.quant_method, "kt_ep"):
+        return _compute_moe_deepseek_kt_tbo(layer, forward_mode)
     if forward_mode == ForwardMode.EXTEND:
         return _compute_moe_deepseek_blog_prefill(layer)
     elif (
@@ -89,6 +92,48 @@ def _compute_moe_deepseek_layer_operations_strategy_tbo(
         return _compute_moe_deepseek_blog_decode(layer)
     else:
         raise NotImplementedError(f"Unsupported {forward_mode=}")
+
+
+def _compute_moe_deepseek_kt_tbo(layer, forward_mode):
+    """Overlap exact KT CPU MoE with the other child's GPU attention.
+
+    The empty overlap-window stage is intentional.  The executor advances
+    child A before child B, so delaying A's sync by one stage lets B launch
+    both attention prepare and attention core before A waits for CPU experts.
+    It also guarantees that a layer never has two KT calls in flight.
+    """
+    if not (
+        forward_mode == ForwardMode.EXTEND
+        or forward_mode == ForwardMode.DECODE
+        or forward_mode == ForwardMode.TARGET_VERIFY
+    ):
+        raise NotImplementedError(f"Unsupported {forward_mode=}")
+
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        tbo_delta_stages=2,
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.self_attn.op_prepare,
+            operations.YieldOperation(),
+            layer.self_attn.op_core,
+            layer.op_comm_prepare_mlp,
+            layer.mlp.op_gate,
+            layer.mlp.op_select_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_kt_dispatch,
+            layer.mlp.op_kt_submit,
+            layer.mlp.op_shared_experts,
+            operations.YieldOperation(),
+            layer.mlp.op_kt_overlap_window,
+            operations.YieldOperation(),
+            layer.mlp.op_kt_sync,
+            layer.mlp.op_kt_combine,
+            operations.YieldOperation(),
+            layer.mlp.op_kt_output,
+            layer.op_comm_postprocess_layer,
+        ],
+    )
 
 
 def _compute_moe_deepseek_blog_prefill(layer):

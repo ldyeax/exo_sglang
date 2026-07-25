@@ -32,6 +32,7 @@ import ctypes
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -138,6 +139,24 @@ class KTConfig:
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
     expert_lora_path: Optional[str] = None
+
+
+@dataclass
+class KTAsyncApplyHandle:
+    """State retained between a TBO CPU-MoE submit and its later sync."""
+
+    owner: "KTEPWrapperMethod"
+    generation: int
+    reference: torch.Tensor
+    staging_buffer: Optional[torch.Tensor]
+    staging_lease: Optional["SharedStagingLease"]
+    gpu_output: torch.Tensor
+    cpu_submitted: bool
+    closed: bool = False
+
+    def abort_on_error(self) -> None:
+        """Drain and release this operation during TBO executor unwinding."""
+        self.owner.abort_tbo_apply(self)
 
 
 @dataclass
@@ -332,6 +351,10 @@ class SharedStagingBuffer:
             dtype=dtype,
             device=device,
         )
+        self._lease_lock = threading.Lock()
+        self._lease_generation = 0
+        self._lease_token: Optional[object] = None
+        self._lease_owner: Optional[str] = None
         buffer_size_mb = self.buffer.numel() * self.buffer.element_size() / 1024**2
         logger.info(
             f"[KT] Created shared staging buffer: {buffer_size_mb:.1f} MiB "
@@ -339,11 +362,108 @@ class SharedStagingBuffer:
         )
 
     def get_slice(self, num_tokens: int) -> torch.Tensor:
-        """Get a slice of the buffer for the given number of tokens."""
-        assert num_tokens <= self.max_tokens, (
-            f"Batch size {num_tokens} exceeds staging buffer max size {self.max_tokens}"
-        )
+        """Get an unleased slice for the synchronous legacy apply path.
+
+        A TBO operation owns the buffer from submit through sync.  Refuse a
+        legacy caller while that lease is active instead of silently letting
+        it overwrite the CPU job's input.
+        """
+        with self._lease_lock:
+            if self._lease_token is not None:
+                raise RuntimeError(
+                    "KT shared staging buffer is leased by "
+                    f"{self._lease_owner}; synchronous reuse is unsafe"
+                )
+            self._validate_num_tokens(num_tokens)
         return self.buffer[:num_tokens]
+
+    def acquire(self, num_tokens: int, *, owner: str) -> "SharedStagingLease":
+        """Acquire the sole process-local TBO staging-buffer lease."""
+        with self._lease_lock:
+            self._validate_num_tokens(num_tokens)
+            if self._lease_token is not None:
+                raise RuntimeError(
+                    "KT shared staging buffer already has an in-flight CPU "
+                    f"job owned by {self._lease_owner}"
+                )
+            self._lease_generation += 1
+            token = object()
+            self._lease_token = token
+            self._lease_owner = owner
+            return SharedStagingLease(
+                owner=self,
+                token=token,
+                generation=self._lease_generation,
+                owner_label=owner,
+                tensor=self.buffer[:num_tokens],
+            )
+
+    def release(self, lease: "SharedStagingLease") -> None:
+        """Release exactly the active lease; stale handles fail closed."""
+        with self._lease_lock:
+            if lease.released:
+                raise RuntimeError(
+                    f"KT staging lease {lease.generation} was already released"
+                )
+            if (
+                self._lease_token is not lease.token
+                or self._lease_generation != lease.generation
+            ):
+                raise RuntimeError(
+                    "KT staging lease does not own the active buffer generation"
+                )
+            self._lease_token = None
+            self._lease_owner = None
+            lease.released = True
+
+    def _validate_num_tokens(self, num_tokens: int) -> None:
+        if num_tokens < 0 or num_tokens > self.max_tokens:
+            raise ValueError(
+                f"Batch size {num_tokens} is outside staging buffer capacity "
+                f"[0, {self.max_tokens}]"
+            )
+
+    def validate_spec(
+        self,
+        *,
+        max_tokens: int,
+        hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> None:
+        requested_device = torch.device(device)
+        actual_device = self.buffer.device
+        if (
+            max_tokens != self.max_tokens
+            or hidden_size != self.hidden_size
+            or dtype != self.buffer.dtype
+            or requested_device != actual_device
+        ):
+            raise RuntimeError(
+                "KT shared staging buffer was already initialized with an "
+                "incompatible specification: "
+                f"existing=(max_tokens={self.max_tokens}, "
+                f"hidden_size={self.hidden_size}, dtype={self.buffer.dtype}, "
+                f"device={actual_device}), "
+                f"requested=(max_tokens={max_tokens}, "
+                f"hidden_size={hidden_size}, dtype={dtype}, "
+                f"device={requested_device})"
+            )
+
+
+@dataclass
+class SharedStagingLease:
+    """Generation-bound ownership token for :class:`SharedStagingBuffer`."""
+
+    owner: SharedStagingBuffer
+    token: object
+    generation: int
+    owner_label: str
+    tensor: torch.Tensor
+    released: bool = False
+
+    def release(self) -> None:
+        self.owner.release(self)
 
 
 def get_or_create_shared_staging_buffer(
@@ -356,6 +476,13 @@ def get_or_create_shared_staging_buffer(
     global _SHARED_STAGING_BUFFER
     if _SHARED_STAGING_BUFFER is None:
         _SHARED_STAGING_BUFFER = SharedStagingBuffer(
+            max_tokens=max_tokens,
+            hidden_size=hidden_size,
+            dtype=dtype,
+            device=device,
+        )
+    else:
+        _SHARED_STAGING_BUFFER.validate_spec(
             max_tokens=max_tokens,
             hidden_size=hidden_size,
             dtype=dtype,
@@ -2509,6 +2636,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Shared staging buffer reference (initialized in create_weights, shared across all layers)
         self._shared_staging_buffer: Optional[SharedStagingBuffer] = None
         self._staging_buffer_max_size: int = kt_config.chunked_prefill_size or 8192
+        self._tbo_apply_in_flight = False
+        self._tbo_apply_generation = 0
+        self._tbo_apply_handle: Optional[KTAsyncApplyHandle] = None
 
     def create_weights(
         self,
@@ -2867,6 +2997,194 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             return torch.zeros_like(staged_hidden_states)
 
         return self._sync_cpu_forward(staged_hidden_states)
+
+    def begin_tbo_apply(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+    ) -> KTAsyncApplyHandle:
+        """Start one exact KT MoE operation without waiting for its CPU result.
+
+        SGLang's TBO scheduler calls :meth:`finish_tbo_apply` after the other
+        child batch has launched attention work.  KT's wrapper owns one output
+        workspace per layer, so deliberately allow only one outstanding call.
+        """
+        if self._tbo_apply_in_flight:
+            raise RuntimeError(
+                f"KT layer {self.kt_config.layer_idx} already has an in-flight "
+                "two-batch-overlap operation"
+            )
+        self._tbo_apply_in_flight = True
+        self._tbo_apply_generation += 1
+        generation = self._tbo_apply_generation
+
+        from sglang.srt.eplb.expert_distribution import (
+            get_global_expert_distribution_recorder,
+        )
+
+        staging_lease: Optional[SharedStagingLease] = None
+        cpu_submitted = False
+        x = dispatch_output.hidden_states
+        try:
+            if self.tp_rank == 0:
+                get_global_expert_distribution_recorder().on_gpu_expert_mask(
+                    self.kt_config.layer_idx, self.gpu_experts_mask_cuda
+                )
+
+            staging_buffer = None
+            if self.tp_rank == 0 and self._cpu_stream is not None:
+                if self._shared_staging_buffer is None:
+                    raise RuntimeError("Shared staging buffer not initialized")
+                staging_lease = self._shared_staging_buffer.acquire(
+                    x.shape[0],
+                    owner=(
+                        f"layer={self.kt_config.layer_idx},"
+                        f"generation={generation}"
+                    ),
+                )
+                staging_buffer = staging_lease.tensor
+                staging_buffer.copy_(x, non_blocking=True)
+                self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
+                with torch.cuda.stream(self._cpu_stream):
+                    self._submit_with_staged_input(
+                        layer, dispatch_output, staging_buffer
+                    )
+                cpu_submitted = True
+
+            topk_output = dispatch_output.topk_output
+            topk_ids = topk_output.topk_ids
+            masked_topk_ids = mask_and_remap_expert_ids(
+                topk_ids,
+                self.gpu_experts_mask_cuda,
+                self.logical_to_gpu_index_cuda,
+            )
+            masked_dispatch_output = dispatch_output._replace(
+                topk_output=topk_output._replace(topk_ids=masked_topk_ids)
+            )
+
+            if (
+                self.num_gpu_experts == 0
+                or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1"
+            ):
+                gpu_output = torch.zeros_like(x)
+            else:
+                gpu_output = self.gpu_method.apply(
+                    layer, masked_dispatch_output
+                ).hidden_states
+
+            handle = KTAsyncApplyHandle(
+                owner=self,
+                generation=generation,
+                reference=x,
+                staging_buffer=staging_buffer,
+                staging_lease=staging_lease,
+                gpu_output=gpu_output,
+                cpu_submitted=cpu_submitted,
+            )
+            self._tbo_apply_handle = handle
+            return handle
+        except BaseException as error:
+            cleanup_succeeded = not cpu_submitted
+            if cpu_submitted:
+                try:
+                    assert staging_lease is not None
+                    self._drain_tbo_cpu_job(x, staging_lease.tensor)
+                    cleanup_succeeded = True
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        "KT TBO CPU-job cleanup also failed; the staging "
+                        f"buffer remains leased: {cleanup_error!r}"
+                    )
+                    logger.exception(
+                        "Failed to drain KT layer %d TBO CPU job after submit error",
+                        self.kt_config.layer_idx,
+                    )
+            if cleanup_succeeded:
+                if staging_lease is not None:
+                    staging_lease.release()
+                self._tbo_apply_in_flight = False
+            raise
+
+    def finish_tbo_apply(self, handle: KTAsyncApplyHandle) -> "CombineInput":
+        """Finish an operation started by :meth:`begin_tbo_apply`."""
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        self._validate_tbo_handle(handle)
+
+        cpu_drained = not handle.cpu_submitted
+        try:
+            output = handle.gpu_output
+            if handle.cpu_submitted:
+                if handle.staging_buffer is None:
+                    raise RuntimeError(
+                        "KT TBO handle submitted a CPU job without staging storage"
+                    )
+                cpu_output = self._drain_tbo_cpu_job(
+                    handle.reference, handle.staging_buffer
+                )
+                cpu_drained = True
+                output = output + cpu_output
+            return StandardCombineInput(hidden_states=output)
+        finally:
+            # If sync itself fails, retain the lease and active generation.  A
+            # subsequent writer must fail closed rather than corrupt a CPU job
+            # whose completion is unknown.
+            if cpu_drained:
+                self._release_tbo_handle(handle)
+
+    def abort_tbo_apply(self, handle: KTAsyncApplyHandle) -> None:
+        """Drain an outstanding TBO CPU job while unwinding another error."""
+        self._validate_tbo_handle(handle)
+        if handle.cpu_submitted:
+            if handle.staging_buffer is None:
+                raise RuntimeError(
+                    "KT TBO handle submitted a CPU job without staging storage"
+                )
+            self._drain_tbo_cpu_job(handle.reference, handle.staging_buffer)
+        self._release_tbo_handle(handle)
+
+    def _validate_tbo_handle(self, handle: KTAsyncApplyHandle) -> None:
+        if handle.owner is not self:
+            raise RuntimeError(
+                f"KT layer {self.kt_config.layer_idx} received a handle owned "
+                "by another wrapper"
+            )
+        if handle.closed:
+            raise RuntimeError(
+                f"KT TBO handle generation {handle.generation} is already closed"
+            )
+        if (
+            not self._tbo_apply_in_flight
+            or self._tbo_apply_handle is not handle
+            or handle.generation != self._tbo_apply_generation
+        ):
+            raise RuntimeError(
+                f"KT layer {self.kt_config.layer_idx} received a stale or "
+                f"non-active TBO handle generation {handle.generation}"
+            )
+
+    def _drain_tbo_cpu_job(
+        self, reference: torch.Tensor, staging_buffer: torch.Tensor
+    ) -> torch.Tensor:
+        if self.tp_rank != 0 or self._cpu_stream is None:
+            raise RuntimeError("Only KT TP rank 0 can own a TBO CPU job")
+        if self._sync_done_event is None:
+            raise RuntimeError("KT TBO completion event is not initialized")
+        with torch.cuda.stream(self._cpu_stream):
+            cpu_output = self._sync_with_staged_input(staging_buffer)
+            self._sync_done_event.record(self._cpu_stream)
+        torch.cuda.current_stream(reference.device).wait_event(
+            self._sync_done_event
+        )
+        return cpu_output
+
+    def _release_tbo_handle(self, handle: KTAsyncApplyHandle) -> None:
+        self._validate_tbo_handle(handle)
+        if handle.staging_lease is not None:
+            handle.staging_lease.release()
+        handle.closed = True
+        self._tbo_apply_handle = None
+        self._tbo_apply_in_flight = False
 
     def apply(
         self,
