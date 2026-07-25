@@ -247,6 +247,19 @@ from sglang.kernels.ops.gemm.fused_a_gemm import (
 
 logger = logging.getLogger(__name__)
 
+_PACKED_LINEAR_QUANTIZATION_METHODS = frozenset(
+    {"awq", "awq_marlin", "gptq", "gptq_marlin", "moe_wna16"}
+)
+
+
+def _uses_packed_linear_weights(layer: nn.Module) -> bool:
+    quant_method = getattr(layer, "quant_method", None)
+    quant_config = getattr(quant_method, "quant_config", None)
+    return (
+        quant_config is not None
+        and quant_config.get_name() in _PACKED_LINEAR_QUANTIZATION_METHODS
+    )
+
 
 def _join_cuda_side_stream_tensor(
     tensor: Optional[torch.Tensor],
@@ -788,13 +801,9 @@ class DeepseekV2MoE(nn.Module):
                 self.shared_experts._enable_nvfp4_gemm_swiglu_fusion = True
                 self.shared_experts.down_proj._accepts_prequantized_fp4 = True
             self._shared_expert_tp1 = _shared_expert_use_tp1
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                "awq",
-                "awq_marlin",
-                "moe_wna16",
-            }
+            is_packed_weight = _uses_packed_linear_weights(
+                self.shared_experts.gate_up_proj
+            )
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
@@ -2134,11 +2143,8 @@ class DeepseekV2AttentionMLA(
         )
 
         self.has_fused_proj = hasattr(self, "fused_qkv_a_proj_with_mqa")
-        self.is_packed_weight = (
-            self.has_fused_proj
-            and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
-            and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+        self.is_packed_weight = self.has_fused_proj and _uses_packed_linear_weights(
+            self.fused_qkv_a_proj_with_mqa
         )
         self._use_min_latency_fused_a_gemm: bool | None = None
         self.fused_a_gemm_backend = "auto"
@@ -2154,6 +2160,12 @@ class DeepseekV2AttentionMLA(
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
+
+    def _get_mla_kv_b_w8_method(self):
+        quant_method = getattr(self.kv_b_proj, "quant_method", None)
+        if getattr(quant_method, "is_mla_kv_b_w8", False):
+            return quant_method
+        return None
 
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
@@ -2211,7 +2223,20 @@ class DeepseekV2AttentionMLA(
         self.current_attention_backend = attention_backend
 
         handler = AttentionBackendRegistry.get_handler(attention_backend)
-        return handler(self, forward_batch)
+        attn_forward_method = handler(self, forward_batch)
+        # The compact layout has no ordinary Linear orientation. Fail closed
+        # on MHA and platform-specific fused variants; CUDA must stay on the
+        # plain absorbed-MLA implementation that calls the compact kernels.
+        if (
+            self._get_mla_kv_b_w8_method() is not None
+            and attn_forward_method != AttnForwardMethod.MLA
+        ):
+            raise RuntimeError(
+                "compact MLA kv_b W8 requires the absorbed MLA attention "
+                f"path, but backend {attention_backend!r} selected "
+                f"{attn_forward_method}"
+            )
+        return attn_forward_method
 
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(

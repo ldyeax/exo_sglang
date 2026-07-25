@@ -211,6 +211,8 @@ class DeepseekMLAForwardMixin:
             return False
         if not self.use_dsa:
             return False
+        if self._get_mla_kv_b_w8_method() is not None:
+            return False
         if self.use_deep_gemm_bmm or _is_hip:
             return False
         if is_kv_b_lora_active(self):
@@ -618,7 +620,12 @@ class DeepseekMLAForwardMixin:
 
                 _kvb_q = kv_b_lora_q_prepare(self, q_nope)
 
-            if self.use_deep_gemm_bmm:
+            mla_kv_b_w8_method = self._get_mla_kv_b_w8_method()
+            if mla_kv_b_w8_method is not None:
+                q_nope_out = mla_kv_b_w8_method.apply_mla_k(
+                    self.kv_b_proj, q_nope
+                )
+            elif self.use_deep_gemm_bmm:
                 (
                     q_nope_val,
                     q_nope_scale,
@@ -1056,7 +1063,12 @@ class DeepseekMLAForwardMixin:
 
             _kvb_v = kv_b_lora_v_prepare(self, attn_output)
 
-        if self.use_deep_gemm_bmm:
+        mla_kv_b_w8_method = self._get_mla_kv_b_w8_method()
+        if mla_kv_b_w8_method is not None:
+            attn_bmm_output = mla_kv_b_w8_method.apply_mla_v(
+                self.kv_b_proj, attn_output
+            )
+        elif self.use_deep_gemm_bmm:
             (
                 attn_output_val,
                 attn_output_scale,
