@@ -44,8 +44,8 @@ def _executors(**overrides) -> GLM52ExecutorCompatibility:
         "distributed_slp_ready": True,
         "distributed_slp_tensor_parallel_size": 2,
         "distributed_slp_admission": "kt-stream-prefill:ring=2:chunk=4",
-        # These stay false by default because this branch does not have TP1
-        # process/model wiring.  Split tests opt in with an explicit proof.
+        # A unified server does not imply that the separate TP1 process trees
+        # are live. Split tests opt in with an explicit runtime proof.
         "split_slp_ready": False,
         "split_slp_tensor_parallel_size": 1,
         "split_decode_ready": False,

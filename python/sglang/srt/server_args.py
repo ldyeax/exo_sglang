@@ -2938,7 +2938,11 @@ class ServerArgs:
     ] = None
     kt_stream_prefill: A[
         bool,
-        "[experimental ktransformers parameter] Use a bounded BF16 expert-chunk ring for long-prefill GPU fallback.",
+        (
+            "[experimental ktransformers parameter] Use a bounded BF16 "
+            "expert-chunk ring for GLM-5.2 PP=1 long-prefill GPU fallback "
+            "with TP=1 or TP=2 and two AMXINT4 NUMA pools."
+        ),
         NS("exec.moe"),
     ] = False
     kt_stream_prefill_small_ep: A[
@@ -2970,7 +2974,8 @@ class ServerArgs:
         (
             "[experimental ktransformers parameter] Install the fail-closed "
             "GLM-5.2 intra-node routing/admission planner. This exposes plans "
-            "and state hooks only; it does not launch split TP=1 executors."
+            "and state hooks; sglang.srt.disaggregation.glm52_intra_node_runtime "
+            "launches the admitted split TP=1 topology."
         ),
         NS("exec.moe"),
     ] = False
@@ -8554,7 +8559,7 @@ class ServerArgs:
             )
 
     def create_glm52_intra_node_pd_controller(self):
-        """Build the tokenizer-owned planner hook without claiming split wiring."""
+        """Build the tokenizer-owned pure planner hook."""
 
         if not self.enable_glm52_intra_node_pd_planner:
             return None
@@ -8585,9 +8590,10 @@ class ServerArgs:
         errors = []
         if not self.kt_stream_prefill:
             errors.append("--kt-stream-prefill is required")
-        if self.pp_size != 1 or self.tp_size != 2:
+        if self.pp_size != 1 or self.tp_size not in {1, 2}:
             errors.append(
-                "--pipeline-parallel-size 1 and --tensor-parallel-size 2 are required"
+                "--pipeline-parallel-size 1 and --tensor-parallel-size 1 or 2 "
+                "are required"
             )
         if self.chunked_prefill_size is None or self.chunked_prefill_size <= 0:
             errors.append("chunked prefill must be enabled")
@@ -8688,6 +8694,11 @@ class ServerArgs:
             architectures = getattr(hf_config, "architectures", None) or ()
             architecture = architectures[0] if architectures else ""
             resolved = self._resolved()
+            if self.tp_size != 2:
+                errors.append(
+                    "--kt-stream-prefill-small-ep requires "
+                    "--tensor-parallel-size 2"
+                )
             if architecture != "GlmMoeDsaForCausalLM":
                 errors.append(
                     "--kt-stream-prefill-small-ep requires GlmMoeDsaForCausalLM"
