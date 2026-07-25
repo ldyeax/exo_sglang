@@ -18,9 +18,6 @@ import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.srt.configs.model_config import is_deepseek_nsa
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
@@ -51,7 +48,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_common.utils import enable_nextn_moe_bf16_cast_to_fp8
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.kt_mtp import get_glm52_kt_mtp_shared_modules
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+from torch import nn
+from transformers import PretrainedConfig
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +85,16 @@ class DeepseekModelNextN(nn.Module):
 
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            use_attn_tp_group=is_dp_attention_enabled(),
-            prefix=add_prefix("embed_tokens", prefix),
-        )
+        kt_mtp_shared_modules = get_glm52_kt_mtp_shared_modules()
+        if kt_mtp_shared_modules is None:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                use_attn_tp_group=is_dp_attention_enabled(),
+                prefix=add_prefix("embed_tokens", prefix),
+            )
+        else:
+            self.embed_tokens = kt_mtp_shared_modules.embed_tokens
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -191,7 +195,6 @@ class DeepseekModelNextN(nn.Module):
 
 
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -217,12 +220,19 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.model = DeepseekModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+        kt_mtp_shared_modules = get_glm52_kt_mtp_shared_modules()
+        if kt_mtp_shared_modules is None:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("model.shared_head.head", prefix),
+                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+            )
+        else:
+            self.lm_head = kt_mtp_shared_modules.lm_head
+        self.kt_mtp_shared_embed_and_head_at_construction = (
+            kt_mtp_shared_modules is not None
         )
         self.logits_processor = LogitsProcessor(config)
 

@@ -3,7 +3,6 @@ import time
 from typing import List, Optional, Tuple
 
 import torch
-
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
     EAGLEDraftNpuGraphRunner,
@@ -47,12 +46,14 @@ from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.kt_mtp import (
     KTMTPAdmission,
+    KTMTPAdmissionError,
     admit_glm52_kt_mtp,
+    glm52_kt_mtp_shared_modules,
     validate_loaded_glm52_kt_mtp,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
     detect_nan,
@@ -82,7 +83,6 @@ logger = logging.getLogger(__name__)
 
 
 class EAGLEWorker(TpModelWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -153,8 +153,12 @@ class EAGLEWorker(TpModelWorker):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), self._kt_mtp_context():
+            ctx,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            self._kt_mtp_context(),
+            self._kt_mtp_shared_modules_context(),
+        ):
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -220,9 +224,11 @@ class EAGLEWorker(TpModelWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -304,6 +310,19 @@ class EAGLEWorker(TpModelWorker):
             physical_layer_index=admission.physical_layer_index,
         )
 
+    def _kt_mtp_shared_modules_context(self):
+        if not self.kt_mtp_admission.enabled:
+            return empty_context()
+        target_model = self.target_worker.model_runner.model
+        try:
+            embed_tokens = target_model.model.embed_tokens
+            lm_head = target_model.lm_head
+        except AttributeError as error:
+            raise KTMTPAdmissionError(
+                "GLM-5.2 KT MTP target does not expose model.embed_tokens and lm_head"
+            ) from error
+        return glm52_kt_mtp_shared_modules(embed_tokens, lm_head)
+
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         """Run speculative decoding forward.
 
@@ -320,9 +339,12 @@ class EAGLEWorker(TpModelWorker):
             logits_output, next_token_ids, seq_lens_cpu = self.forward_target_extend(
                 batch
             )
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), self._kt_mtp_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                self._kt_mtp_context(),
+            ):
                 self.forward_draft_extend(
                     batch,
                     logits_output.hidden_states,
@@ -337,17 +359,23 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), self._kt_mtp_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                self._kt_mtp_context(),
+            ):
                 spec_info = self.draft(batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
 
-            with self.draft_tp_context(
-                self.draft_model_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), self._kt_mtp_context():
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+                self._kt_mtp_context(),
+            ):
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (
