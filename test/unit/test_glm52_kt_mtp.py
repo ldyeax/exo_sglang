@@ -107,6 +107,10 @@ def test_non_glm_draft_retains_gpu_only_behavior():
         ("kt_method", "BF16"),
         ("speculative_num_steps", 2),
         ("disable_cuda_graph", False),
+        ("load_format", None),
+        ("speculative_draft_load_format", None),
+        ("kt_threadpool_count", True),
+        ("kt_numa_nodes", [0, -1]),
     ],
 )
 def test_glm52_candidate_rejects_unsupported_runtime_values(field: str, value):
@@ -486,11 +490,29 @@ def _make_hybrid_artifacts(
         },
         "files": target_files,
         "kind": "glm52_amxint4_ampere_w8a16_hybrid_checkpoint",
+        "output": {
+            "payload_bytes": 20_056_714_112,
+            "shard_count": 5,
+            "tensor_count": 2_052,
+        },
         "policy": {
             "omit_expert": {"source_tensor_count": 58_368},
             "omitted_expert_names_sha256": (
                 "dc2323c334d9af5eebbce9dd266059d4b9927945eeeff1b57cae9139f30ae1cc"
             ),
+        },
+        "quantization": {
+            "activation_dtype": "BF16",
+            "checkpoint_layout": {
+                "mla_kv_b": "gptq_packed_rows_per_head_v1",
+                "ordinary_linear": "gptq_packed_rows",
+            },
+            "mla_kv_b_compact_to_compact_marlin_repack_at_load": True,
+            "mla_kv_b_triton_uses_serialized_words_directly": True,
+            "ordinary_linear_compact_to_compact_marlin_repack_at_load": True,
+            "serialized_scale_dtype": "BF16",
+            "serialized_weight_dtype": ("INT8_biased_by_128_packed_in_INT32"),
+            "temporary_bf16_expansion_at_load": False,
         },
         "schema_version": 1,
     }
@@ -500,7 +522,11 @@ def _make_hybrid_artifacts(
             _canonical_json_bytes(content_contract)
         ).hexdigest(),
         "created_at_utc": "2026-07-25T00:00:00+00:00",
-        "immutability": {"materialized_offline": True},
+        "immutability": {
+            "directory_mode": "0555",
+            "file_mode": "0444",
+            "materialized_offline": True,
+        },
         "tensors": [],
     }
     _write_json(
@@ -511,6 +537,7 @@ def _make_hybrid_artifacts(
     for directory in (model_path, weight_path):
         for path in directory.iterdir():
             path.chmod(0o444)
+    model_path.chmod(0o555)
     shared_manifest.chmod(0o444)
     return model_path, weight_path, shared_manifest, shared_content_id
 
@@ -590,6 +617,72 @@ def test_hybrid_admission_proves_compact_kv_b_and_external_mtp_experts(
     assert admission.enabled
     assert admission.compact_mla_kv_b_w8
     assert "direct compact MLA kv_b W8" in admission.reason
+
+
+def test_hybrid_admission_requires_target_shard_manifest_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _clear_shared_weight_environment(monkeypatch)
+    model_path, weight_path, _, _ = _make_hybrid_artifacts(tmp_path)
+
+    def mutate(manifest):
+        manifest["files"] = [
+            entry
+            for entry in manifest["files"]
+            if entry["path"] != "model-00001-of-00001.safetensors"
+        ]
+
+    _rewrite_hybrid_manifest(model_path, mutate)
+
+    with pytest.raises(
+        KTMTPAdmissionError,
+        match="does not attest target layer-78 shards",
+    ):
+        admit_glm52_kt_mtp(
+            _hybrid_server_args(model_path, weight_path),
+            _glm52_config(),
+        )
+
+
+@pytest.mark.parametrize("writable_target", ["root", "manifest"])
+def test_hybrid_admission_requires_live_immutable_root_and_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writable_target: str,
+):
+    _clear_shared_weight_environment(monkeypatch)
+    model_path, weight_path, _, _ = _make_hybrid_artifacts(tmp_path)
+    if writable_target == "root":
+        model_path.chmod(0o755)
+    else:
+        (model_path / "hybrid-checkpoint-manifest.json").chmod(0o644)
+
+    with pytest.raises(KTMTPAdmissionError, match="is not immutable"):
+        admit_glm52_kt_mtp(
+            _hybrid_server_args(model_path, weight_path),
+            _glm52_config(),
+        )
+
+
+def test_named_dangling_hybrid_manifest_cannot_fall_back_to_legacy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _clear_shared_weight_environment(monkeypatch)
+    model_path, weight_path = _make_artifacts(tmp_path)
+    (model_path / "hybrid-checkpoint-manifest.json").symlink_to(
+        model_path / "missing-manifest.json"
+    )
+
+    with pytest.raises(
+        KTMTPAdmissionError,
+        match="Hybrid target manifest is present",
+    ):
+        admit_glm52_kt_mtp(
+            _hybrid_server_args(model_path, weight_path),
+            _glm52_config(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -693,6 +786,27 @@ def test_hybrid_admission_rejects_non_string_compact_shard(
     _write_json(index_path, index)
 
     with pytest.raises(KTMTPAdmissionError, match="non-string shard"):
+        admit_glm52_kt_mtp(
+            _hybrid_server_args(model_path, weight_path),
+            _glm52_config(),
+        )
+
+
+def test_hybrid_admission_rejects_nested_target_shard_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _clear_shared_weight_environment(monkeypatch)
+    model_path, weight_path, _, _ = _make_hybrid_artifacts(tmp_path)
+    index_path = model_path / "model.safetensors.index.json"
+    index_path.chmod(0o644)
+    index = json.loads(index_path.read_text())
+    index["weight_map"]["model.layers.78.self_attn.kv_b_proj.kc_qweight"] = (
+        "nested/model.safetensors"
+    )
+    _write_json(index_path, index)
+
+    with pytest.raises(KTMTPAdmissionError, match="unsafe shard paths"):
         admit_glm52_kt_mtp(
             _hybrid_server_args(model_path, weight_path),
             _glm52_config(),
