@@ -734,6 +734,7 @@ class ServerArgs:
     kt_stream_prefill_experts_per_chunk: int = 4
     kt_stream_prefill_ring_slots: int = 2
     kt_stream_prefill_safety_margin_mb: int = 512
+    enable_glm52_intra_node_pd_planner: bool = False
     record_kt_gpu_expert_distribution: bool = False
     kt_enable_dynamic_expert_update: bool = False
     kt_expert_placement_strategy: str = "uniform"
@@ -4904,6 +4905,15 @@ class ServerArgs:
             "allocating the BF16 expert ring (default 512 MiB).",
         )
         parser.add_argument(
+            "--enable-glm52-intra-node-pd-planner",
+            action="store_true",
+            default=ServerArgs.enable_glm52_intra_node_pd_planner,
+            help="[experimental ktransformers parameter] Install the fail-closed "
+            "GLM-5.2 dwagon routing/admission controller. This exposes plans and "
+            "state hooks only; it does not launch the unavailable TP1 prefill/decode "
+            "split executors.",
+        )
+        parser.add_argument(
             "--record-kt-gpu-expert-distribution",
             action="store_true",
             help="[ktransformers parameter] Record GPU expert distribution (which experts are on GPU) for each forward pass. Recorded data is dumped with expert distribution stats.",
@@ -5716,6 +5726,31 @@ class ServerArgs:
         # It is used to determine the caching point in a sequence during prefill.
         return max(FLA_CHUNK_SIZE, self.page_size)
 
+    def create_glm52_intra_node_pd_controller(self):
+        """Build the tokenizer-owned planner hook without claiming split wiring."""
+
+        if not self.enable_glm52_intra_node_pd_planner:
+            return None
+
+        from sglang.srt.disaggregation.glm52_intra_node_policy import (
+            GLM52IntraNodeAdmissionController,
+            GLM52IntraNodePolicyConfig,
+        )
+
+        assert self.kt_gpu_prefill_token_threshold is not None
+        assert self.chunked_prefill_size is not None
+        return GLM52IntraNodeAdmissionController(
+            GLM52IntraNodePolicyConfig(
+                enabled=True,
+                long_prompt_threshold=self.kt_gpu_prefill_token_threshold,
+                chunked_prefill_size=self.chunked_prefill_size,
+                gpu_ids=(
+                    self.base_gpu_id,
+                    self.base_gpu_id + self.gpu_id_step,
+                ),
+            )
+        )
+
     def check_server_args(self):
         # Check parallel size constraints
         assert (
@@ -5933,6 +5968,42 @@ class ServerArgs:
                 raise ValueError(
                     "KT stream-prefill admission failed: "
                     + "; ".join(stream_prefill_errors)
+                )
+
+        if self.enable_glm52_intra_node_pd_planner:
+            planner_errors = []
+            if not self.kt_stream_prefill:
+                planner_errors.append("--kt-stream-prefill is required")
+            if self.pp_size != 1 or self.tp_size != 2:
+                planner_errors.append(
+                    "--pipeline-parallel-size 1 and --tensor-parallel-size 2 "
+                    "are required"
+                )
+            if self.chunked_prefill_size is None or self.chunked_prefill_size <= 0:
+                planner_errors.append("chunked prefill must be enabled")
+            if (
+                self.kt_gpu_prefill_token_threshold is None
+                or self.kt_gpu_prefill_token_threshold <= 0
+            ):
+                planner_errors.append(
+                    "--kt-gpu-prefill-token-threshold must be positive"
+                )
+            elif self.kt_gpu_prefill_token_threshold > self.max_prefill_tokens:
+                planner_errors.append(
+                    "--kt-gpu-prefill-token-threshold must not exceed "
+                    "--max-prefill-tokens"
+                )
+            if self.disaggregation_mode != "null":
+                planner_errors.append(
+                    "--disaggregation-mode must be null; the intra-node planner "
+                    "owns a separate routing contract"
+                )
+            if self.enable_pdmux:
+                planner_errors.append("--enable-pdmux is incompatible")
+            if planner_errors:
+                raise ValueError(
+                    "GLM-5.2 intra-node PD planner admission failed: "
+                    + "; ".join(planner_errors)
                 )
 
     def check_torch_2_9_1_cudnn_compatibility(self):

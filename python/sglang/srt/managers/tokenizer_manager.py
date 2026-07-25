@@ -406,6 +406,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             self.server_args.disaggregation_mode
         )
         self.bootstrap_server = start_disagg_service(self.server_args)
+        # The controller owns plans and reservations only. A future router must
+        # supply executor, shared-host-weight, and live capacity contracts.
+        self.glm52_intra_node_pd_controller = (
+            self.server_args.create_glm52_intra_node_pd_controller()
+        )
 
         # Encoder Disaggregation
         if self.server_args.language_only:
