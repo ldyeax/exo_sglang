@@ -5752,6 +5752,13 @@ class ServerArgs:
         )
 
     def check_server_args(self):
+        if self.enable_two_batch_overlap and self.kt_stream_prefill:
+            raise ValueError(
+                "--kt-stream-prefill cannot be combined with "
+                "--enable-two-batch-overlap because the KTransformers TBO "
+                "path does not dispatch the stream-prefill expert ring."
+            )
+
         # Check parallel size constraints
         assert (
             self.tp_size * self.pp_size

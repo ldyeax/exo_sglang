@@ -29,6 +29,23 @@ class TestPrepareServerArgs(CustomTestCase):
         )
 
 
+class TestKTransformersAdmission(unittest.TestCase):
+    def test_stream_prefill_rejects_two_batch_overlap(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            served_model_name="dummy",
+            kt_stream_prefill=True,
+            enable_two_batch_overlap=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "--kt-stream-prefill cannot be combined with "
+            "--enable-two-batch-overlap",
+        ):
+            server_args.check_server_args()
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):
         server_args = ServerArgs(model_path="dummy", disaggregation_mode="null")
