@@ -84,7 +84,6 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -4006,20 +4005,32 @@ def create_kt_config_from_server_args(
     """
     # Check if KT EP wrapper is disabled (e.g., for draft models in speculative decoding)
     try:
-        from sglang.srt.layers.moe.utils import is_kt_ep_wrapper_disabled
+        from sglang.srt.layers.moe.utils import (
+            get_kt_ep_weight_layer_index,
+            is_kt_ep_wrapper_disabled,
+        )
     except ImportError:
 
         def is_kt_ep_wrapper_disabled() -> bool:
             return False
 
+        def get_kt_ep_weight_layer_index(local_layer_index: int) -> int:
+            return local_layer_index
+
     if is_kt_ep_wrapper_disabled():
         return None
+
+    local_layer_idx = layer_idx
+    layer_idx = get_kt_ep_weight_layer_index(local_layer_idx)
 
     if server_args.kt_weight_path is None:
         return None
 
     hf_config = _get_hf_config(server_args)
     num_layers = getattr(hf_config, "num_hidden_layers", None)
+    num_nextn_layers = int(
+        getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+    )
     global_num_experts = int(
         getattr(
             hf_config,
@@ -4035,6 +4046,21 @@ def create_kt_config_from_server_args(
         if dspark_stage_match is not None
         else None
     )
+    is_physical_nextn_override = layer_idx != local_layer_idx
+    if is_physical_nextn_override and (
+        local_layer_idx != 0
+        or num_layers is None
+        or layer_idx != int(num_layers)
+        or num_nextn_layers != 1
+        or getattr(server_args, "kt_num_gpu_experts", None) != 0
+        or getattr(server_args, "kt_gpu_experts_ratio", None) is not None
+        or weight_key_prefix is not None
+    ):
+        raise RuntimeError(
+            "Unsupported speculative KT layer-index override: "
+            f"local={local_layer_idx}, physical={layer_idx}, "
+            f"num_layers={num_layers}, nextn_layers={num_nextn_layers}"
+        )
     split_tier_setting = os.environ.get(_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU_ENV, "0")
     if split_tier_setting not in ("0", "1"):
         raise ValueError(
@@ -4071,7 +4097,14 @@ def create_kt_config_from_server_args(
         if uses_dedicated_draft_hybrid_plan
         else target_hybrid_shard_plan
     )
-    if hybrid_shard_plan:
+    if is_physical_nextn_override:
+        # The admitted GLM-5.2 NEXTN layer is persisted as blk.78 and is an
+        # all-CPU AMXINT4 layer.  The target placement table has rows 0..77,
+        # so it must not be indexed with the physical draft layer number.
+        gpu_experts_mask = torch.zeros(
+            global_num_experts, dtype=torch.bool, device="cpu"
+        )
+    elif hybrid_shard_plan:
         gpu_experts_mask = torch.zeros(
             global_num_experts, dtype=torch.bool, device="cpu"
         )
@@ -4315,7 +4348,10 @@ def create_kt_config_from_server_args(
         method=effective_kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
         num_layers=(
-            hybrid_plan_num_layers if uses_dedicated_draft_hybrid_plan else num_layers
+            hybrid_plan_num_layers
+            if uses_dedicated_draft_hybrid_plan
+            else int(num_layers)
+            + (num_nextn_layers if is_physical_nextn_override else 0)
         ),
         gpu_prefill_token_threshold=gpu_prefill_token_threshold,
         kt_enable_dynamic_expert_update=dynamic_expert_update,
@@ -5096,6 +5132,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             elif (
                 metadata is not None
                 and getattr(metadata, "physical_to_logical_map_cpu", None) is not None
+                and self.kt_config.layer_idx
+                < metadata.physical_to_logical_map_cpu.shape[0]
             ):
                 physical_to_logical_map_cpu = metadata.physical_to_logical_map_cpu[
                     self.kt_config.layer_idx

@@ -5,7 +5,6 @@ from dataclasses import replace
 from typing import List, Optional
 
 import torch
-
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
@@ -25,6 +24,7 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
 from sglang.srt.layers.moe.utils import (
+    speculative_kt_ep_context,
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
@@ -80,6 +80,11 @@ from sglang.srt.speculative.eagle_worker_common import (
     prepare_for_draft,
     prepare_for_draft_extend,
     run_eagle_verify,
+)
+from sglang.srt.speculative.kt_mtp import (
+    KTMTPAdmission,
+    admit_glm52_kt_mtp,
+    validate_loaded_glm52_kt_mtp,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -149,6 +154,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.kt_mtp_admission = admit_glm52_kt_mtp(
+            server_args,
+            target_worker.model_runner.model_config.hf_config,
+        )
+        if self.kt_mtp_admission.enabled and ps.tp_rank == 0:
+            logger.info(
+                "GLM52_KT_MTP_ADMISSION physical_layer=%d reason=%s",
+                self.kt_mtp_admission.physical_layer_index,
+                self.kt_mtp_admission.reason,
+            )
 
         self._rebuild_topk1_chain_buffers()
 
@@ -158,8 +173,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         else:
             ctx = empty_context()
         with (
-            ctx
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            ctx,
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+            self._kt_mtp_context(),
+        ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -171,6 +189,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        if self.kt_mtp_admission.enabled:
+            receipt = validate_loaded_glm52_kt_mtp(
+                self.draft_runner.model, self.kt_mtp_admission
+            )
+            if ps.tp_rank == 0:
+                logger.info("GLM52_KT_MTP_LOADED %s", receipt)
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
@@ -180,6 +204,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = default_tree_mask_mode()
 
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
+
+    def _kt_mtp_context(self):
+        admission: KTMTPAdmission = self.kt_mtp_admission
+        return speculative_kt_ep_context(
+            enabled=admission.enabled,
+            physical_layer_index=admission.physical_layer_index,
+        )
 
     def alloc_memory_pool(
         self,
@@ -219,6 +250,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
+            self._kt_mtp_context(),
         ):
             self.draft_worker.init_attention_backends()
             self.init_attention_backend()
@@ -228,6 +260,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_tp_context(self.draft_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
+            self._kt_mtp_context(),
         ):
             self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
             if check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE):
@@ -1067,6 +1100,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                self._draft_worker._kt_mtp_context(),
             ):
                 self.adaptive_controller.register(
                     SpecRuntimeState(
@@ -1116,6 +1150,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
                 speculative_moe_backend_context(),
                 speculative_moe_a2a_backend_context(),
+                self.draft_worker._kt_mtp_context(),
                 spec_stage_span("draft_extend"),
             ):
                 batch_output.next_draft_input = (
@@ -1158,6 +1193,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
+                    self.draft_worker._kt_mtp_context(),
                     spec_stage_span("draft"),
                 ):
                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
@@ -1179,6 +1215,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     ),
                     speculative_moe_backend_context(),
                     speculative_moe_a2a_backend_context(),
+                    self.draft_worker._kt_mtp_context(),
                     spec_stage_span("draft_extend"),
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)

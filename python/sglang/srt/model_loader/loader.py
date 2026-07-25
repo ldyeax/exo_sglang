@@ -41,7 +41,6 @@ from typing import (
 import huggingface_hub
 import numpy as np
 import torch
-
 from sglang.srt.constants import GIB_BYTES
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -64,10 +63,6 @@ except ImportError:
     get_max_memory = None
 
 from huggingface_hub import HfApi, hf_hub_download
-from torch import nn
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
-
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.connector import (
     ConnectorType,
@@ -88,6 +83,9 @@ from sglang.srt.model_loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.srt.utils.common import is_cuda_alike
+from torch import nn
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
@@ -578,6 +576,23 @@ class DefaultModelLoader(BaseModelLoader):
                 source.model_config.hf_config,
             )
 
+        mtp_filter = self._get_glm52_kt_mtp_weight_filter(
+            source=source,
+            hf_folder=hf_folder,
+            hf_weights_files=hf_weights_files,
+            use_safetensors=use_safetensors,
+        )
+        if mtp_filter is not None:
+            hf_weights_files, allowed_weight_names = mtp_filter
+            source_filter = weight_name_filter
+
+            def _admitted_mtp_weight(name: str) -> bool:
+                return name in allowed_weight_names and (
+                    source_filter is None or source_filter(name)
+                )
+
+            weight_name_filter = _admitted_mtp_weight
+
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
             assert use_safetensors is False
@@ -629,6 +644,7 @@ class DefaultModelLoader(BaseModelLoader):
                     hf_weights_files,
                     enable_gds=enable_gds,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    tensor_name_filter=weight_name_filter,
                 )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
@@ -672,6 +688,88 @@ class DefaultModelLoader(BaseModelLoader):
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+    @staticmethod
+    def _get_glm52_kt_mtp_weight_filter(
+        *,
+        source: "DefaultModelLoader.Source",
+        hf_folder: str,
+        hf_weights_files: List[str],
+        use_safetensors: bool,
+    ) -> Optional[Tuple[List[str], set[str]]]:
+        """Select layer-78 nonexpert weights before tensor materialization."""
+        model_config = source.model_config
+        if model_config is None or not model_config.is_draft_model:
+            return None
+
+        from sglang.srt.layers.moe.utils import get_kt_ep_weight_layer_index
+
+        physical_layer_index = get_kt_ep_weight_layer_index(0)
+        if physical_layer_index == 0:
+            return None
+        hf_config = model_config.hf_config
+        if (
+            getattr(hf_config, "model_type", None) != "glm_moe_dsa"
+            or physical_layer_index != 78
+        ):
+            raise RuntimeError(
+                "A speculative KT layer override is only supported for "
+                "GLM-5.2 physical layer 78"
+            )
+        if not use_safetensors:
+            raise RuntimeError(
+                "GLM-5.2 KT MTP requires a safetensors target checkpoint so "
+                "layer-78 weights can be filtered before tensor materialization"
+            )
+
+        index_path = os.path.join(hf_folder, SAFE_WEIGHTS_INDEX_NAME)
+        try:
+            with open(index_path) as index_file:
+                index = json.load(index_file)
+            weight_map = index["weight_map"]
+        except (OSError, KeyError, json.JSONDecodeError) as error:
+            raise RuntimeError(
+                f"Cannot build GLM-5.2 KT MTP weight filter from {index_path}: "
+                f"{error}"
+            ) from error
+
+        from sglang.srt.speculative.kt_mtp import (
+            select_glm52_mtp_nonexpert_weights,
+        )
+
+        try:
+            allowed_weight_names, required_shards = (
+                select_glm52_mtp_nonexpert_weights(
+                    weight_map, physical_layer_index
+                )
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                f"Cannot select GLM-5.2 KT MTP weights from {index_path}: {error}"
+            ) from error
+
+        filtered_files = [
+            path
+            for path in hf_weights_files
+            if os.path.basename(path) in required_shards
+        ]
+        missing_shards = sorted(
+            required_shards
+            - {os.path.basename(path) for path in filtered_files}
+        )
+        if missing_shards:
+            raise RuntimeError(
+                "GLM-5.2 KT MTP checkpoint is missing selected shards: "
+                + ", ".join(missing_shards)
+            )
+        logger.info(
+            "GLM52_KT_MTP_WEIGHT_FILTER physical_layer=%d tensors=%d "
+            "shards=%s routed_experts=persistent_AMXINT4",
+            physical_layer_index,
+            len(allowed_weight_names),
+            sorted(required_shards),
+        )
+        return filtered_files, allowed_weight_names
 
     @classmethod
     def _filter_mtp_weights(

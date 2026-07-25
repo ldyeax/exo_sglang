@@ -37,8 +37,6 @@ import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
-from tqdm.auto import tqdm
-
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import REQUANTIZATION_METHODS, ModelConfig
 from sglang.srt.distributed import (
@@ -64,6 +62,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import is_cuda_alike
 from sglang.utils import is_in_ci
+from tqdm.auto import tqdm
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
@@ -1004,6 +1003,7 @@ def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
     enable_gds: bool = True,
     drop_cache_after_load: bool = False,
+    tensor_name_filter: Optional[Callable[[str], bool]] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """
     Iterate over the weights in the model safetensor files
@@ -1049,8 +1049,9 @@ def fastsafetensors_weights_iterator(
             try:
                 keys = list(fb.key_to_rank_lidx.keys())
                 for k in keys:
-                    t = fb.get_tensor(k)
-                    yield k, t
+                    if tensor_name_filter is None or tensor_name_filter(k):
+                        t = fb.get_tensor(k)
+                        yield k, t
             finally:
                 pass
         finally:

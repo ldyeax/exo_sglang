@@ -4,10 +4,9 @@ import logging
 import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
-
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -23,6 +22,14 @@ if TYPE_CHECKING:
 from sglang.srt.runtime_context import get_server_args
 
 logger = logging.getLogger(__name__)
+
+# Draft-model construction normally inherits the target ServerArgs, including
+# its KT weight path.  Keep draft KT disabled unless a fail-closed admission
+# context explicitly maps local layer zero to the checkpoint's physical MTP
+# layer.  These values are process-local, matching the other temporary MoE
+# backend contexts below.
+_KT_EP_DISABLED = False
+_KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE: Optional[int] = None
 
 
 class MoeA2ABackend(Enum):
@@ -553,6 +560,53 @@ def speculative_moe_a2a_backend_context():
     finally:
         moe.a2a_backend = original_backend
         moe.disable_fp4_allgather = original_disable_fp4_allgather
+
+
+def is_kt_ep_wrapper_disabled() -> bool:
+    return _KT_EP_DISABLED
+
+
+def get_kt_ep_weight_layer_index(local_layer_index: int) -> int:
+    """Map a one-layer draft's local index to its checkpoint KT index."""
+    if _KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE is None:
+        return local_layer_index
+    if local_layer_index != 0:
+        raise RuntimeError(
+            "A speculative KT layer-index override may only map local layer zero"
+        )
+    return _KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE
+
+
+@contextmanager
+def speculative_kt_ep_context(
+    *,
+    enabled: bool,
+    physical_layer_index: Optional[int] = None,
+):
+    """Enable KT only for an admitted draft and restore target-model state."""
+    global _KT_EP_DISABLED
+    global _KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE
+
+    if enabled != (physical_layer_index is not None):
+        raise ValueError(
+            "Enabled speculative KT requires exactly one physical layer index"
+        )
+    original_disabled = _KT_EP_DISABLED
+    original_override = _KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE
+    try:
+        _KT_EP_DISABLED = not enabled
+        _KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE = physical_layer_index
+        yield
+    finally:
+        _KT_EP_DISABLED = original_disabled
+        _KT_EP_WEIGHT_LAYER_INDEX_OVERRIDE = original_override
+
+
+@contextmanager
+def speculative_kt_ep_disabled_context():
+    """Compatibility context for draft workers that must remain GPU-only."""
+    with speculative_kt_ep_context(enabled=False):
+        yield
 
 
 # The type of method in top-K routing, for use in torch custom op
