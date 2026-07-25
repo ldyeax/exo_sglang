@@ -18,11 +18,56 @@ from sglang.srt.speculative.kt_mtp import (
     KTMTPAdmission,
     KTMTPAdmissionError,
     admit_glm52_kt_mtp,
+    admit_glm52_kt_remote_draft,
     get_glm52_kt_mtp_shared_modules,
     glm52_kt_mtp_shared_modules,
     is_glm52_kt_mtp_shared_module,
     select_glm52_mtp_nonexpert_weights,
+    select_glm52_remote_mtp_weights,
     validate_loaded_glm52_kt_mtp,
+)
+
+_REMOTE_DRAFT_HEADER_SHARD = "model-00001-of-00005.safetensors"
+_REMOTE_DRAFT_LAYER_SHARD = "model-00005-of-00005.safetensors"
+_REMOTE_DRAFT_WEIGHT_NAMES = (
+    "model.embed_tokens.weight",
+    "lm_head.qweight",
+    "lm_head.scales",
+    "model.layers.78.eh_proj.weight",
+    "model.layers.78.enorm.weight",
+    "model.layers.78.hnorm.weight",
+    "model.layers.78.input_layernorm.weight",
+    "model.layers.78.mlp.gate.e_score_correction_bias",
+    "model.layers.78.mlp.gate.weight",
+    "model.layers.78.mlp.shared_experts.down_proj.qweight",
+    "model.layers.78.mlp.shared_experts.down_proj.scales",
+    "model.layers.78.mlp.shared_experts.gate_proj.qweight",
+    "model.layers.78.mlp.shared_experts.gate_proj.scales",
+    "model.layers.78.mlp.shared_experts.up_proj.qweight",
+    "model.layers.78.mlp.shared_experts.up_proj.scales",
+    "model.layers.78.post_attention_layernorm.weight",
+    "model.layers.78.self_attn.indexer.k_norm.bias",
+    "model.layers.78.self_attn.indexer.k_norm.weight",
+    "model.layers.78.self_attn.indexer.weights_proj.weight",
+    "model.layers.78.self_attn.indexer.wk.qweight",
+    "model.layers.78.self_attn.indexer.wk.scales",
+    "model.layers.78.self_attn.indexer.wq_b.qweight",
+    "model.layers.78.self_attn.indexer.wq_b.scales",
+    "model.layers.78.self_attn.kv_a_layernorm.weight",
+    "model.layers.78.self_attn.kv_a_proj_with_mqa.qweight",
+    "model.layers.78.self_attn.kv_a_proj_with_mqa.scales",
+    "model.layers.78.self_attn.kv_b_proj.kc_qweight",
+    "model.layers.78.self_attn.kv_b_proj.kc_scales",
+    "model.layers.78.self_attn.kv_b_proj.vc_qweight",
+    "model.layers.78.self_attn.kv_b_proj.vc_scales",
+    "model.layers.78.self_attn.o_proj.qweight",
+    "model.layers.78.self_attn.o_proj.scales",
+    "model.layers.78.self_attn.q_a_layernorm.weight",
+    "model.layers.78.self_attn.q_a_proj.qweight",
+    "model.layers.78.self_attn.q_a_proj.scales",
+    "model.layers.78.self_attn.q_b_proj.qweight",
+    "model.layers.78.self_attn.q_b_proj.scales",
+    "model.layers.78.shared_head.norm.weight",
 )
 
 
@@ -75,13 +120,22 @@ def _server_args(model_path: str = "/models/glm52") -> SimpleNamespace:
         enable_eplb=False,
         enable_two_batch_overlap=False,
         enable_single_batch_overlap=False,
-        record_kt_gpu_expert_distribution=False,
         init_expert_location="trivial",
         chunked_prefill_size=8192,
         kt_expert_placement_strategy="uniform",
         kt_lora_path=None,
         speculative_token_map=None,
     )
+
+
+def _remote_server_args(model_path: str = "/models/glm52") -> SimpleNamespace:
+    server_args = _server_args(model_path)
+    server_args.tp_size = 1
+    server_args.kt_cpuinfer = 60
+    server_args.kt_threadpool_count = 2
+    server_args.kt_numa_nodes = [0, 0]
+    server_args.kt_stream_prefill = False
+    return server_args
 
 
 def test_admits_exact_glm52_tp2_pp1_topology_without_artifact_io():
@@ -134,6 +188,102 @@ def test_glm52_candidate_requires_same_checkpoint_for_target_and_draft():
 
     with pytest.raises(KTMTPAdmissionError, match="must resolve"):
         admit_glm52_kt_mtp(server_args, _glm52_config(), validate_artifacts=False)
+
+
+def test_remote_admission_binds_two_logical_slots_to_fwuff_numa_zero(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _clear_shared_weight_environment(monkeypatch)
+    monkeypatch.setenv("KT_SHARED_HOST_WEIGHTS", "0")
+
+    admission = admit_glm52_kt_remote_draft(
+        _remote_server_args(),
+        _glm52_config(),
+        validate_artifacts=False,
+    )
+
+    assert admission.enabled
+    assert admission.physical_layer_index == 78
+    assert admission.logical_amx_slots == (0, 1)
+    assert admission.physical_numa_nodes == (0, 0)
+    assert admission.cpuinfer_threads == 60
+    assert admission.threadpool_count == 2
+    assert admission.standalone_tensor_count == 38
+    assert admission.standalone_shards == (
+        _REMOTE_DRAFT_HEADER_SHARD,
+        _REMOTE_DRAFT_LAYER_SHARD,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tp_size", 2),
+        ("tp_size", True),
+        ("kt_cpuinfer", 120),
+        ("kt_cpuinfer", 60.0),
+        ("kt_threadpool_count", 1),
+        ("kt_threadpool_count", 2.0),
+        ("kt_numa_nodes", [0, 1]),
+        ("kt_numa_nodes", [False, 0]),
+        ("kt_enable_dynamic_expert_update", True),
+        ("kt_stream_prefill", True),
+    ],
+)
+def test_remote_admission_rejects_non_fwuff_runtime_values(
+    field: str,
+    value,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _clear_shared_weight_environment(monkeypatch)
+    server_args = _remote_server_args()
+    setattr(server_args, field, value)
+
+    with pytest.raises(KTMTPAdmissionError, match=field):
+        admit_glm52_kt_remote_draft(
+            server_args,
+            _glm52_config(),
+            validate_artifacts=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("KT_SHARED_HOST_WEIGHTS", "1"),
+        ("KT_SHARED_HOST_WEIGHTS", ""),
+        ("KT_SHARED_HOST_WEIGHTS_MANIFEST", "/tmp/dormant-manifest.json"),
+        ("KT_SHARED_HOST_WEIGHTS_CONTENT_ID", "0" * 64),
+        ("KT_SHARED_HOST_WEIGHTS_STATE_DIR", "/tmp/dormant-state"),
+    ],
+)
+def test_remote_admission_requires_shared_host_weights_strictly_off(
+    name: str,
+    value: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _clear_shared_weight_environment(monkeypatch)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(KTMTPAdmissionError, match="shared|SHARED"):
+        admit_glm52_kt_remote_draft(
+            _remote_server_args(),
+            _glm52_config(),
+            validate_artifacts=False,
+        )
+
+
+def test_remote_runtime_remains_disallowed_by_local_tp2_admission(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _clear_shared_weight_environment(monkeypatch)
+
+    with pytest.raises(KTMTPAdmissionError, match="tp_size"):
+        admit_glm52_kt_mtp(
+            _remote_server_args(),
+            _glm52_config(),
+            validate_artifacts=False,
+        )
 
 
 def test_speculative_context_maps_only_local_layer_zero_and_restores():
@@ -400,6 +550,64 @@ def test_draft_weight_filter_excludes_bf16_routed_experts_before_loading():
     assert shards == {"mtp-header.safetensors", "mtp-tail.safetensors"}
 
 
+def _remote_weight_map() -> dict[str, object]:
+    weight_map: dict[str, object] = {}
+    for name in _REMOTE_DRAFT_WEIGHT_NAMES:
+        weight_map[name] = (
+            _REMOTE_DRAFT_HEADER_SHARD
+            if not name.startswith("model.layers.78.")
+            else _REMOTE_DRAFT_LAYER_SHARD
+        )
+    weight_map["model.layers.77.input_layernorm.weight"] = (
+        "model-00004-of-00005.safetensors"
+    )
+    weight_map["model.layers.78.mlp.experts.0.gate_proj.weight"] = (
+        _REMOTE_DRAFT_LAYER_SHARD
+    )
+    return weight_map
+
+
+def test_remote_weight_filter_selects_exact_standalone_38_tensor_contract():
+    names, shards = select_glm52_remote_mtp_weights(_remote_weight_map(), 78)
+
+    assert names == set(_REMOTE_DRAFT_WEIGHT_NAMES)
+    assert len(names) == 38
+    assert shards == {
+        _REMOTE_DRAFT_HEADER_SHARD,
+        _REMOTE_DRAFT_LAYER_SHARD,
+    }
+    assert not any(".mlp.experts." in name for name in names)
+
+
+def test_remote_weight_filter_rejects_missing_tensor():
+    weight_map = _remote_weight_map()
+    del weight_map["lm_head.scales"]
+
+    with pytest.raises(KTMTPAdmissionError, match="missing 1 of 38"):
+        select_glm52_remote_mtp_weights(weight_map, 78)
+
+
+def test_remote_weight_filter_rejects_non_string_shard():
+    weight_map = _remote_weight_map()
+    weight_map["model.embed_tokens.weight"] = 1
+
+    with pytest.raises(KTMTPAdmissionError, match="non-string shard"):
+        select_glm52_remote_mtp_weights(weight_map, 78)
+
+
+def test_remote_weight_filter_rejects_wrong_exact_shard():
+    weight_map = _remote_weight_map()
+    weight_map["lm_head.qweight"] = _REMOTE_DRAFT_LAYER_SHARD
+
+    with pytest.raises(KTMTPAdmissionError, match="unexpected shard"):
+        select_glm52_remote_mtp_weights(weight_map, 78)
+
+
+def test_remote_weight_filter_rejects_non_layer_78_request():
+    with pytest.raises(KTMTPAdmissionError, match="physical layer 78"):
+        select_glm52_remote_mtp_weights(_remote_weight_map(), 77)
+
+
 def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value))
 
@@ -515,6 +723,7 @@ def _make_hybrid_artifacts(
     root: Path,
     *,
     compact_overrides: dict[str, tuple[str, tuple[int, ...]]] | None = None,
+    remote_standalone: bool = False,
 ) -> tuple[Path, Path, Path, str]:
     model_path = root / "hybrid-model"
     weight_path = root / "hybrid-weights"
@@ -536,15 +745,28 @@ def _make_hybrid_artifacts(
 
     prefix = "model.layers.78."
     source_names = [prefix + suffix for suffix in kt_mtp_module._HYBRID_LAYER_SUFFIXES]
-    model_shard = "model-00001-of-00001.safetensors"
+    model_shard = (
+        _REMOTE_DRAFT_LAYER_SHARD
+        if remote_standalone
+        else "model-00001-of-00001.safetensors"
+    )
     _write_compact_safetensors(
         model_path / model_shard,
         prefix + "self_attn.kv_b_proj.",
         overrides=compact_overrides,
     )
+    source_weight_map = {name: model_shard for name in source_names}
+    if remote_standalone:
+        (model_path / _REMOTE_DRAFT_HEADER_SHARD).touch()
+        source_weight_map.update(
+            {
+                name: _REMOTE_DRAFT_HEADER_SHARD
+                for name in _REMOTE_DRAFT_WEIGHT_NAMES[:3]
+            }
+        )
     _write_json(
         model_path / "model.safetensors.index.json",
-        {"weight_map": {name: model_shard for name in source_names}},
+        {"weight_map": source_weight_map},
     )
 
     weight_shard = "model-00001-of-00001.safetensors"
@@ -596,19 +818,22 @@ def _make_hybrid_artifacts(
         },
     )
 
+    target_file_paths = [
+        model_path / "config.json",
+        model_path / "model.safetensors.index.json",
+        model_path / "quantize_config.json",
+        model_path / model_shard,
+    ]
+    if remote_standalone:
+        target_file_paths.append(model_path / _REMOTE_DRAFT_HEADER_SHARD)
     target_files = sorted(
         (
-            _file_row(model_path / "config.json", model_path),
             _file_row(
-                model_path / "model.safetensors.index.json",
+                path,
                 model_path,
-            ),
-            _file_row(model_path / "quantize_config.json", model_path),
-            _file_row(
-                model_path / model_shard,
-                model_path,
-                hash_contents=False,
-            ),
+                hash_contents=path.suffix != ".safetensors",
+            )
+            for path in target_file_paths
         ),
         key=lambda row: str(row["path"]),
     )
@@ -749,6 +974,30 @@ def test_hybrid_admission_proves_compact_kv_b_and_external_mtp_experts(
     assert admission.enabled
     assert admission.compact_mla_kv_b_w8
     assert "direct compact MLA kv_b W8" in admission.reason
+
+
+def test_remote_artifact_admission_separates_logical_slots_from_physical_numa(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _clear_shared_weight_environment(monkeypatch)
+    model_path, weight_path, _, _ = _make_hybrid_artifacts(
+        tmp_path,
+        remote_standalone=True,
+    )
+    server_args = _remote_server_args(str(model_path))
+    server_args.kt_weight_path = str(weight_path)
+
+    admission = admit_glm52_kt_remote_draft(
+        server_args,
+        _glm52_config(),
+    )
+
+    assert admission.enabled
+    assert admission.compact_mla_kv_b_w8
+    assert admission.logical_amx_slots == (0, 1)
+    assert admission.physical_numa_nodes == (0, 0)
+    assert admission.standalone_tensor_count == 38
 
 
 def test_hybrid_admission_requires_target_shard_manifest_attestation(

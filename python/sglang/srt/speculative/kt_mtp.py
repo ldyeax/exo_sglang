@@ -113,6 +113,24 @@ _HYBRID_LAYER_SUFFIXES: Final = (
     "self_attn.q_b_proj.scales",
     "shared_head.norm.weight",
 )
+_REMOTE_DRAFT_HEADER_SHARD: Final = "model-00001-of-00005.safetensors"
+_REMOTE_DRAFT_LAYER_SHARD: Final = "model-00005-of-00005.safetensors"
+_REMOTE_DRAFT_HEADER_WEIGHTS: Final[Mapping[str, str]] = {
+    "model.embed_tokens.weight": _REMOTE_DRAFT_HEADER_SHARD,
+    "lm_head.qweight": _REMOTE_DRAFT_HEADER_SHARD,
+    "lm_head.scales": _REMOTE_DRAFT_HEADER_SHARD,
+}
+# The artifact partitions each expert into two logical AMX slots.  Fwuff has
+# one physical NUMA node, so its two disjoint 30-core pools both bind there.
+_REMOTE_DRAFT_LOGICAL_AMX_SLOTS: Final = (0, 1)
+_REMOTE_DRAFT_PHYSICAL_NUMA_NODES: Final = (0, 0)
+_REMOTE_DRAFT_CPUINFER_THREADS: Final = 60
+_REMOTE_DRAFT_THREADPOOL_COUNT: Final = 2
+_REMOTE_SHARED_WEIGHT_BINDINGS: Final = (
+    "KT_SHARED_HOST_WEIGHTS_MANIFEST",
+    "KT_SHARED_HOST_WEIGHTS_CONTENT_ID",
+    "KT_SHARED_HOST_WEIGHTS_STATE_DIR",
+)
 _COMPACT_KV_B_ABI: Final[Mapping[str, tuple[str, tuple[int, ...]]]] = {
     "kc_qweight": ("I32", (64, 48, 512)),
     "kc_scales": ("BF16", (64, 1, 512)),
@@ -135,6 +153,22 @@ class KTMTPAdmission:
     physical_layer_index: int | None = None
     reason: str = ""
     compact_mla_kv_b_w8: bool = False
+
+
+@dataclass(frozen=True)
+class KTMTPRemoteDraftAdmission:
+    """Fail-closed plan for the standalone TP1 fwuff draft service."""
+
+    enabled: bool = False
+    physical_layer_index: int | None = None
+    reason: str = ""
+    compact_mla_kv_b_w8: bool = False
+    logical_amx_slots: tuple[int, ...] = ()
+    physical_numa_nodes: tuple[int, ...] = ()
+    cpuinfer_threads: int | None = None
+    threadpool_count: int | None = None
+    standalone_tensor_count: int = 0
+    standalone_shards: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -948,6 +982,23 @@ def _validate_shared_weight_environment(
         )
 
 
+def _validate_remote_shared_weight_environment() -> None:
+    enabled = os.environ.get("KT_SHARED_HOST_WEIGHTS")
+    if enabled not in {None, "0"}:
+        raise KTMTPAdmissionError(
+            "Remote GLM-5.2 draft requires KT_SHARED_HOST_WEIGHTS to be "
+            "absent or exactly 0"
+        )
+    configured_bindings = [
+        name for name in _REMOTE_SHARED_WEIGHT_BINDINGS if name in os.environ
+    ]
+    if configured_bindings:
+        raise KTMTPAdmissionError(
+            "Remote GLM-5.2 draft forbids shared-host-weight environment "
+            "bindings: " + ", ".join(configured_bindings)
+        )
+
+
 def _validate_hybrid_expert_contract(
     *,
     model_path: Path,
@@ -955,6 +1006,8 @@ def _validate_hybrid_expert_contract(
     target_required_shards: set[str],
     required_shards: set[str],
     numa_nodes: tuple[int, ...],
+    manifest_numa_slots: tuple[int, ...] | None = None,
+    validate_shared_environment: bool = True,
 ) -> None:
     expert_checkpoint = _validate_hybrid_checkpoint_manifest(
         model_path,
@@ -1009,6 +1062,9 @@ def _validate_hybrid_expert_contract(
             "KT shared-host-weight content ID differs from the hybrid expert contract"
         )
     raw_numa_nodes = manifest.get("numa_nodes")
+    expected_manifest_numa_slots = (
+        numa_nodes if manifest_numa_slots is None else manifest_numa_slots
+    )
     if (
         not isinstance(raw_numa_nodes, list)
         or any(
@@ -1016,10 +1072,11 @@ def _validate_hybrid_expert_contract(
             for node in raw_numa_nodes
         )
         or len(raw_numa_nodes) != len(set(raw_numa_nodes))
-        or tuple(raw_numa_nodes) != numa_nodes
+        or tuple(raw_numa_nodes) != expected_manifest_numa_slots
     ):
         raise KTMTPAdmissionError(
-            "KT shared-host-weight manifest NUMA order differs from kt_numa_nodes"
+            "KT shared-host-weight manifest NUMA order differs from the "
+            "expected logical AMX slot order"
         )
 
     files = _parse_manifest_files(
@@ -1060,10 +1117,11 @@ def _validate_hybrid_expert_contract(
             "KT shared-host-weight manifest does not attest MTP expert shards: "
             + ", ".join(missing_shards[:3])
         )
-    _validate_shared_weight_environment(
-        manifest_path=manifest_path,
-        content_id=expected_content_id,
-    )
+    if validate_shared_environment:
+        _validate_shared_weight_environment(
+            manifest_path=manifest_path,
+            content_id=expected_content_id,
+        )
 
 
 def select_glm52_mtp_nonexpert_weights(
@@ -1089,6 +1147,94 @@ def select_glm52_mtp_nonexpert_weights(
         )
     shards = {weight_map[name] for name in names}
     return names, shards
+
+
+def select_glm52_remote_mtp_weights(
+    weight_map: Mapping[str, Any], physical_layer_index: int
+) -> tuple[set[str], set[str]]:
+    """Select the exact standalone layer-78 draft tensor and shard contract."""
+    if physical_layer_index != 78:
+        raise KTMTPAdmissionError(
+            "Remote GLM-5.2 MTP weight filtering only supports physical layer 78"
+        )
+    expected_shards_by_name = dict(_REMOTE_DRAFT_HEADER_WEIGHTS)
+    expected_shards_by_name.update(
+        {
+            f"model.layers.{physical_layer_index}.{suffix}": (_REMOTE_DRAFT_LAYER_SHARD)
+            for suffix in _HYBRID_LAYER_SUFFIXES
+        }
+    )
+    missing = sorted(set(expected_shards_by_name) - set(weight_map))
+    if missing:
+        raise KTMTPAdmissionError(
+            "Remote GLM-5.2 draft checkpoint is missing "
+            f"{len(missing)} of 38 standalone tensors; first missing: {missing[:3]}"
+        )
+    invalid_shards = sorted(
+        name
+        for name in expected_shards_by_name
+        if not isinstance(weight_map[name], str)
+    )
+    if invalid_shards:
+        raise KTMTPAdmissionError(
+            "Remote GLM-5.2 draft weight map has non-string shard values for "
+            f"{invalid_shards[:3]}"
+        )
+    wrong_shards = sorted(
+        name
+        for name, expected_shard in expected_shards_by_name.items()
+        if weight_map[name] != expected_shard
+    )
+    if wrong_shards:
+        first = wrong_shards[0]
+        raise KTMTPAdmissionError(
+            "Remote GLM-5.2 draft tensor has an unexpected shard: "
+            f"{first}={weight_map[first]!r} "
+            f"(expected {expected_shards_by_name[first]!r})"
+        )
+    return set(expected_shards_by_name), set(expected_shards_by_name.values())
+
+
+def _validate_remote_draft_checkpoint(
+    model_path: Path,
+    *,
+    physical_layer_index: int,
+) -> set[str]:
+    index_path = model_path / "model.safetensors.index.json"
+    index = _load_json(index_path, "remote draft checkpoint index")
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        raise KTMTPAdmissionError(
+            f"Remote draft checkpoint index {index_path} has no object weight_map"
+        )
+    names, selected_shards = select_glm52_remote_mtp_weights(
+        weight_map,
+        physical_layer_index,
+    )
+    validated_shards = _validate_index_entries(
+        model_path,
+        weight_map,
+        sorted(names),
+        "remote draft checkpoint",
+        require_flat_shards=True,
+    )
+    if validated_shards != selected_shards:
+        raise KTMTPAdmissionError(
+            "Remote GLM-5.2 draft selector and checkpoint validation disagree"
+        )
+    return selected_shards
+
+
+def _matches_exact_runtime_value(actual: Any, expected: object) -> bool:
+    if isinstance(expected, bool):
+        return actual is expected
+    if isinstance(expected, int):
+        return (
+            isinstance(actual, int)
+            and not isinstance(actual, bool)
+            and actual == expected
+        )
+    return actual == expected
 
 
 def admit_glm52_kt_mtp(
@@ -1256,6 +1402,156 @@ def admit_glm52_kt_mtp(
             + (" and direct compact MLA kv_b W8" if compact_mla_kv_b_w8 else "")
         ),
         compact_mla_kv_b_w8=compact_mla_kv_b_w8,
+    )
+
+
+def admit_glm52_kt_remote_draft(
+    server_args: Any,
+    target_hf_config: Any,
+    *,
+    validate_artifacts: bool = True,
+) -> KTMTPRemoteDraftAdmission:
+    """Admit only fwuff's standalone TP1 GLM-5.2 layer-78 draft service."""
+
+    if _get(server_args, "kt_weight_path") is None:
+        return KTMTPRemoteDraftAdmission(reason="KTransformers is not configured")
+    if _architecture(target_hf_config) != GLM52_ARCHITECTURE:
+        return KTMTPRemoteDraftAdmission(reason="draft target is not GLM-5.2 DSA")
+
+    _validate_glm52_fingerprint(target_hf_config, description="target config")
+
+    required_values = {
+        "speculative_algorithm": "EAGLE",
+        "tp_size": 1,
+        "pp_size": 1,
+        "ep_size": 1,
+        "moe_a2a_backend": "none",
+        "speculative_moe_a2a_backend": "none",
+        "kt_method": "AMXINT4",
+        "kt_cpuinfer": _REMOTE_DRAFT_CPUINFER_THREADS,
+        "kt_threadpool_count": _REMOTE_DRAFT_THREADPOOL_COUNT,
+        "kt_num_gpu_experts": 0,
+        "kt_max_deferred_experts_per_token": 0,
+        "disable_shared_experts_fusion": True,
+        "disable_cuda_graph": True,
+        "enable_dp_attention": False,
+        "enable_eplb": False,
+        "kt_enable_dynamic_expert_update": False,
+        "speculative_num_steps": 1,
+        "speculative_eagle_topk": 1,
+        "speculative_num_draft_tokens": 2,
+    }
+    mismatches = [
+        f"{name}={_get(server_args, name)!r} (expected {expected!r})"
+        for name, expected in required_values.items()
+        if not _matches_exact_runtime_value(_get(server_args, name), expected)
+    ]
+
+    optional_disabled = {
+        "kt_gpu_experts_ratio": (None,),
+        "kt_gpu_prefill_token_threshold": (None, 0),
+        "kt_expert_lora_path": (None,),
+        "kt_lora_path": (None,),
+        "speculative_token_map": (None,),
+        "speculative_draft_model_quantization": (None,),
+        "init_expert_location": (None, "trivial"),
+        "kt_stream_prefill": (None, False),
+    }
+    for name, admitted_values in optional_disabled.items():
+        actual = _get(server_args, name)
+        if not any(
+            _matches_exact_runtime_value(actual, admitted)
+            for admitted in admitted_values
+        ):
+            mismatches.append(
+                f"{name}={actual!r} (expected one of {admitted_values!r})"
+            )
+    for name in ("load_format", "speculative_draft_load_format"):
+        actual = _get(server_args, name)
+        normalized = getattr(actual, "value", actual)
+        if normalized != "safetensors":
+            mismatches.append(f"{name}={actual!r} (expected 'safetensors')")
+
+    model_path = _get(server_args, "model_path")
+    draft_model_path = _get(server_args, "speculative_draft_model_path")
+    if not _same_local_path(model_path, draft_model_path):
+        mismatches.append(
+            "speculative_draft_model_path must resolve to the target model_path"
+        )
+
+    numa_nodes = _get(server_args, "kt_numa_nodes")
+    if (
+        not isinstance(numa_nodes, (list, tuple))
+        or any(
+            isinstance(node, bool) or not isinstance(node, int) for node in numa_nodes
+        )
+        or tuple(numa_nodes) != _REMOTE_DRAFT_PHYSICAL_NUMA_NODES
+    ):
+        mismatches.append(
+            "kt_numa_nodes must bind logical AMX slots [0, 1] to physical "
+            "NUMA nodes [0, 0]"
+        )
+
+    if mismatches:
+        raise KTMTPAdmissionError(
+            "Remote GLM-5.2 KT MTP admission rejected: " + "; ".join(mismatches)
+        )
+    _validate_remote_shared_weight_environment()
+
+    physical_layer_index = int(_get(target_hf_config, "num_hidden_layers"))
+    compact_mla_kv_b_w8 = False
+    if validate_artifacts:
+        model_path_object = Path(model_path)
+        weight_path_object = Path(_get(server_args, "kt_weight_path"))
+        compact_mla_kv_b_w8, target_required_shards = _validate_source_checkpoint(
+            model_path_object,
+            physical_layer_index,
+        )
+        if not compact_mla_kv_b_w8:
+            raise KTMTPAdmissionError(
+                "Remote GLM-5.2 draft requires the persistent hybrid compact "
+                "W8 checkpoint"
+            )
+        remote_required_shards = _validate_remote_draft_checkpoint(
+            model_path_object,
+            physical_layer_index=physical_layer_index,
+        )
+        required_expert_shards = _validate_kt_artifact(
+            weight_path_object,
+            physical_layer_index=physical_layer_index,
+            numa_slot_count=len(_REMOTE_DRAFT_LOGICAL_AMX_SLOTS),
+        )
+        _validate_hybrid_expert_contract(
+            model_path=model_path_object,
+            weight_path=weight_path_object,
+            target_required_shards=(target_required_shards | remote_required_shards),
+            required_shards=required_expert_shards,
+            numa_nodes=_REMOTE_DRAFT_PHYSICAL_NUMA_NODES,
+            manifest_numa_slots=_REMOTE_DRAFT_LOGICAL_AMX_SLOTS,
+            validate_shared_environment=False,
+        )
+
+    standalone_shards = tuple(
+        sorted({_REMOTE_DRAFT_HEADER_SHARD, _REMOTE_DRAFT_LAYER_SHARD})
+    )
+    standalone_tensor_count = len(_REMOTE_DRAFT_HEADER_WEIGHTS) + len(
+        _HYBRID_LAYER_SUFFIXES
+    )
+    return KTMTPRemoteDraftAdmission(
+        enabled=True,
+        physical_layer_index=physical_layer_index,
+        reason=(
+            "admitted standalone fwuff TP1 GLM-5.2 layer-78 draft with "
+            "two logical AMX slots on physical NUMA node 0"
+            + (" and direct compact MLA kv_b W8" if compact_mla_kv_b_w8 else "")
+        ),
+        compact_mla_kv_b_w8=compact_mla_kv_b_w8,
+        logical_amx_slots=_REMOTE_DRAFT_LOGICAL_AMX_SLOTS,
+        physical_numa_nodes=_REMOTE_DRAFT_PHYSICAL_NUMA_NODES,
+        cpuinfer_threads=_REMOTE_DRAFT_CPUINFER_THREADS,
+        threadpool_count=_REMOTE_DRAFT_THREADPOOL_COUNT,
+        standalone_tensor_count=standalone_tensor_count,
+        standalone_shards=standalone_shards,
     )
 
 
