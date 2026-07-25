@@ -53,8 +53,12 @@ def _attention(*, compact_w8: bool) -> DeepseekV2AttentionMLA:
     attention = object.__new__(DeepseekV2AttentionMLA)
     torch.nn.Module.__init__(attention)
     attention.kv_b_proj = SimpleNamespace(
-        quant_method=SimpleNamespace(is_mla_kv_b_w8=compact_w8)
+        quant_method=SimpleNamespace(
+            is_mla_kv_b_w8=compact_w8,
+            requires_mla_absorb=compact_w8,
+        )
     )
+    attention.flashinfer_mla_disable_ragged = False
     return attention
 
 
@@ -165,8 +169,6 @@ def test_model_runner_configures_flashinfer_metadata_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attention = _attention(compact_w8=True)
-    attention.kv_b_proj.quant_method.requires_mla_absorb = True
-    attention.flashinfer_mla_disable_ragged = False
     model = torch.nn.Module()
     model.add_module("attention", attention)
 
@@ -234,3 +236,57 @@ def test_model_runner_configures_flashinfer_metadata_before_dispatch(
     )
     selected = attention.dispatch_attn_forward_method(forward_batch)
     assert selected == AttnForwardMethod.MLA
+
+
+def test_model_runner_synchronizes_mixed_mla_attention_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_attention = _attention(compact_w8=True)
+    ordinary_attention = _attention(compact_w8=False)
+    model = torch.nn.Module()
+    model.add_module("compact_attention", compact_attention)
+    model.add_module("ordinary_attention", ordinary_attention)
+
+    server_args = SimpleNamespace(flashinfer_mla_disable_ragged=False)
+    global_server_args = SimpleNamespace(
+        decode_attention_backend="flashinfer",
+        flashinfer_mla_disable_ragged=False,
+        prefill_attention_backend="flashinfer",
+        speculative_attention_mode="prefill",
+    )
+    runner = object.__new__(ModelRunner)
+    runner.model = model
+    runner.server_args = server_args
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_global_server_args",
+        lambda: global_server_args,
+    )
+
+    runner.configure_compact_mla_kv_b_attention()
+
+    assert server_args.flashinfer_mla_disable_ragged
+    assert global_server_args.flashinfer_mla_disable_ragged
+    assert compact_attention.flashinfer_mla_disable_ragged
+    assert ordinary_attention.flashinfer_mla_disable_ragged
+
+    monkeypatch.setattr(
+        deepseek_v2,
+        "get_global_server_args",
+        lambda: global_server_args,
+    )
+    forward_batch = SimpleNamespace(
+        extend_prefix_lens_cpu=[0],
+        forward_mode=_ZeroPrefixExtendForwardMode(),
+        get_max_chunk_capacity=lambda: 3,
+        seq_lens_cpu=[3],
+    )
+
+    assert (
+        compact_attention.dispatch_attn_forward_method(forward_batch)
+        == AttnForwardMethod.MLA
+    )
+    assert (
+        ordinary_attention.dispatch_attn_forward_method(forward_batch)
+        == AttnForwardMethod.MLA
+    )

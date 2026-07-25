@@ -954,8 +954,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def configure_compact_mla_kv_b_attention(self) -> None:
         """Keep FlashInfer metadata on absorbed MLA for compact ``kv_b``."""
 
+        mla_attention_modules: list[torch.nn.Module] = []
         compact_attention_modules: list[torch.nn.Module] = []
         for module in self.model.modules():
+            if hasattr(module, "flashinfer_mla_disable_ragged"):
+                mla_attention_modules.append(module)
             kv_b_projection = getattr(module, "kv_b_proj", None)
             quant_method = getattr(kv_b_projection, "quant_method", None)
             if not getattr(quant_method, "is_mla_kv_b_w8", False):
@@ -982,13 +985,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         global_server_args = get_global_server_args()
         self.server_args.flashinfer_mla_disable_ragged = True
         global_server_args.flashinfer_mla_disable_ragged = True
-        for module in compact_attention_modules:
+        for module in mla_attention_modules:
             module.flashinfer_mla_disable_ragged = True
 
         logger.info(
             "Compact MLA kv_b W8 requires absorbed MLA; disabled FlashInfer "
-            "ragged MHA prefill for %d attention modules",
+            "ragged MHA prefill for %d compact modules and synchronized %d "
+            "MLA attention modules",
             len(compact_attention_modules),
+            len(mla_attention_modules),
         )
 
     def load_model(self):
