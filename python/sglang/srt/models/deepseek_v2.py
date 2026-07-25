@@ -1797,9 +1797,23 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
         handler = AttentionBackendRegistry.get_handler(attention_backend)
         attn_forward_method = handler(self, forward_batch)
-        # The compact layout has no ordinary Linear orientation.  Both GPU
-        # absorbed-MLA paths call the compact KC/VC specialists directly;
-        # MHA and the CPU fused-RoPE path still dereference legacy weights.
+        # The compact layout has no ordinary Linear orientation.  FlashInfer's
+        # zero-prefix prefill heuristic normally selects an MHA variant, but
+        # that is only an optimization choice: force it back to absorbed MLA,
+        # whose KC/VC sites call the compact specialists directly.
+        if (
+            self._get_mla_kv_b_w8_method() is not None
+            and attn_forward_method
+            in {
+                AttnForwardMethod.MHA,
+                AttnForwardMethod.MHA_CHUNKED_KV,
+                AttnForwardMethod.MHA_ONE_SHOT,
+            }
+        ):
+            return AttnForwardMethod.MLA
+
+        # Both GPU absorbed-MLA paths are specialized.  CPU/NPU variants still
+        # dereference legacy weights, so reject those explicitly.
         compact_kv_b_supported_methods = {
             AttnForwardMethod.MLA,
             AttnForwardMethod.MLA_FUSED_ROPE,

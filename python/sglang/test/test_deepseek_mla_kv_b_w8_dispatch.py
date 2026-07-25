@@ -95,20 +95,32 @@ def test_compact_w8_dispatch_allows_gpu_absorbed_mla(
     "selected_method",
     [
         AttnForwardMethod.MHA,
-        AttnForwardMethod.MLA_FUSED_ROPE_CPU,
+        AttnForwardMethod.MHA_CHUNKED_KV,
+        AttnForwardMethod.MHA_ONE_SHOT,
     ],
 )
-def test_compact_w8_dispatch_rejects_non_plain_mla(
+def test_compact_w8_dispatch_forces_mha_heuristics_to_absorbed_mla(
     monkeypatch: pytest.MonkeyPatch,
     selected_method: AttnForwardMethod,
 ) -> None:
     attention = _attention(compact_w8=True)
     _select_method(monkeypatch, selected_method)
 
-    with pytest.raises(
-        RuntimeError,
-        match="compact MLA kv_b W8 requires the absorbed MLA attention path",
-    ):
+    selected = attention.dispatch_attn_forward_method(
+        SimpleNamespace(forward_mode=_DecodeForwardMode())
+    )
+
+    assert selected == AttnForwardMethod.MLA
+    assert attention.current_attention_backend == "test_decode"
+
+
+def test_compact_w8_dispatch_rejects_cpu_fused_rope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attention = _attention(compact_w8=True)
+    _select_method(monkeypatch, AttnForwardMethod.MLA_FUSED_ROPE_CPU)
+
+    with pytest.raises(RuntimeError, match="compact MLA kv_b W8 requires"):
         attention.dispatch_attn_forward_method(
             SimpleNamespace(forward_mode=_DecodeForwardMode())
         )
