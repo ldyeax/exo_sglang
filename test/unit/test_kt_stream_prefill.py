@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.kt_stream_prefill import (
     ReusableAsyncRing,
     admit_kt_stream_prefill,
     iter_expert_chunks,
+    iter_rank_expert_chunks,
 )
 
 
@@ -49,6 +50,47 @@ def test_glm52_tp2_four_expert_ring_sizing() -> None:
     assert plan.device_ring_bytes == 288 * 1024**2
     assert plan.host_ring_bytes_per_rank == 288 * 1024**2
     assert plan.chunks_per_layer == 64
+
+
+def test_glm52_small_ep_loads_complete_disjoint_experts() -> None:
+    plan = admit_kt_stream_prefill(
+        KTStreamPrefillConfig(
+            enabled=True,
+            small_ep_enabled=True,
+            experts_per_chunk=4,
+        ),
+        _glm52_facts(
+            attention_context_parallel_size=2,
+            nsa_prefill_context_parallel=True,
+        ),
+    )
+
+    assert plan.small_ep_enabled
+    assert plan.local_num_experts == 128
+    assert plan.per_expert_device_bytes == 72 * 1024**2
+    assert plan.device_ring_bytes == 576 * 1024**2
+    assert plan.chunks_per_layer == 32
+
+    rank_zero = tuple(iter_rank_expert_chunks(plan, 0))
+    rank_one = tuple(iter_rank_expert_chunks(plan, 1))
+    assert rank_zero[0] == (0, 1, 2, 3)
+    assert rank_zero[-1] == (124, 125, 126, 127)
+    assert rank_one[0] == (128, 129, 130, 131)
+    assert rank_one[-1] == (252, 253, 254, 255)
+    assert (
+        set().union(*map(set, rank_zero)).isdisjoint(set().union(*map(set, rank_one)))
+    )
+
+
+def test_small_ep_admission_rejects_missing_context_parallelism() -> None:
+    with pytest.raises(
+        KTStreamPrefillAdmissionError,
+        match="requires NSA prefill context parallelism",
+    ):
+        admit_kt_stream_prefill(
+            KTStreamPrefillConfig(enabled=True, small_ep_enabled=True),
+            _glm52_facts(),
+        )
 
 
 @pytest.mark.parametrize(

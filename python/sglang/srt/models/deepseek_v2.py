@@ -97,6 +97,11 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.quant_method_registry import is_wrapped_method
+from sglang.srt.layers.moe.small_ep import (
+    SmallEPContractError,
+    select_small_ep_model_forward,
+    small_ep_forward_scope,
+)
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
@@ -266,8 +271,7 @@ class DeepseekV2MLP(nn.Module):
             self.down_proj.weight = self.down_proj.weight_packed
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -361,7 +365,6 @@ class MoEGate(nn.Module):
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
             ):
-
                 # router gemm output float32
                 logits = dsv3_router_gemm(
                     hidden_states, self.weight, out_dtype=torch.float32
@@ -416,7 +419,6 @@ def _get_mega_moe_symm_buffer(
 
 
 class DeepseekV2MoE(nn.Module):
-
     def _compute_is_hash(
         self, layer_id: int, n_hash_layers: int, is_nextn: bool
     ) -> bool:
@@ -573,13 +575,15 @@ class DeepseekV2MoE(nn.Module):
                     else {}
                 ),
             )
-            is_packed_weight = hasattr(
-                self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
-                "awq",
-                "awq_marlin",
-                "moe_wna16",
-            }
+            is_packed_weight = (
+                hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
+                and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
+                in {
+                    "awq",
+                    "awq_marlin",
+                    "moe_wna16",
+                }
+            )
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
@@ -601,9 +605,7 @@ class DeepseekV2MoE(nn.Module):
                         self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
                         == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
                     )
-                    self.shared_experts_weight_block_size = (
-                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-                    )
+                    self.shared_experts_weight_block_size = self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
 
         self.top_k = config.num_experts_per_tok
 
@@ -692,6 +694,7 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     input_ids,
                     input_ids_global=input_ids_global,
+                    forward_batch=forward_batch,
                 )
         else:
             return self.forward_deepep(
@@ -707,7 +710,6 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
         shared_output = self._forward_shared_experts(
@@ -752,6 +754,7 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -779,7 +782,6 @@ class DeepseekV2MoE(nn.Module):
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-
                 nonlocal shared_output
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
@@ -803,10 +805,34 @@ class DeepseekV2MoE(nn.Module):
                 self.experts.dispatcher.register_post_combine_hook(_post_combine_hook)
             )
 
-        final_hidden_states = self.experts(
-            hidden_states,
-            topk_output,
-        )
+        kt_wrapper_present = is_wrapped_method(self.experts.quant_method, "kt_ep")
+        if kt_wrapper_present:
+            server_args = get_global_server_args()
+            architecture = (getattr(self.config, "architectures", None) or ("",))[0]
+            small_ep_selected = select_small_ep_model_forward(
+                enabled=bool(getattr(server_args, "kt_stream_prefill_small_ep", False)),
+                architecture=architecture,
+                kt_wrapper_present=True,
+                context_parallel_extend=(
+                    forward_batch is not None and nsa_use_prefill_cp(forward_batch)
+                ),
+                num_tokens=int(hidden_states.shape[0]),
+                token_threshold=int(
+                    getattr(server_args, "kt_gpu_prefill_token_threshold", 0) or 0
+                ),
+            )
+        else:
+            small_ep_selected = False
+        with small_ep_forward_scope(small_ep_selected) as small_ep_state:
+            final_hidden_states = self.experts(
+                hidden_states,
+                topk_output,
+            )
+        if small_ep_state.partial_produced and not use_reduce_scatter:
+            raise SmallEPContractError(
+                "SmallEP local partial requires the NSA context-parallel "
+                "reduce-scatter postprocess"
+            )
         if (
             not _is_cuda
             and not _use_aiter
@@ -831,6 +857,7 @@ class DeepseekV2MoE(nn.Module):
 
         if (
             self.tp_size > 1
+            and not small_ep_state.partial_produced
             and not should_allreduce_fusion
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
@@ -985,7 +1012,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
-
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
@@ -1003,7 +1029,6 @@ class DeepseekV2MoE(nn.Module):
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-
                 nonlocal shared_output
 
                 if (
@@ -1041,7 +1066,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
-
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
@@ -1408,10 +1432,7 @@ class DeepseekV2MoE(nn.Module):
 
     def op_kt_output(self, state):
         self.op_output(state)
-        if (
-            self.tp_size > 1
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
-        ):
+        if self.tp_size > 1 and not should_use_flashinfer_cutlass_moe_fp4_allgather():
             state.hidden_states_mlp_output = tensor_model_parallel_all_reduce(
                 state.pop("hidden_states_mlp_output")
             )
@@ -1454,7 +1475,6 @@ class DeepseekV2MoE(nn.Module):
 
 
 class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1752,9 +1772,7 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                     self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
                     == self.q_b_proj.quant_method.quant_config.weight_block_size
                 )
-                self.weight_block_size = (
-                    self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
-                )
+                self.weight_block_size = self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.weight_block_size
 
         self.init_mha_forward()
 
@@ -1827,18 +1845,18 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
                 not get_attn_tp_context().input_scattered
                 and hidden_states[0].shape[0] == 0
             ):
-                assert (
-                    not self.o_proj.reduce_results
-                ), "short-circuiting allreduce will lead to hangs"
+                assert not self.o_proj.reduce_results, (
+                    "short-circuiting allreduce will lead to hangs"
+                )
                 return hidden_states[0]
         else:
             if (
                 not get_attn_tp_context().input_scattered
                 and hidden_states.shape[0] == 0
             ):
-                assert (
-                    not self.o_proj.reduce_results
-                ), "short-circuiting allreduce will lead to hangs"
+                assert not self.o_proj.reduce_results, (
+                    "short-circuiting allreduce will lead to hangs"
+                )
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
@@ -2515,9 +2533,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        assert self.q_lora_rank is not None and use_intel_amx_backend(
-            self
-        ), "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
+        assert self.q_lora_rank is not None and use_intel_amx_backend(self), (
+            "forward_absorb_fused_mla_rope_cpu_prepare requires q_lora_rank is not None and use_intel_amx_backend"
+        )
 
         q_input, k_input, v_input = (
             torch.ops.sgl_kernel.qkv_proj_with_rope_fused_weight(
@@ -2635,9 +2653,9 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
     def forward_absorb_fused_mla_rope_cpu_core(
         self, q_input, k_input, v_input, forward_batch, zero_allocator
     ):
-        assert self.q_lora_rank is not None and use_intel_amx_backend(
-            self
-        ), "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
+        assert self.q_lora_rank is not None and use_intel_amx_backend(self), (
+            "forward_absorb_fused_mla_rope_cpu_core requires q_lora_rank is not None and use_intel_amx_backend"
+        )
 
         attn_output = self.attn_mqa(q_input, k_input, v_input, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
@@ -2682,7 +2700,6 @@ class DeepseekV2AttentionMLA(nn.Module, DeepseekMHAForwardMixin):
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -3385,7 +3402,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             # KV expansion: kv_lora_rank -> num_heads * (qk_nope_head_dim + v_head_dim)
             return (
                 config.kv_lora_rank,
-                config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
+                config.num_attention_heads
+                * (config.qk_nope_head_dim + config.v_head_dim),
             )
         elif module_name == "o_proj":
             # Output projection: num_heads * v_head_dim -> hidden_size
@@ -3405,14 +3423,18 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 # DeepseekV2MoE has shared_experts attribute
                 if hasattr(mlp, "shared_experts"):
                     # SharedExperts use moe_intermediate_size * n_shared_experts
-                    intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+                    intermediate_size = (
+                        config.moe_intermediate_size * config.n_shared_experts
+                    )
 
             if module_name == "gate_up_proj":
                 return config.hidden_size, intermediate_size * 2
             else:  # down_proj
                 return intermediate_size, config.hidden_size
         else:
-            raise NotImplementedError(f"Module {module_name} not supported for DeepSeek-V2 LoRA")
+            raise NotImplementedError(
+                f"Module {module_name} not supported for DeepSeek-V2 LoRA"
+            )
 
     @torch.no_grad()
     def forward(

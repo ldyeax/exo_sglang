@@ -13,14 +13,17 @@ SmallEP is intentionally different from a standard token-dispatch all-to-all:
 The redundant gate/sort work trades inexpensive local compute for substantially
 less payload on a two-GPU PCIe/InfiniBand-class topology.  This module supplies
 the exact indexing/reduction contract and a working torch.distributed
-collective.  Wiring it into GLM's context-parallel attention and a local-expert
-GPU runner remains a separate model-level step.
+collective.  GLM-5.2's stream-prefill path also uses the ownership and
+forward-scope contracts below while its existing NSA context-parallel
+communicator performs the gather/reduce-scatter at layer boundaries.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
+from typing import Callable, Iterator, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -28,6 +31,98 @@ import torch.distributed as dist
 
 class SmallEPContractError(ValueError):
     """Raised when ranks, routes, or ownership violate the SmallEP contract."""
+
+
+@dataclass
+class SmallEPForwardState:
+    """One synchronous GLM MoE invocation admitted to emit a rank partial."""
+
+    enabled: bool
+    partial_produced: bool = False
+
+    def mark_partial_produced(self) -> None:
+        if not self.enabled:
+            raise SmallEPContractError(
+                "SmallEP produced a local partial outside an admitted model forward"
+            )
+        if self.partial_produced:
+            raise SmallEPContractError(
+                "SmallEP produced more than one local partial in one model forward"
+            )
+        self.partial_produced = True
+
+
+_CURRENT_SMALL_EP_FORWARD: ContextVar[Optional[SmallEPForwardState]] = ContextVar(
+    "current_small_ep_forward",
+    default=None,
+)
+
+
+@contextmanager
+def small_ep_forward_scope(enabled: bool) -> Iterator[SmallEPForwardState]:
+    """Bind rank-partial ownership to exactly one synchronous MoE forward."""
+
+    if _CURRENT_SMALL_EP_FORWARD.get() is not None:
+        raise SmallEPContractError("nested SmallEP model forwards are unsupported")
+    state = SmallEPForwardState(enabled=enabled)
+    token = _CURRENT_SMALL_EP_FORWARD.set(state)
+    try:
+        yield state
+    finally:
+        _CURRENT_SMALL_EP_FORWARD.reset(token)
+
+
+def mark_small_ep_partial_produced() -> None:
+    """Record that the stream executor returned an unreduced rank partial."""
+
+    state = _CURRENT_SMALL_EP_FORWARD.get()
+    if state is None:
+        raise SmallEPContractError(
+            "SmallEP stream execution requires an admitted model-forward scope"
+        )
+    state.mark_partial_produced()
+
+
+def require_small_ep_forward_scope() -> None:
+    """Reject SmallEP execution before loading weights when no model owns it."""
+
+    state = _CURRENT_SMALL_EP_FORWARD.get()
+    if state is None or not state.enabled:
+        raise SmallEPContractError(
+            "SmallEP stream execution requires an admitted model-forward scope"
+        )
+
+
+def select_small_ep_model_forward(
+    *,
+    enabled: bool,
+    architecture: str,
+    kt_wrapper_present: bool,
+    context_parallel_extend: bool,
+    num_tokens: int,
+    token_threshold: int,
+) -> bool:
+    """Select the GLM SmallEP path or reject a threshold-crossing mismatch."""
+
+    if not enabled or num_tokens < token_threshold:
+        return False
+
+    failures: list[str] = []
+    if architecture != "GlmMoeDsaForCausalLM":
+        failures.append(
+            f"architecture must be GlmMoeDsaForCausalLM, got {architecture!r}"
+        )
+    if not kt_wrapper_present:
+        failures.append("the routed-expert method is not wrapped by KTransformers")
+    if not context_parallel_extend:
+        failures.append("the forward is not an NSA context-parallel extend")
+    if token_threshold <= 0:
+        failures.append("the stream-prefill token threshold must be positive")
+    if failures:
+        raise SmallEPContractError(
+            "SmallEP model-forward selection failed: " + "; ".join(failures)
+        )
+    return True
 
 
 @dataclass(frozen=True)
@@ -202,9 +297,7 @@ def compute_small_ep_reference_partial(
 
     output = torch.zeros_like(hidden_states)
     for global_expert_id in layout.owned_experts(rank):
-        token_indices, choice_indices = torch.where(
-            topk_ids == global_expert_id
-        )
+        token_indices, choice_indices = torch.where(topk_ids == global_expert_id)
         if token_indices.numel() == 0:
             continue
         transformed = expert(
@@ -217,9 +310,9 @@ def compute_small_ep_reference_partial(
                 f"{tuple(transformed.shape)}, expected "
                 f"{tuple(hidden_states[token_indices].shape)}"
             )
-        weighted = transformed * topk_weights[
-            token_indices, choice_indices
-        ].unsqueeze(-1)
+        weighted = transformed * topk_weights[token_indices, choice_indices].unsqueeze(
+            -1
+        )
         output.index_add_(0, token_indices, weighted)
     return output
 
@@ -323,9 +416,7 @@ def execute_small_ep(
     local_hidden_states: torch.Tensor,
     layout: SmallEPLayout,
     gate: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
-    local_experts: Callable[
-        [torch.Tensor, SmallEPLocalRoutes], torch.Tensor
-    ],
+    local_experts: Callable[[torch.Tensor, SmallEPLocalRoutes], torch.Tensor],
     collective: TorchSmallEPCollective,
 ) -> torch.Tensor:
     """Run the complete collective contract with injectable gate/expert kernels."""
