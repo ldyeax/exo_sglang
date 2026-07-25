@@ -150,6 +150,7 @@ class KTMTPSharedModules:
 
     embed_tokens: Any
     lm_head: Any
+    borrowed_module_ids: frozenset[int]
 
 
 _ACTIVE_SHARED_MODULES: ContextVar[KTMTPSharedModules | None] = ContextVar(
@@ -177,7 +178,16 @@ def glm52_kt_mtp_shared_modules(
         raise KTMTPAdmissionError(
             "GLM-5.2 KT MTP shared modules must provide embedding and LM head"
         )
-    shared = KTMTPSharedModules(embed_tokens=embed_tokens, lm_head=lm_head)
+    borrowed_module_ids = {id(embed_tokens), id(lm_head)}
+    for root in (embed_tokens, lm_head):
+        iter_modules = getattr(root, "modules", None)
+        if callable(iter_modules):
+            borrowed_module_ids.update(id(module) for module in iter_modules())
+    shared = KTMTPSharedModules(
+        embed_tokens=embed_tokens,
+        lm_head=lm_head,
+        borrowed_module_ids=frozenset(borrowed_module_ids),
+    )
     token: Token[KTMTPSharedModules | None] = _ACTIVE_SHARED_MODULES.set(shared)
     try:
         yield shared
@@ -189,6 +199,34 @@ def get_glm52_kt_mtp_shared_modules() -> KTMTPSharedModules | None:
     """Return construction-scoped target modules, if the exact path is active."""
 
     return _ACTIVE_SHARED_MODULES.get()
+
+
+def is_glm52_kt_mtp_shared_module(
+    module: Any,
+    *,
+    owner_model: Any | None = None,
+) -> bool:
+    """Return whether ``module`` is borrowed from the target in this context.
+
+    The identity set includes the two shared roots and their module subtrees.
+    Draft models persist the same set so later reload/checkpoint hooks retain
+    the ownership boundary.  Target models are never marked, so their ordinary
+    post-processing behavior is unchanged.
+    """
+
+    shared = _ACTIVE_SHARED_MODULES.get()
+    if shared is not None and id(module) in shared.borrowed_module_ids:
+        return True
+    if owner_model is None:
+        return False
+    borrowed_module_ids = getattr(
+        owner_model,
+        "kt_mtp_borrowed_module_ids_at_construction",
+        None,
+    )
+    return isinstance(borrowed_module_ids, frozenset) and (
+        id(module) in borrowed_module_ids
+    )
 
 
 def _get(config: Any, name: str, default: Any = None) -> Any:
@@ -1107,6 +1145,7 @@ def admit_glm52_kt_mtp(
         "kt_gpu_prefill_token_threshold": (None, 0),
         "kt_expert_lora_path": (None,),
         "kt_lora_path": (None,),
+        "speculative_token_map": (None,),
         "speculative_draft_model_quantization": (None,),
         "init_expert_location": (None, "trivial"),
     }
@@ -1194,7 +1233,10 @@ def admit_glm52_kt_mtp(
 
 
 def validate_loaded_glm52_kt_mtp(
-    draft_model: Any, admission: KTMTPAdmission
+    draft_model: Any,
+    admission: KTMTPAdmission,
+    *,
+    target_model: Any | None = None,
 ) -> dict[str, Any]:
     """Prove that the loaded one-layer draft actually received the KT wrapper."""
     if not admission.enabled or admission.physical_layer_index is None:
@@ -1233,6 +1275,33 @@ def validate_loaded_glm52_kt_mtp(
     )
     if shared_at_construction is not True:
         errors.append("embed/head modules were not shared at draft construction")
+    borrowed_module_ids = getattr(
+        draft_model,
+        "kt_mtp_borrowed_module_ids_at_construction",
+        None,
+    )
+    if not isinstance(borrowed_module_ids, frozenset):
+        errors.append("draft model did not retain borrowed module ownership")
+    if target_model is None:
+        errors.append("target model was not provided for shared-module proof")
+    else:
+        try:
+            draft_embed_tokens = draft_model.model.embed_tokens
+            draft_lm_head = draft_model.lm_head
+            target_embed_tokens = target_model.model.embed_tokens
+            target_lm_head = target_model.lm_head
+        except AttributeError:
+            errors.append("draft/target models do not expose shared embed/head modules")
+        else:
+            if draft_embed_tokens is not target_embed_tokens:
+                errors.append("draft embedding is not the target embedding module")
+            if draft_lm_head is not target_lm_head:
+                errors.append("draft LM head is not the target LM head module")
+            if isinstance(borrowed_module_ids, frozenset) and (
+                id(draft_embed_tokens) not in borrowed_module_ids
+                or id(draft_lm_head) not in borrowed_module_ids
+            ):
+                errors.append("borrowed module ownership omits the shared roots")
     if admission.compact_mla_kv_b_w8:
         try:
             kv_b_projection = decoder.self_attn.kv_b_proj

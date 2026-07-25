@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 import sglang.srt.speculative.kt_mtp as kt_mtp_module
+import torch
 from sglang.srt.layers.moe.utils import (
     get_kt_ep_weight_layer_index,
     speculative_kt_ep_context,
@@ -18,6 +19,7 @@ from sglang.srt.speculative.kt_mtp import (
     admit_glm52_kt_mtp,
     get_glm52_kt_mtp_shared_modules,
     glm52_kt_mtp_shared_modules,
+    is_glm52_kt_mtp_shared_module,
     select_glm52_mtp_nonexpert_weights,
     validate_loaded_glm52_kt_mtp,
 )
@@ -75,6 +77,7 @@ def _server_args(model_path: str = "/models/glm52") -> SimpleNamespace:
         chunked_prefill_size=8192,
         kt_expert_placement_strategy="uniform",
         kt_lora_path=None,
+        speculative_token_map=None,
     )
 
 
@@ -111,6 +114,7 @@ def test_non_glm_draft_retains_gpu_only_behavior():
         ("speculative_draft_load_format", None),
         ("kt_threadpool_count", True),
         ("kt_numa_nodes", [0, -1]),
+        ("speculative_token_map", "/models/hot-token-map.json"),
     ],
 )
 def test_glm52_candidate_rejects_unsupported_runtime_values(field: str, value):
@@ -141,16 +145,102 @@ def test_speculative_context_maps_only_local_layer_zero_and_restores():
 
 
 def test_shared_module_context_exposes_exact_target_modules_and_restores():
-    embed_tokens = object()
-    lm_head = object()
+    embed_tokens = torch.nn.Module()
+    lm_head = torch.nn.Sequential(torch.nn.Module())
+    lm_head_child = next(lm_head.children())
+    unrelated = torch.nn.Module()
     assert get_glm52_kt_mtp_shared_modules() is None
+    assert not is_glm52_kt_mtp_shared_module(embed_tokens)
 
     with glm52_kt_mtp_shared_modules(embed_tokens, lm_head) as shared:
         assert shared.embed_tokens is embed_tokens
         assert shared.lm_head is lm_head
         assert get_glm52_kt_mtp_shared_modules() is shared
+        assert is_glm52_kt_mtp_shared_module(embed_tokens)
+        assert is_glm52_kt_mtp_shared_module(lm_head)
+        assert is_glm52_kt_mtp_shared_module(lm_head_child)
+        assert not is_glm52_kt_mtp_shared_module(unrelated)
 
     assert get_glm52_kt_mtp_shared_modules() is None
+    assert not is_glm52_kt_mtp_shared_module(lm_head)
+
+
+class _CountingQuantMethod:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def process_weights_after_loading(self, module: torch.nn.Module) -> None:
+        del module
+        self.calls += 1
+
+
+class _QuantizedLeaf(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.quant_method = _CountingQuantMethod()
+
+
+class _LoaderModel(torch.nn.Module):
+    def __init__(
+        self,
+        borrowed_head: torch.nn.Module,
+        owned_leaf: _QuantizedLeaf,
+    ) -> None:
+        super().__init__()
+        self.borrowed_head = borrowed_head
+        self.owned_leaf = owned_leaf
+        self.load_calls = 0
+
+    def load_weights(self, weights) -> None:
+        tuple(weights)
+        self.load_calls += 1
+
+
+def test_default_loader_skips_only_context_borrowed_module_subtrees():
+    if not torch.cuda.is_available():
+        pytest.skip("SGLang model-loader imports require a visible CUDA device")
+    from sglang.srt.model_loader.loader import DefaultModelLoader
+
+    embed_tokens = torch.nn.Module()
+    borrowed_leaf = _QuantizedLeaf()
+    borrowed_head = torch.nn.Sequential(borrowed_leaf)
+    owned_leaf = _QuantizedLeaf()
+    model = _LoaderModel(borrowed_head, owned_leaf)
+
+    with glm52_kt_mtp_shared_modules(embed_tokens, borrowed_head) as shared:
+        model.kt_mtp_borrowed_module_ids_at_construction = (
+            shared.borrowed_module_ids
+        )
+        DefaultModelLoader.load_weights_and_postprocess(
+            model,
+            (),
+            torch.device("cpu"),
+        )
+
+    assert model.load_calls == 1
+    assert borrowed_leaf.quant_method.calls == 0
+    assert owned_leaf.quant_method.calls == 1
+
+    DefaultModelLoader.load_weights_and_postprocess(
+        model,
+        (),
+        torch.device("cpu"),
+    )
+
+    assert model.load_calls == 2
+    assert borrowed_leaf.quant_method.calls == 0
+    assert owned_leaf.quant_method.calls == 2
+
+    del model.kt_mtp_borrowed_module_ids_at_construction
+    DefaultModelLoader.load_weights_and_postprocess(
+        model,
+        (),
+        torch.device("cpu"),
+    )
+
+    assert model.load_calls == 3
+    assert borrowed_leaf.quant_method.calls == 1
+    assert owned_leaf.quant_method.calls == 3
 
 
 class _Scalar:
@@ -175,6 +265,8 @@ def _loaded_draft(
     gpu_expert_count: int = 0,
     shared_at_construction: bool = True,
     compact_mla_kv_b_w8: bool = False,
+    embed_tokens: object,
+    lm_head: object,
 ):
     kt_config = SimpleNamespace(
         layer_idx=layer_index,
@@ -195,15 +287,36 @@ def _loaded_draft(
             )
         )
     return SimpleNamespace(
-        model=SimpleNamespace(decoder=decoder),
+        model=SimpleNamespace(decoder=decoder, embed_tokens=embed_tokens),
+        lm_head=lm_head,
         kt_mtp_shared_embed_and_head_at_construction=shared_at_construction,
+        kt_mtp_borrowed_module_ids_at_construction=frozenset(
+            (id(embed_tokens), id(lm_head))
+        ),
     )
 
 
+def _loaded_models(**kwargs):
+    embed_tokens = object()
+    lm_head = object()
+    draft_model = _loaded_draft(
+        embed_tokens=embed_tokens,
+        lm_head=lm_head,
+        **kwargs,
+    )
+    target_model = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=embed_tokens),
+        lm_head=lm_head,
+    )
+    return draft_model, target_model
+
+
 def test_loaded_draft_receipt_proves_physical_layer_and_cpu_ownership():
+    draft_model, target_model = _loaded_models()
     receipt = validate_loaded_glm52_kt_mtp(
-        _loaded_draft(),
+        draft_model,
         KTMTPAdmission(enabled=True, physical_layer_index=78),
+        target_model=target_model,
     )
 
     assert receipt == {
@@ -216,29 +329,47 @@ def test_loaded_draft_receipt_proves_physical_layer_and_cpu_ownership():
 
 
 def test_loaded_draft_receipt_rejects_local_layer_zero_mapping():
+    draft_model, target_model = _loaded_models(layer_index=0)
     with pytest.raises(KTMTPAdmissionError, match="physical_layer_index=0"):
         validate_loaded_glm52_kt_mtp(
-            _loaded_draft(layer_index=0),
+            draft_model,
             KTMTPAdmission(enabled=True, physical_layer_index=78),
+            target_model=target_model,
         )
 
 
 def test_loaded_draft_receipt_requires_construction_time_weight_sharing():
+    draft_model, target_model = _loaded_models(shared_at_construction=False)
     with pytest.raises(KTMTPAdmissionError, match="not shared at draft construction"):
         validate_loaded_glm52_kt_mtp(
-            _loaded_draft(shared_at_construction=False),
+            draft_model,
             KTMTPAdmission(enabled=True, physical_layer_index=78),
+            target_model=target_model,
+        )
+
+
+def test_loaded_draft_receipt_requires_exact_target_module_identities():
+    draft_model, target_model = _loaded_models()
+    draft_model.lm_head = object()
+
+    with pytest.raises(KTMTPAdmissionError, match="not the target LM head module"):
+        validate_loaded_glm52_kt_mtp(
+            draft_model,
+            KTMTPAdmission(enabled=True, physical_layer_index=78),
+            target_model=target_model,
         )
 
 
 def test_loaded_draft_receipt_proves_direct_compact_kv_b_consumption():
+    draft_model, target_model = _loaded_models(compact_mla_kv_b_w8=True)
     receipt = validate_loaded_glm52_kt_mtp(
-        _loaded_draft(compact_mla_kv_b_w8=True),
+        draft_model,
         KTMTPAdmission(
             enabled=True,
             physical_layer_index=78,
             compact_mla_kv_b_w8=True,
         ),
+        target_model=target_model,
     )
 
     assert receipt["compact_mla_kv_b_w8"] is True

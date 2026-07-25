@@ -783,9 +783,15 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        from sglang.srt.speculative.kt_mtp import (
+            is_glm52_kt_mtp_shared_module,
+        )
+
         model.load_weights(weights)
 
         for _, module in model.named_modules():
+            if is_glm52_kt_mtp_shared_module(module, owner_model=model):
+                continue
             quant_method = getattr(module, "quant_method", None)
             if quant_method is not None:
                 # When quant methods need to process weights after loading

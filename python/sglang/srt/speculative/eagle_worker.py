@@ -175,38 +175,41 @@ class EAGLEWorker(TpModelWorker):
             )
         if self.kt_mtp_admission.enabled:
             kt_mtp_receipt = validate_loaded_glm52_kt_mtp(
-                self.draft_model_runner.model, self.kt_mtp_admission
+                self.draft_model_runner.model,
+                self.kt_mtp_admission,
+                target_model=self.target_worker.model_runner.model,
             )
             if tp_rank == 0:
                 logger.info("GLM52_KT_MTP_LOADED %s", kt_mtp_receipt)
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        if not self.kt_mtp_admission.enabled:
+            embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
-        if self.speculative_algorithm.is_eagle3():
-            # most cases EAGLE3 models don't share lm_head
-            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
-            if (
-                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
-                and self.draft_model_runner.model.load_lm_head_from_target
-            ):
-                self.draft_model_runner.model.set_embed_and_head(embed, head)
+            if self.speculative_algorithm.is_eagle3():
+                # most cases EAGLE3 models don't share lm_head
+                # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+                if (
+                    hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+                    and self.draft_model_runner.model.load_lm_head_from_target
+                ):
+                    self.draft_model_runner.model.set_embed_and_head(embed, head)
+                else:
+                    self.draft_model_runner.model.set_embed(embed)
+
+                # grab hot token ids
+                if self.draft_model_runner.model.hot_token_id is not None:
+                    self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
+                        embed.device
+                    )
+
             else:
-                self.draft_model_runner.model.set_embed(embed)
+                if self.hot_token_id is not None:
+                    head = head.clone()
+                    self.hot_token_id = self.hot_token_id.to(head.device)
+                    head.data = head.data[self.hot_token_id]
 
-            # grab hot token ids
-            if self.draft_model_runner.model.hot_token_id is not None:
-                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
-                    embed.device
-                )
-
-        else:
-            if self.hot_token_id is not None:
-                head = head.clone()
-                self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
-
-            # Share the embedding and lm_head
-            self.draft_model_runner.model.set_embed_and_head(embed, head)
+                # Share the embedding and lm_head
+                self.draft_model_runner.model.set_embed_and_head(embed, head)
 
         # Init attention backend and cuda graphs
         self.draft_model_runner.server_args.disable_cuda_graph = (
