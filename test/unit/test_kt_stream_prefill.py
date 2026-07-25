@@ -52,6 +52,19 @@ def test_glm52_tp2_four_expert_ring_sizing() -> None:
     assert plan.chunks_per_layer == 64
 
 
+def test_glm52_tp1_four_expert_ring_sizing_for_pd_prefill() -> None:
+    plan = admit_kt_stream_prefill(
+        KTStreamPrefillConfig(enabled=True, experts_per_chunk=4),
+        _glm52_facts(tensor_parallel_size=1),
+    )
+
+    assert plan.tensor_parallel_size == 1
+    assert plan.per_expert_device_bytes == 72 * 1024**2
+    assert plan.device_ring_bytes == 576 * 1024**2
+    assert plan.host_ring_bytes_per_rank == 576 * 1024**2
+    assert plan.chunks_per_layer == 64
+
+
 def test_glm52_small_ep_loads_complete_disjoint_experts() -> None:
     plan = admit_kt_stream_prefill(
         KTStreamPrefillConfig(
@@ -93,11 +106,27 @@ def test_small_ep_admission_rejects_missing_context_parallelism() -> None:
         )
 
 
+def test_small_ep_admission_rejects_tp1() -> None:
+    with pytest.raises(
+        KTStreamPrefillAdmissionError,
+        match="SmallEP requires tensor parallel size 2",
+    ):
+        admit_kt_stream_prefill(
+            KTStreamPrefillConfig(enabled=True, small_ep_enabled=True),
+            _glm52_facts(
+                tensor_parallel_size=1,
+                attention_context_parallel_size=2,
+                nsa_prefill_context_parallel=True,
+            ),
+        )
+
+
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
         ({"pipeline_parallel_size": 2}, "pipeline parallel size must be 1"),
-        ({"tensor_parallel_size": 1}, "tensor parallel size must be 2"),
+        ({"tensor_parallel_size": 3}, "tensor parallel size must be 1 or 2"),
+        ({"threadpool_count": 1}, "requires two KT NUMA threadpools"),
         ({"method": "BF16"}, "KT method must be AMXINT4"),
         ({"num_gpu_experts": 1}, "--kt-num-gpu-experts 0"),
         ({"max_deferred_experts_per_token": 1}, "deferred experts 0"),

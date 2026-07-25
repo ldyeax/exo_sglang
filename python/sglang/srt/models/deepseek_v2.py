@@ -217,16 +217,6 @@ else:
 logger = logging.getLogger(__name__)
 
 
-FORWARD_ABSORB_CORE_ATTENTION_BACKENDS = [
-    "fa3",
-    "nsa",
-    "flashinfer",
-    "cutlass_mla",
-    "trtllm_mla",
-    "ascend",
-]
-
-
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,

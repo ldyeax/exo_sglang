@@ -4901,8 +4901,8 @@ class ServerArgs:
             default=ServerArgs.kt_stream_prefill,
             help="[experimental ktransformers parameter] Replace the complete-layer "
             "GPU prefill fallback with a bounded two-slot BF16 expert-chunk ring. "
-            "The first implementation is admitted only for GLM-5.2 PP=1/TP=2 "
-            "with AMXINT4 CPU weights and zero resident/deferred experts.",
+            "The implementation is admitted only for GLM-5.2 PP=1 with TP=1 "
+            "or TP=2, two AMXINT4 NUMA pools, and zero resident/deferred experts.",
         )
         parser.add_argument(
             "--kt-stream-prefill-experts-per-chunk",
@@ -4941,8 +4941,8 @@ class ServerArgs:
             default=ServerArgs.enable_glm52_intra_node_pd_planner,
             help="[experimental ktransformers parameter] Install the fail-closed "
             "GLM-5.2 dwagon routing/admission controller. This exposes plans and "
-            "state hooks only; it does not launch the unavailable TP1 prefill/decode "
-            "split executors.",
+            "state hooks only; use sglang.srt.disaggregation."
+            "glm52_intra_node_runtime to launch the TP1 prefill/decode topology.",
         )
         parser.add_argument(
             "--record-kt-gpu-expert-distribution",
@@ -5758,7 +5758,7 @@ class ServerArgs:
         return max(FLA_CHUNK_SIZE, self.page_size)
 
     def create_glm52_intra_node_pd_controller(self):
-        """Build the tokenizer-owned planner hook without claiming split wiring."""
+        """Build the tokenizer-owned pure planner hook."""
 
         if not self.enable_glm52_intra_node_pd_planner:
             return None
@@ -5948,10 +5948,10 @@ class ServerArgs:
                 stream_prefill_errors.append("--kt-weight-path is required")
             if (self.kt_method or "").upper() != "AMXINT4":
                 stream_prefill_errors.append("--kt-method must be AMXINT4")
-            if self.pp_size != 1 or self.tp_size != 2:
+            if self.pp_size != 1 or self.tp_size not in {1, 2}:
                 stream_prefill_errors.append(
-                    "--pipeline-parallel-size 1 and --tensor-parallel-size 2 "
-                    "are required"
+                    "--pipeline-parallel-size 1 and --tensor-parallel-size 1 "
+                    "or 2 are required"
                 )
             if self.kt_threadpool_count != 2:
                 stream_prefill_errors.append("--kt-threadpool-count must be 2")
@@ -6004,6 +6004,10 @@ class ServerArgs:
                     hf_config = hf_config.text_config
                 architectures = getattr(hf_config, "architectures", None) or ()
                 architecture = architectures[0] if architectures else ""
+                if self.tp_size != 2:
+                    stream_prefill_errors.append(
+                        "--kt-stream-prefill-small-ep requires --tensor-parallel-size 2"
+                    )
                 if architecture != "GlmMoeDsaForCausalLM":
                     stream_prefill_errors.append(
                         "--kt-stream-prefill-small-ep requires GlmMoeDsaForCausalLM"

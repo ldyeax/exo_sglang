@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fail-closed GLM-5.2 routing for the two-GPU ``dwagon`` host.
 
-This module is deliberately an admission and action-planning boundary, not a
-process launcher.  The bounded KTransformers stream-loading prefill (SLP)
-executor already has an executable PP=1/TP=2 path.  SGLang does not yet have
-the model wiring needed to run that executor on one GPU while a separate
-one-GPU worker decodes on the other GPU.
+This module is deliberately a pure admission and action-planning boundary.
+``glm52_intra_node_runtime`` supplies the executable PP=1/TP=1 prefill,
+PP=1/TP=1 decode, native KV-handoff, and model-gateway process topology.  The
+bounded KTransformers stream-loading prefill (SLP) executor also retains its
+unified PP=1/TP=2 path.
 
 Callers therefore have to present explicit executor, shared-host-weight, and
 capacity contracts.  A missing or stale proof never falls back to an
@@ -18,7 +18,8 @@ unverified execution mode:
 * all other combinations are rejected or deferred.
 
 The controller at the bottom provides atomic reservations and state-reporting
-hooks for a future router.  It does not imply that the split executor exists.
+hooks for callers that need selective admission.  The executable runtime
+withholds its public gateway until its live contracts satisfy this planner.
 """
 
 from __future__ import annotations
@@ -112,9 +113,9 @@ class GLM52ExecutorCompatibility:
     """Runtime proof of model topology and available executor wiring.
 
     ``distributed_slp_admission`` must identify a successful admission of the
-    existing bounded KT stream-prefill executor.  The split booleans are kept
+    existing bounded KT stream-prefill executor.  The split booleans stay
     separate because a TP1 SLP worker, TP1 decode worker, and KV handoff are
-    three independently missing pieces today.
+    independently attested pieces of the live runtime.
     """
 
     architecture: str
@@ -316,7 +317,7 @@ class GLM52IntraNodeRuntimeState:
 
 @dataclass(frozen=True)
 class GLM52IntraNodeAction:
-    """One ordered action for a future executor."""
+    """One ordered action for an executor."""
 
     kind: GLM52IntraNodeActionKind
     gpu_ids: tuple[int, ...]
@@ -644,7 +645,7 @@ class _GLM52Reservation:
 
 
 class GLM52IntraNodeAdmissionController:
-    """Thread-safe admission and lifecycle hooks for a future request router."""
+    """Thread-safe admission and lifecycle hooks for a request router."""
 
     def __init__(self, config: GLM52IntraNodePolicyConfig):
         self.config = config

@@ -14,11 +14,13 @@ et al. (OSDI'26):
 * the model stream waits on a per-slot ready event, computes a weighted partial
   MoE result, and records a consumed event before the slot is reused.
 
-This module intentionally admits only the first hardware/model configuration
-we can reason about exactly: GLM-5.2, PP=1/TP=2 on one host, two KT NUMA pools,
-AMXINT4 CPU experts, no resident/deferred experts, and BF16 temporary GPU
-weights.  Unsupported combinations fail before ring allocation instead of
-silently falling back to a numerically or topologically different path.
+This module intentionally admits only the hardware/model configurations we can
+reason about exactly: GLM-5.2, PP=1 with TP=1 or TP=2 on one host, two KT NUMA
+pools, AMXINT4 CPU experts, no resident/deferred experts, and BF16 temporary GPU
+weights. TP=1 is the non-SmallEP intra-node prefill/decode split. TP=2 supports
+both the plain unified worker and SmallEP's complete, disjoint expert ownership.
+Unsupported combinations fail before ring allocation instead of silently
+falling back to a numerically or topologically different path.
 """
 
 from __future__ import annotations
@@ -188,11 +190,16 @@ def admit_kt_stream_prefill(
         failures.append(
             f"pipeline parallel size must be 1, got {facts.pipeline_parallel_size}"
         )
-    if facts.tensor_parallel_size != 2:
+    if facts.tensor_parallel_size not in {1, 2}:
         failures.append(
-            f"tensor parallel size must be 2, got {facts.tensor_parallel_size}"
+            f"tensor parallel size must be 1 or 2, got {facts.tensor_parallel_size}"
         )
     if config.small_ep_enabled:
+        if facts.tensor_parallel_size != 2:
+            failures.append(
+                "SmallEP requires tensor parallel size 2, got "
+                f"{facts.tensor_parallel_size}"
+            )
         if not facts.nsa_prefill_context_parallel:
             failures.append("SmallEP requires NSA prefill context parallelism")
         if facts.attention_context_parallel_size != 2:
@@ -215,10 +222,10 @@ def admit_kt_stream_prefill(
                 "SmallEP requires the original two-way MoE TP checkpoint layout, got "
                 f"{facts.moe_tensor_parallel_size}"
             )
-    if facts.threadpool_count != facts.tensor_parallel_size:
+    if facts.threadpool_count != 2:
         failures.append(
-            "KT threadpool count must equal tensor parallel size "
-            f"({facts.tensor_parallel_size}), got {facts.threadpool_count}"
+            "GLM-5.2 AMXINT4 stream-prefill requires two KT NUMA threadpools, "
+            f"got {facts.threadpool_count}"
         )
     if len(facts.numa_nodes) != facts.threadpool_count:
         failures.append(
@@ -334,8 +341,8 @@ def admit_kt_stream_prefill(
         tensor_parallel_size=facts.tensor_parallel_size,
         per_expert_device_bytes=per_expert_device_bytes,
         device_ring_bytes=device_ring_bytes,
-        # Each rank owns one pinned host chunk for each GPU ring slot.  Rank
-        # zero writes both ranks' POSIX-shared chunks before publishing them.
+        # Each rank owns one pinned host chunk for each GPU ring slot.  The
+        # exporting rank writes all TP rank chunks before publishing them.
         host_ring_bytes_per_rank=device_ring_bytes,
         safety_margin_bytes=config.safety_margin_bytes,
     )
