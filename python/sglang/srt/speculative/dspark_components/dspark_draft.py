@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Optional
 
@@ -232,6 +233,7 @@ class DraftBlockProposer:
         self._draft_block_spec_info = draft_block_spec_info
         self._draft_sampler = None
         self._dp_moe_sync = dp_moe_sync
+        self._graph_eager_compare_count = 0
 
     def attach_draft_sampler(self, draft_sampler) -> None:
         self._draft_sampler = draft_sampler
@@ -393,12 +395,56 @@ class DraftBlockProposer:
         raw_hidden = logits_output.hidden_states
         if raw_hidden is None:
             raise RuntimeError("DSpark draft model returned no hidden states.")
+        can_run_graph = draft_out.can_run_graph
+        if (
+            can_run_graph
+            and os.environ.get("SGLANG_DSV4_DRAFT_COMPARE_GRAPH_EAGER") == "1"
+        ):
+            graph_hidden = raw_hidden.detach().clone()
+            graph_runner = self.draft_model_runner.decode_cuda_graph_runner
+            self.draft_model_runner.decode_cuda_graph_runner = (
+                self.draft_model_runner.eager_runner
+            )
+            try:
+                with torch.inference_mode():
+                    eager_out = self.draft_model_runner.forward(draft_forward_batch)
+            finally:
+                self.draft_model_runner.decode_cuda_graph_runner = graph_runner
+            eager_hidden = eager_out.logits_output.hidden_states
+            if eager_hidden is None:
+                raise RuntimeError(
+                    "DSpark draft eager comparison returned no hidden states."
+                )
+            if self._graph_eager_compare_count < 8:
+                graph_float = graph_hidden.float()
+                eager_float = eager_hidden.float()
+                delta = graph_float - eager_float
+                rel_l2 = torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(
+                    eager_float
+                ).clamp_min(1e-20)
+                logger.info(
+                    "DSpark draft graph/eager hidden comparison step=%d: "
+                    "max_abs=%.7g mean_abs=%.7g rel_l2=%.7g "
+                    "graph_finite=%s eager_finite=%s positions=[%d,%d] seq_len=%d",
+                    self._graph_eager_compare_count,
+                    float(delta.abs().max().item()),
+                    float(delta.abs().mean().item()),
+                    float(rel_l2.item()),
+                    bool(torch.isfinite(graph_float).all().item()),
+                    bool(torch.isfinite(eager_float).all().item()),
+                    int(draft_positions.min().item()),
+                    int(draft_positions.max().item()),
+                    int(prefix_lens.max().item()),
+                )
+            self._graph_eager_compare_count += 1
+            raw_hidden = eager_hidden
+            can_run_graph = False
         draft_hidden_3d = raw_hidden.view(bs, gamma, -1)
         return DraftForwardResult(
             draft_block_ids=draft_block_ids,
             raw_hidden=raw_hidden,
             draft_hidden_3d=draft_hidden_3d,
-            can_run_graph=draft_out.can_run_graph,
+            can_run_graph=can_run_graph,
         )
 
     def _fill_dp_moe_sync_metadata(

@@ -61,6 +61,18 @@ class DFlashDraftInputV2(SpecInput):
 
     verify_token_budget: Optional[int] = None
 
+    # PP DSpark carries the last stage's next proposal around the ordinary
+    # pipeline output ring.  The following target-verify iteration can then
+    # start on PP0 without a reverse, latency-serializing collective.  These
+    # tensors are empty/None for non-PP execution and for the single
+    # target-only bootstrap decode after prefill.
+    pp_draft_block_ids: Optional[torch.Tensor] = None
+    pp_draft_tokens: Optional[torch.Tensor] = None
+    pp_corrected_logits: Optional[torch.Tensor] = None
+    pp_greedy_mask: Optional[torch.Tensor] = None
+    pp_temperatures: Optional[torch.Tensor] = None
+    pp_confidence: Optional[torch.Tensor] = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
 
@@ -247,6 +259,18 @@ class DFlashDraftInputV2(SpecInput):
             self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices.cpu()]
             self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
 
+        for name in (
+            "pp_draft_block_ids",
+            "pp_draft_tokens",
+            "pp_corrected_logits",
+            "pp_greedy_mask",
+            "pp_temperatures",
+            "pp_confidence",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                setattr(self, name, value[new_indices])
+
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
@@ -267,6 +291,25 @@ class DFlashDraftInputV2(SpecInput):
         elif spec_info.reserved_seq_lens_cpu is not None:
             self.reserved_seq_lens_cpu = spec_info.reserved_seq_lens_cpu
             self.reserved_seq_lens_sum = spec_info.reserved_seq_lens_sum
+
+        for name in (
+            "pp_draft_block_ids",
+            "pp_draft_tokens",
+            "pp_corrected_logits",
+            "pp_greedy_mask",
+            "pp_temperatures",
+            "pp_confidence",
+        ):
+            left = getattr(self, name)
+            right = getattr(spec_info, name)
+            if left is None or right is None:
+                if left is not None or right is not None:
+                    raise ValueError(
+                        f"Cannot merge PP DSpark proposal field {name}: "
+                        "one batch has a proposal and the other does not."
+                    )
+                continue
+            setattr(self, name, torch.cat([left, right], dim=0))
 
         if self.future_indices is not None:
             assert spec_info.future_indices is not None

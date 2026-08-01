@@ -168,7 +168,10 @@ def _weak_ref_if_tensor(x):
 
         return weak_ref_tensors(x)
     if isinstance(x, tuple):
-        return tuple(_weak_ref_if_tensor(e) for e in x)
+        transformed = tuple(_weak_ref_if_tensor(e) for e in x)
+        if hasattr(x, "_fields"):
+            return type(x)(*transformed)
+        return transformed
     if isinstance(x, list):
         return [_weak_ref_if_tensor(e) for e in x]
     return x
@@ -191,7 +194,9 @@ def _copy_output(dst: Any, src: Any) -> Any:
         and len(dst) == len(src)
     ):
         copied = [_copy_output(d, s) for d, s in zip(dst, src)]
-        return tuple(copied) if isinstance(dst, tuple) else copied
+        if isinstance(dst, tuple):
+            return type(dst)(*copied) if hasattr(dst, "_fields") else tuple(copied)
+        return copied
 
     if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
         for key, src_val in src.__dict__.items():
@@ -221,7 +226,11 @@ def eager_on_graph(enable: bool):
 
         def wrapper(*args, **kwargs):
             capture = _current_capture_var.get()
-            if capture is None:
+            # An outer eager_on_graph wrapper has already ended the active
+            # segment while it executes its body. Nested eager wrappers should
+            # run normally under that outer break, not try to end the same
+            # segment a second time.
+            if capture is None or capture._current_graph is None:
                 return inner(*args, **kwargs)
 
             logger.debug("Break graph due to function: %s", inner.__name__)
@@ -229,8 +238,11 @@ def eager_on_graph(enable: bool):
             # End the segment that captured up to this break point.
             capture._end_current_segment()
 
-            # Run the eager function once so it allocates its outputs and
-            # writes real data into them.
+            # Segment teardown is variable across ranks. Re-synchronize before
+            # eager breaks that contain rank-coupled collectives and timeouts.
+            if capture._barrier_fn is not None:
+                capture._barrier_fn()
+
             output = inner(*args, **kwargs)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
@@ -308,6 +320,7 @@ class BreakableCUDAGraphCapture:
         pool=None,
         stream: torch.cuda.Stream | None = None,
         capture_error_mode: str = "global",
+        barrier_fn: Callable[[], None] | None = None,
     ):
         assert isinstance(
             cuda_graph, BreakableCUDAGraph
@@ -316,6 +329,7 @@ class BreakableCUDAGraphCapture:
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream
         self._capture_error_mode = capture_error_mode
+        self._barrier_fn = barrier_fn
         self._stream_ctx = None
         self._capture_token = None
         self._stream_token = None

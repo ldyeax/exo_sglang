@@ -122,6 +122,12 @@ def fused_rope_inplace(
         positions: [batch_size] int32 or int64, indices into freqs_cis
         inverse: if True, apply inverse rotation (conjugate freqs)
     """
+    if q.ndim == 4:
+        assert q.shape[1] == 1
+        q = q.squeeze(1)
+    if k is not None and k.ndim == 4:
+        assert k.shape[1] == 1
+        k = k.squeeze(1)
     if _is_hip or _is_xpu:
         from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 
@@ -155,9 +161,29 @@ def fused_q_indexer_rope_hadamard_quant(
     weight_scale: float,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
+    q_fp8_output: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
-    q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
+    if q_fp8_output is None:
+        q_fp8 = torch.empty(
+            q_input.shape,
+            dtype=torch.float8_e4m3fn,
+            device=q_input.device,
+        )
+    else:
+        if (
+            q_fp8_output.shape != q_input.shape
+            or q_fp8_output.dtype != torch.float8_e4m3fn
+            or q_fp8_output.device != q_input.device
+            or not q_fp8_output.is_contiguous()
+        ):
+            raise RuntimeError(
+                "invalid caller-owned DSV4 indexer-Q FP8 output: "
+                f"input={tuple(q_input.shape)}/{q_input.device}, "
+                f"output={tuple(q_fp8_output.shape)}/{q_fp8_output.dtype}/"
+                f"{q_fp8_output.device}, contiguous={q_fp8_output.is_contiguous()}"
+            )
+        q_fp8 = q_fp8_output
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
     )

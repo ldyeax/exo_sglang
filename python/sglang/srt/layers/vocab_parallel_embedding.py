@@ -498,12 +498,16 @@ class VocabParallelEmbedding(torch.nn.Module):
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
-    def forward(self, input_):
+    def forward(self, input_, output: Optional[torch.Tensor] = None):
         # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
         # located async assert instead of a silent OOB embedding gather (tp=1 does not mask).
         maybe_detect_oob(
             input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
         )
+        if output is not None and self.tp_size != 1:
+            raise RuntimeError(
+                "caller-owned VocabParallelEmbedding output currently requires tp_size=1"
+            )
         if self.tp_size > 1:
             # Build the mask.
             masked_input, input_mask = get_masked_input_and_mask(
@@ -521,7 +525,17 @@ class VocabParallelEmbedding(torch.nn.Module):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            output_parallel = self.quant_method.embedding(self, masked_input.long())
+            masked_input = masked_input.long()
+            if output is None:
+                output_parallel = self.quant_method.embedding(self, masked_input)
+            else:
+                embedding_into = getattr(self.quant_method, "embedding_into", None)
+                if embedding_into is None:
+                    raise RuntimeError(
+                        "caller-owned VocabParallelEmbedding output is not "
+                        f"implemented by {type(self.quant_method).__name__}"
+                    )
+                output_parallel = embedding_into(self, masked_input, output)
 
         if self.tp_size > 1:
             # Mask the output embedding.

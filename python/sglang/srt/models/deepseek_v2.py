@@ -110,7 +110,7 @@ from sglang.srt.layers.moe.utils import (
     is_tbo_enabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
@@ -252,6 +252,7 @@ class DeepseekV2MLP(nn.Module):
         super().__init__()
         self.tp_size = tp_size
         self.swiglu_limit = swiglu_limit
+        self._is_shared_expert = prefix.endswith("shared_experts")
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -291,6 +292,136 @@ class DeepseekV2MLP(nn.Module):
         )
         self._fused_clamp_fp8_checked = False
         self._fused_clamp_use_fp8 = False
+
+    def _allocate_gate_up_output(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        M = x.shape[0]
+        quant_method = getattr(self.gate_up_proj, "quant_method", None)
+        if (
+            not self._is_shared_expert
+            or M < 512
+            or not isinstance(quant_method, Fp8LinearMethod)
+            or not quant_method.use_marlin
+            or self.gate_up_proj.tp_size != 1
+        ):
+            return None
+
+        attn_backend = get_attn_backend()
+        workspace = getattr(attn_backend, "_dsv4_main_q_workspace", None)
+        output_shape = (M, self.gate_up_proj.output_size_per_partition)
+        output_elements = M * self.gate_up_proj.output_size_per_partition
+        if (
+            workspace is None
+            or workspace.dtype != x.dtype
+            or workspace.device != x.device
+            or not workspace.is_contiguous()
+            or workspace.numel() < output_elements
+        ):
+            return None
+
+        setattr(
+            attn_backend,
+            "_dsv4_mlp_workspace_live_elements",
+            output_elements,
+        )
+        return workspace.view(-1)[:output_elements].view(output_shape)
+
+    def _allocate_swiglu_output(self, gate_up: torch.Tensor) -> torch.Tensor:
+        M, N = gate_up.shape
+        output_shape = (M, N // 2)
+
+        # DSV4's large-prefill main-Q workspace is dead after attention and
+        # before the serial shared-expert MLP begins. Reuse its contiguous
+        # prefix for the post-SwiGLU activation instead of asking the caching
+        # allocator for another short-lived block at peak KV-pool residency.
+        # Small batches (including decode/graph capture), dense MLPs, and
+        # models/backends without this explicitly named workspace retain the
+        # ordinary allocation path.
+        if self._is_shared_expert and M >= 512:
+            attn_backend = get_attn_backend()
+            workspace = getattr(attn_backend, "_dsv4_main_q_workspace", None)
+            needed_elements = M * (N // 2)
+            output_offset = 0
+            if (
+                workspace is not None
+                and gate_up.untyped_storage().data_ptr()
+                == workspace.untyped_storage().data_ptr()
+            ):
+                # Gate/up occupies the prefix until SwiGLU has consumed it.
+                # Leave enough prefix space for the subsequent, wider down
+                # output, then place the activation above both. Once SwiGLU
+                # finishes, down can safely overwrite the dead gate/up range.
+                output_offset = max(
+                    gate_up.numel(),
+                    M * self.down_proj.output_size,
+                )
+            if (
+                workspace is not None
+                and workspace.dtype == gate_up.dtype
+                and workspace.device == gate_up.device
+                and workspace.is_contiguous()
+                and workspace.numel() >= output_offset + needed_elements
+            ):
+                setattr(
+                    attn_backend,
+                    "_dsv4_mlp_workspace_live_elements",
+                    output_offset + needed_elements,
+                )
+                return workspace.view(-1)[
+                    output_offset : output_offset + needed_elements
+                ].view(output_shape)
+
+        return gate_up.new_empty(output_shape)
+
+    def _allocate_down_output(self, x: torch.Tensor) -> Optional[torch.Tensor]:
+        M = x.shape[0]
+        quant_method = getattr(self.down_proj, "quant_method", None)
+        if (
+            not self._is_shared_expert
+            or M < 512
+            or not isinstance(quant_method, Fp8LinearMethod)
+            or not quant_method.use_marlin
+            or self.down_proj.tp_size != 1
+        ):
+            return None
+
+        attn_backend = get_attn_backend()
+        workspace = getattr(attn_backend, "_dsv4_main_q_workspace", None)
+        output_shape = (M, self.down_proj.output_size)
+        output_elements = M * self.down_proj.output_size
+        if (
+            workspace is None
+            or workspace.dtype != x.dtype
+            or workspace.device != x.device
+            or not workspace.is_contiguous()
+            or x.untyped_storage().data_ptr()
+            != workspace.untyped_storage().data_ptr()
+        ):
+            return None
+
+        input_offset = x.storage_offset() - workspace.storage_offset()
+        if input_offset < 0:
+            return None
+        if input_offset >= output_elements:
+            # The activation was placed above a prefix large enough for the
+            # down output; reuse the now-dead gate/up prefix.
+            output_offset = 0
+        else:
+            # Legacy layout used when gate/up was ordinarily allocated.
+            output_offset = input_offset + x.numel()
+        if workspace.numel() < output_offset + output_elements:
+            return None
+
+        setattr(
+            attn_backend,
+            "_dsv4_mlp_workspace_live_elements",
+            max(
+                input_offset + x.numel(),
+                output_offset + output_elements,
+            ),
+        )
+        return workspace.view(-1)[
+            output_offset : output_offset + output_elements
+        ].view(output_shape)
 
     def forward(
         self,
@@ -336,7 +467,13 @@ class DeepseekV2MLP(nn.Module):
             ).view(x.shape[0], self.gate_up_proj.output_size_per_partition)
             x = (x, None, y)
 
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up_output = (
+            self._allocate_gate_up_output(x) if isinstance(x, torch.Tensor) else None
+        )
+        if gate_up_output is None:
+            gate_up, _ = self.gate_up_proj(x)
+        else:
+            gate_up, _ = self.gate_up_proj(x, output=gate_up_output)
         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
         # Only valid when down_proj does NOT need an all-reduce and its weights
         # are fp8 (uint8 storage with weight_scale_inv).
@@ -420,12 +557,15 @@ class DeepseekV2MLP(nn.Module):
                 )
                 x = self.act_fn(gate_up)
             else:
-                M, N = gate_up.shape
-                x = gate_up.new_empty((M, N // 2))
+                x = self._allocate_swiglu_output(gate_up)
                 silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
         else:
             x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        down_output = self._allocate_down_output(x)
+        if down_output is None:
+            x, _ = self.down_proj(x)
+        else:
+            x, _ = self.down_proj(x, output=down_output)
         return x
 
 

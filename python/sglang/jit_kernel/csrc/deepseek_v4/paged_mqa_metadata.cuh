@@ -83,7 +83,8 @@ void setup_kernel_smem_once(host::DebugInfo where = {}) {
 }
 
 struct IndexerMetadataKernel {
-  static constexpr auto kMaxBatchSizeInSmem = 16384 * 2;  // 128 KB smeme
+  // 16K int32 lengths use 64 KiB, within Ampere's opt-in shared-memory cap.
+  static constexpr auto kMaxBatchSizeInSmem = 16384;
   static void run(tvm::ffi::TensorView seq_lens, tvm::ffi::TensorView metadata) {
     using namespace host;
     auto N = SymbolicSize{"batch_size"};

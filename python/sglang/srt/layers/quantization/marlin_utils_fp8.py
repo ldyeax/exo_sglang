@@ -100,6 +100,61 @@ def apply_fp8_marlin_linear(
     return output.reshape(out_shape)
 
 
+def apply_fp8_marlin_linear_into(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    workspace: torch.Tensor,
+    size_n: int,
+    size_k: int,
+    bias: Optional[torch.Tensor],
+    output: torch.Tensor,
+    use_fp32_reduce: bool = USE_FP32_REDUCE_DEFAULT,
+) -> torch.Tensor:
+    """Run the Marlin FP8 linear directly into caller-owned contiguous storage."""
+
+    reshaped_x = input.reshape(-1, input.shape[-1])
+    reshaped_output = output.reshape(-1, size_n)
+    expected_shape = (reshaped_x.size(0), size_n)
+    if reshaped_output.shape != expected_shape:
+        raise ValueError(
+            "FP8 Marlin output has invalid shape: "
+            f"expected={expected_shape}, actual={tuple(reshaped_output.shape)}"
+        )
+    if not reshaped_output.is_contiguous():
+        raise ValueError("FP8 Marlin caller-owned output must be contiguous")
+
+    use_atomic_add = should_use_atomic_add_reduce(
+        m=reshaped_x.size(0),
+        n=size_n,
+        k=size_k,
+        device=input.device,
+        dtype=input.dtype,
+    )
+    result = gptq_marlin_gemm(
+        a=reshaped_x,
+        c=reshaped_output,
+        b_q_weight=weight,
+        b_scales=weight_scale,
+        global_scale=None,
+        b_zeros=None,
+        g_idx=None,
+        perm=None,
+        workspace=workspace,
+        b_q_type=scalar_types.float8_e4m3fn,
+        size_m=reshaped_x.size(0),
+        size_n=size_n,
+        size_k=size_k,
+        use_atomic_add=use_atomic_add,
+        use_fp32_reduce=use_fp32_reduce,
+    )
+    if result.data_ptr() != reshaped_output.data_ptr():
+        raise RuntimeError("FP8 Marlin did not preserve caller-owned output storage")
+    if bias is not None:
+        result.add_(bias)
+    return result.reshape(output.shape)
+
+
 def prepare_fp8_layer_for_marlin(
     layer: torch.nn.Module, size_k_first: bool = True
 ) -> None:

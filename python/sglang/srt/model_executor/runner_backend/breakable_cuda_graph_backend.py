@@ -19,6 +19,7 @@ No torch.compile.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import fields, replace
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
@@ -26,6 +27,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
@@ -74,6 +76,12 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
+        capture_shapes = (
+            cuda_graph_runner.capture_num_tokens
+            if cuda_graph_runner.ragged_verify_mode
+            else cuda_graph_runner.capture_bs
+        )
+        self._single_capture_shape = len(capture_shapes) == 1
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -123,18 +131,25 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
         size = shape_key.size
-        if self._shared_output_buffer is None:
+        if not self._single_capture_shape and self._shared_output_buffer is None:
             self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
         with BreakableCUDAGraphCapture(
             cuda_graph=graph,
             pool=self._pool,
             stream=self._capture_stream,
+            barrier_fn=self._tp_group.barrier,
         ):
             out = captured_fn()
-            out_rows = self._output_rows(out, size)
-            self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
+            if not self._single_capture_shape:
+                out_rows = self._output_rows(out, size)
+                self._copy_output_to_buffer(
+                    out, self._shared_output_buffer, out_rows
+                )
 
-        stored = self._slice_output(self._shared_output_buffer, out_rows)
+        if self._single_capture_shape:
+            stored = out
+        else:
+            stored = self._slice_output(self._shared_output_buffer, out_rows)
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = stored
 
@@ -166,6 +181,16 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                     for key, t in output.tensors.items()
                 }
             )
+        if isinstance(output, LogitsProcessorOutput):
+            return replace(
+                output,
+                **{
+                    field.name: self._alloc_full_buffer(value, size)
+                    for field in fields(output)
+                    if (value := getattr(output, field.name)) is None
+                    or torch.is_tensor(value)
+                },
+            )
         if isinstance(output, tuple):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
@@ -179,6 +204,16 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
+        if isinstance(output, LogitsProcessorOutput):
+            return replace(
+                output,
+                **{
+                    field.name: self._slice_output(value, num_tokens)
+                    for field in fields(output)
+                    if (value := getattr(output, field.name)) is None
+                    or torch.is_tensor(value)
+                },
+            )
         if isinstance(output, tuple):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
@@ -210,6 +245,15 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 self._copy_output_to_buffer(
                     tensor, output_buffer.tensors[key], num_tokens
                 )
+            return
+        if isinstance(output, LogitsProcessorOutput) and isinstance(
+            output_buffer, LogitsProcessorOutput
+        ):
+            for field in fields(output):
+                value = getattr(output, field.name)
+                buffer = getattr(output_buffer, field.name)
+                if value is None or torch.is_tensor(value):
+                    self._copy_output_to_buffer(value, buffer, num_tokens)
             return
         if isinstance(output, (list, tuple)) and isinstance(
             output_buffer, type(output)

@@ -221,6 +221,21 @@ class TestPrefetchCheckpoints(CustomTestCase):
                 paths,
             )
 
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_buffered_loader_filters_before_yield(self, _):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._create_safetensors_files(tmpdir, num_shards=3)
+
+            loaded = list(
+                buffered_multi_thread_safetensors_weights_iterator(
+                    paths,
+                    max_workers=2,
+                    tensor_name_filter=lambda name: name == "layer0.weight",
+                )
+            )
+
+        self.assertEqual([name for name, _ in loaded], ["layer0.weight"])
+
 
 class TestPrefetchDispatch(CustomTestCase):
     """Verify _get_weights_iterator dispatches to the right safetensors

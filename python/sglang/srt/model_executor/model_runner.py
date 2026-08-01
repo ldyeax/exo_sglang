@@ -794,11 +794,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         assert (
             (not model_has_mtp_layers)
             or (self.spec_algorithm.is_none())
+            or (self.spec_algorithm.is_dspark() and not self.is_draft_worker)
             or (
                 (not self.spec_algorithm.is_none())
                 and (self.num_effective_layers == model_num_layers)
             )
-        ), "PP is not compatible with MTP models."
+        ), "PP is not compatible with this MTP model configuration."
 
         # Apply torchao quantization
         torchao_applied = getattr(self.model, "torchao_applied", False)
@@ -1316,10 +1317,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"(tp_size={self.tp_size}, pp_size={self.pp_size}, ep_size={self.moe_ep_size})"
                 )
 
+        local_only_draft = (
+            self.is_draft_worker
+            and self.tp_size == 1
+            and self.pp_size == 1
+            and self.server_args.nnodes == 1
+            and get_world_group().world_size > 1
+        )
         pre_model_load_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
+            distributed=get_world_group().world_size > 1 and not local_only_draft,
             cpu_group=get_world_group().cpu_group,
         )
         self.tp_group = get_tp_group()

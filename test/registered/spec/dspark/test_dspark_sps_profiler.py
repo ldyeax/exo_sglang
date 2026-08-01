@@ -222,6 +222,33 @@ class TestTableAssembly(CustomTestCase):
         self.assertEqual(table.sample_batch_tokens, [32])
         self.assertAlmostEqual(table.sample_steps_per_sec[0], 50.0)
 
+    def test_additive_table_preserves_single_stream_graph_tiers(self):
+        summaries = [
+            {
+                "batch_size": 1,
+                "batch_size_per_rank": 1,
+                "batch_tokens": tier,
+                "steps_per_sec": 1.0 / step_time,
+                "frac": tier / 6,
+            }
+            for tier, step_time in enumerate(
+                (0.207, 0.211, 0.216, 0.220, 0.223, 0.227), start=1
+            )
+        ]
+        table = build_table_from_summaries(
+            summaries=summaries,
+            max_batch_tokens=None,
+            offdiag=True,
+        )
+        self.assertEqual(table.m_probes, [1, 2, 3, 4, 5, 6])
+        for tier, step_time in enumerate(
+            (0.207, 0.211, 0.216, 0.220, 0.223, 0.227), start=1
+        ):
+            self.assertAlmostEqual(
+                table.step_time(num_reqs=1, budget=tier - 1),
+                step_time,
+            )
+
 
 class TestSweepHelpers(CustomTestCase):
     def test_request_count_sweep_tapers_and_hits_the_max(self):

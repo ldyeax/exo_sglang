@@ -84,6 +84,10 @@ class ExpertDistributionRecorder(ABC):
         yield
 
     @contextmanager
+    def with_current_layer_if_absent(self, layer_idx):
+        yield
+
+    @contextmanager
     def with_debug_name(self, debug_name):
         yield
 
@@ -167,6 +171,21 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
 
+    @contextmanager
+    def with_current_layer_if_absent(self, layer_idx):
+        """Enter a layer on BCG replay, or preserve the capture-time scope."""
+        current_layer_idx = self._current_layer_idx.value
+        if current_layer_idx is not None:
+            if current_layer_idx != layer_idx:
+                raise RuntimeError(
+                    "Nested expert-recorder layer mismatch: "
+                    f"current={current_layer_idx}, requested={layer_idx}"
+                )
+            yield
+            return
+        with self._current_layer_idx.with_value(layer_idx):
+            yield
+
     def with_debug_name(self, debug_name):
         return self._current_debug_name.with_value(debug_name)
 
@@ -239,12 +258,17 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._recording or torch.get_device_module().is_current_stream_capturing()
         ):
             return
+        layer_idx = self._current_layer_idx.value
+        # DSpark draft routing has no target-layer scope. Recording it as target
+        # demand corrupts route-ranked placement and can also index with None.
+        if layer_idx is None:
+            return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
                 self._current_debug_name.value
             )
         ]
-        getattr(gatherer, hook_name)(layer_idx=self._current_layer_idx.value, **kwargs)
+        getattr(gatherer, hook_name)(layer_idx=layer_idx, **kwargs)
 
     def _reset(self):
         """Reset the expert distribution recorder."""
@@ -860,6 +884,10 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # ``rank`` above is the MoE/TP rank and is zero on every stage of a
+        # TP1 pipeline. Keep the world rank as a unique file identity when PP
+        # stages dump their independent route slices.
+        self._global_rank = torch.distributed.get_rank()
         self._global_physical_count_of_buffered_step = _Buffer.init_new(
             item_shape=(
                 self._expert_location_metadata.num_layers,
@@ -901,18 +929,33 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             self._first_dump = False
             torch.get_device_module().empty_cache()
 
-        torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
-        )
+        # PP control messages travel stage by stage. Entering a world
+        # collective on PP0 here prevents the event loop from forwarding the
+        # dump request to PP1, so the collective can never complete. Each PP
+        # stage already records into the common global [layers, experts]
+        # shape; write its local slice independently and merge the disjoint
+        # layer rows offline. Ordinary TP/EP keeps the original reduction.
+        pipeline_parallel_dump = self._server_args.pp_size > 1
+        if not pipeline_parallel_dump:
+            torch.distributed.all_reduce(
+                logical_count_of_buffered_step,
+                op=torch.distributed.ReduceOp.SUM,
+            )
 
         output = dict(
-            rank=self._rank,
+            rank=self._global_rank,
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
 
         if output_mode == "file":
-            if self._rank == 0:
+            if pipeline_parallel_dump:
+                _dump_to_file(
+                    "expert_distribution_recorder_"
+                    f"{time.time()}_{self._global_rank}.pt",
+                    output,
+                )
+            elif self._rank == 0:
                 _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
         elif output_mode == "object":
             return output

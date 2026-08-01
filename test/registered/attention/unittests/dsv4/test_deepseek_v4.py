@@ -427,6 +427,36 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             )
         )
 
+    def test_refresh_preserves_attention_storage_when_attention_is_captured(self):
+        capture_metadata = self._make_core_metadata(0)
+        replay_metadata = self._make_core_metadata(1000)
+        captured_attention_tensor_fields = [
+            "page_table",
+            "swa_page_indices",
+            "swa_topk_lengths",
+            "c128_page_indices",
+            "c128_topk_lengths_clamp1",
+        ]
+        captured_objects = {
+            field: getattr(capture_metadata, field)
+            for field in captured_attention_tensor_fields
+        }
+
+        with mock.patch.dict(
+            "os.environ",
+            {"SGLANG_DSV4_CAPTURE_ATTN_IN_BCG": "1"},
+        ):
+            capture_metadata.refresh_for_breakable_cuda_graph_replay_(replay_metadata)
+
+        for field in captured_attention_tensor_fields:
+            self.assertIs(getattr(capture_metadata, field), captured_objects[field])
+            self.assertTrue(
+                torch.equal(
+                    getattr(capture_metadata, field),
+                    getattr(replay_metadata, field),
+                )
+            )
+
     def test_backend_replay_keeps_captured_metadata_active(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4AttnBackend,
@@ -469,6 +499,49 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             torch.equal(
                 capture_metadata.core_attn_metadata.seq_lens_casual,
                 replay_metadata.core_attn_metadata.seq_lens_casual,
+            )
+        )
+
+    def test_bcg_refresh_relinks_indexer_to_live_core_metadata(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
+        from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
+
+        def make_indexer(core_metadata):
+            indexer_metadata = object.__new__(PagedIndexerMetadata)
+            indexer_metadata.page_size = core_metadata.page_size
+            indexer_metadata.page_table = core_metadata.page_table
+            indexer_metadata.c4_seq_lens = core_metadata.c4_topk_lengths_raw
+            indexer_metadata.use_prefill_cuda_graph = True
+            indexer_metadata.deep_gemm_metadata = None
+            indexer_metadata.topk_metadata = torch.empty(0)
+            indexer_metadata.nonpaged_plan = None
+            return indexer_metadata
+
+        capture_core = self._make_core_metadata(0)
+        replay_core = self._make_core_metadata(1000)
+        capture_metadata = DSV4Metadata(
+            capture_core,
+            indexer_metadata=make_indexer(capture_core),
+        )
+        replay_metadata = DSV4Metadata(
+            replay_core,
+            indexer_metadata=make_indexer(replay_core),
+        )
+
+        capture_metadata.refresh_for_breakable_cuda_graph_replay_(replay_metadata)
+
+        self.assertIs(
+            capture_metadata.indexer_metadata.page_table,
+            capture_metadata.core_attn_metadata.page_table,
+        )
+        self.assertIs(
+            capture_metadata.indexer_metadata.c4_seq_lens,
+            capture_metadata.core_attn_metadata.c4_topk_lengths_raw,
+        )
+        self.assertTrue(
+            torch.equal(
+                capture_metadata.indexer_metadata.page_table,
+                replay_metadata.core_attn_metadata.page_table,
             )
         )
 

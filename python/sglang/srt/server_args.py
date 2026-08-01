@@ -2371,6 +2371,10 @@ class ServerArgs:
         int,
         "[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
     ] = 2
+    kt_numa_nodes: A[
+        Optional[List[int]],
+        "[ktransformers parameter] Explicit physical NUMA node for each KT thread pool.",
+    ] = None
     kt_num_gpu_experts: A[
         Optional[int],
         "[ktransformers parameter] The number of GPU experts.",
@@ -6982,9 +6986,13 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            assert self.speculative_algorithm in (None, "DSPARK"), (
+                "Pipeline parallelism supports speculative decoding only with "
+                "the PP-aware DSPARK implementation"
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

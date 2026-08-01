@@ -24,6 +24,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -377,6 +378,9 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        weight_name_filter: Optional[Callable[[str], bool]] = None
+        """Optional predicate applied before a safetensors value is materialized."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -385,6 +389,9 @@ class DefaultModelLoader(BaseModelLoader):
                 prefix="",
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
                 model_config=model_config,
+                weight_name_filter=getattr(
+                    model, "checkpoint_weight_name_filter", None
+                ),
             )
 
     counter_before_loading_weights: float = 0.0
@@ -545,6 +552,7 @@ class DefaultModelLoader(BaseModelLoader):
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
         use_multithread = extra_config.get("enable_multithread_load", True)
+        weight_name_filter = getattr(source, "weight_name_filter", None)
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
@@ -617,6 +625,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    tensor_name_filter=weight_name_filter,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -625,6 +634,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    tensor_name_filter=weight_name_filter,
                 )
 
         else:

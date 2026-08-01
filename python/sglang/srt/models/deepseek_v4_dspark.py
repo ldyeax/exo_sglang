@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, List, Optional, Tuple
 
 import msgspec
@@ -11,6 +12,9 @@ from torch import nn
 from sglang.jit_kernel.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_distribution import (
+    get_global_expert_distribution_recorder,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -26,9 +30,13 @@ from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
     MqaAttentionBase,
-    _dequant_fp8_wo_a,
+    _dequant_fp8_wo_a_streaming,
+    bcg_deepseek_v4_moe_ffn,
     hc_head_torch,
     make_hc_head_params,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
 )
 from sglang.srt.models.dspark import (
     DSparkConfidenceHead,
@@ -163,7 +171,10 @@ class DSparkAttention(MqaAttentionBase):
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if self._use_fast_kernel:
             if q_out is None:
-                q_out = torch.empty_like(q)
+                # The fused kernel registers the complete source vector before
+                # writing its disjoint destination, so source/destination
+                # aliasing is safe and avoids a full-size draft-Q duplicate.
+                q_out = q
             fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
             return q_out
         else:
@@ -551,13 +562,43 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.dim)
-        y = self._run_moe_ffn_dp_sync(
-            x, forward_batch, input_ids=None, input_ids_global=None
-        )
+        if is_in_breakable_cuda_graph():
+            # Keep dispatch, native-MXFP4 experts, combine, and collectives on
+            # one eager bridge. Capturing combine against an expert output
+            # allocated by a nested eager bridge replays stale storage.
+            y = bcg_deepseek_v4_moe_ffn(
+                self,
+                x,
+                forward_batch,
+                None,
+                None,
+            )
+        else:
+            y = self._run_moe_ffn_dp_sync(
+                x, forward_batch, input_ids=None, input_ids_global=None
+            )
         return y.view(shape)
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
+    @staticmethod
+    def checkpoint_weight_name_filter(name: str) -> bool:
+        """Filter the bundled target checkpoint before tensor materialization.
+
+        V4 Pro stores the three DSpark stages under ``mtp.*`` in the final
+        checkpoint shards. When every draft expert is assigned to
+        KTransformers, its native loader reads those expert tensors directly;
+        materializing the same 39 GiB through SGLang first is redundant.
+        """
+        if not name.startswith("mtp."):
+            return False
+        if (
+            int(os.environ.get("SGLANG_KT_DRAFT_GPU_EXPERTS", "0")) == 0
+            and ".ffn.experts." in name
+        ):
+            return False
+        return True
+
 
     def __init__(
         self,
@@ -700,8 +741,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
-        for stage in self.stages:
-            x = stage(positions, x, forward_batch)
+        # The recorder is configured from the 61-layer target model and its
+        # placement profile must not mix in the three independently namespaced
+        # DSpark draft layers.  Unlike the target loop, draft stages have no
+        # corresponding target layer index; leaving recording enabled here
+        # makes the recorder index its target accumulator with ``None``.
+        with get_global_expert_distribution_recorder().disable_this_region():
+            for stage in self.stages:
+                x = stage(positions, x, forward_batch)
 
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
@@ -768,9 +815,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params = set()
 
-        weights = list(weights)
-        if any(name.endswith(".wo_a.scale") for name, _ in weights):
-            weights = list(_dequant_fp8_wo_a(weights))
+        weights = _dequant_fp8_wo_a_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
