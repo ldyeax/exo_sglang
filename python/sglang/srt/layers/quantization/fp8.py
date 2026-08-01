@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -67,7 +68,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_block_scale_ue8m0_for_deepgemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear_into,
+    prepare_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -361,6 +365,16 @@ class Fp8Config(QuantizationConfig):
                 )
 
             fp8_method = Fp8MoEMethod(self)
+
+            if (
+                self.is_fp4_experts
+                and os.environ.get("SGLANG_V4_USE_TRITON_KERNELS") == "1"
+            ):
+                from sglang.srt.layers.quantization.mxfp4_triton_kernels_moe import (
+                    Mxfp4TritonKernelsMoEMethod,
+                )
+
+                return Mxfp4TritonKernelsMoEMethod(fp8_method, prefix=prefix)
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
                 assert (
@@ -889,8 +903,20 @@ class Fp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_marlin:
+            if output is not None:
+                return apply_fp8_marlin_linear_into(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    workspace=layer.workspace,
+                    size_n=layer.output_size_per_partition,
+                    size_k=layer.input_size_per_partition,
+                    bias=bias,
+                    output=output,
+                )
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
@@ -900,6 +926,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+
+        if output is not None:
+            raise ValueError("caller-owned FP8 linear output requires Marlin")
 
         if self.use_mxfp8:
             backend = get_fp8_gemm_runner_backend()

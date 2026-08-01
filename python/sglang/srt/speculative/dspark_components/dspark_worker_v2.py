@@ -1,16 +1,25 @@
+import json
 import logging
-from contextlib import nullcontext
+import os
+from contextlib import ExitStack, contextmanager, nullcontext
+from copy import copy
+from pathlib import Path
 from typing import Optional
 
 import torch
+from safetensors import safe_open
 
 from sglang.srt.environ import envs
+from sglang.srt.distributed.parallel_state import patch_pipeline_parallel_group
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     compute_position,
+)
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    eager_on_graph,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
@@ -28,6 +37,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     resolve_runtime_config,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import (
+    DraftBlockResult,
     DraftBlockProposer,
     make_next_draft_input,
     maybe_build_draft_sampler,
@@ -57,6 +67,52 @@ from sglang.srt.utils import get_available_gpu_memory, is_cuda
 logger = logging.getLogger(__name__)
 
 
+class LazySafetensorTokenEmbedding(torch.nn.Module):
+    """Page only requested embedding rows for a last-only PP draft."""
+
+    def __init__(self, model_path: str) -> None:
+        super().__init__()
+        checkpoint = Path(model_path)
+        index_path = checkpoint / "model.safetensors.index.json"
+        with index_path.open(encoding="utf-8") as index_file:
+            weight_map = json.load(index_file)["weight_map"]
+        weight_name = next(
+            (
+                candidate
+                for candidate in ("embed.weight", "model.embed_tokens.weight")
+                if candidate in weight_map
+            ),
+            None,
+        )
+        if weight_name is None:
+            raise RuntimeError(
+                f"PP DSpark could not find an embedding tensor in {index_path}."
+            )
+        self.weight_name = weight_name
+        self.weight_path = checkpoint / weight_map[weight_name]
+
+    @eager_on_graph(True)
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # The last-only PP draft intentionally has no full GPU embedding table.
+        # Row paging contains a CUDA->CPU ID copy plus host safetensors access,
+        # neither of which can be recorded in a CUDA graph.  Keep this small
+        # operation as an eager break between graph segments; its GPU output is
+        # bridged back into the captured draft graph.
+        flat_ids = input_ids.detach().reshape(-1).to(device="cpu", dtype=torch.int64)
+        unique_ids, inverse = torch.unique(flat_ids, sorted=False, return_inverse=True)
+        with safe_open(self.weight_path, framework="pt", device="cpu") as weights:
+            tensor_slice = weights.get_slice(self.weight_name)
+            rows = torch.cat(
+                [
+                    tensor_slice[int(token_id) : int(token_id) + 1]
+                    for token_id in unique_ids.tolist()
+                ],
+                dim=0,
+            )
+        embedded = rows[inverse].reshape(*input_ids.shape, rows.shape[-1])
+        return embedded.to(device=input_ids.device, non_blocking=True)
+
+
 class DSparkWorkerV2(BaseSpecWorker):
 
     def __init__(
@@ -83,6 +139,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
         self.device = target_worker.device
+        self._is_pipeline_parallel = server_args.pp_size > 1
+        self._is_last_pipeline_rank = bool(
+            target_worker.model_runner.pp_group.is_last_rank
+        )
+        self._has_local_draft = (
+            not self._is_pipeline_parallel or self._is_last_pipeline_rank
+        )
+        self._draft_pp_group = None
+        if self._is_pipeline_parallel and self._is_last_pipeline_rank:
+            self._draft_pp_group = copy(target_worker.model_runner.pp_group)
+            self._draft_pp_group.world_size = 1
+            self._draft_pp_group.rank_in_group = 0
+            self._draft_pp_group.ranks = [self._draft_pp_group.rank]
 
         self._draft_is_moe = draft_is_deepseek_v4(server_args=server_args)
         self._draft_dp_context_enabled = (
@@ -96,29 +165,38 @@ class DSparkWorkerV2(BaseSpecWorker):
                 "MoE-under-DP all-reduce."
             )
 
-        with self._draft_context():
-            bundle = build_draft_tp_worker(
-                server_args=server_args,
-                gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                dp_rank=dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_cp_rank=attn_cp_rank,
-                moe_dp_rank=moe_dp_rank,
-                nccl_port=nccl_port,
-                target_model_config=target_worker.model_runner.model_config,
-                algo_label="DSPARK",
-                attention_backend_override=(
-                    DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
-                ),
-            )
-        self._draft_worker = bundle.draft_worker
-        self.draft_model_runner = bundle.draft_model_runner
-        self.draft_model = bundle.draft_model
+        bundle = None
+        if self._has_local_draft:
+            with self._draft_context():
+                bundle = build_draft_tp_worker(
+                    server_args=server_args,
+                    gpu_id=gpu_id,
+                    tp_rank=tp_rank,
+                    dp_rank=dp_rank,
+                    moe_ep_rank=moe_ep_rank,
+                    attn_cp_rank=attn_cp_rank,
+                    moe_dp_rank=moe_dp_rank,
+                    nccl_port=nccl_port,
+                    target_model_config=target_worker.model_runner.model_config,
+                    algo_label="DSPARK",
+                    attention_backend_override=(
+                        DSV4_DRAFT_ATTENTION_BACKEND if self._draft_is_moe else None
+                    ),
+                    standalone_pipeline=self._is_pipeline_parallel,
+                )
+        self._draft_worker = None if bundle is None else bundle.draft_worker
+        self.draft_model_runner = (
+            None if bundle is None else bundle.draft_model_runner
+        )
+        self.draft_model = None if bundle is None else bundle.draft_model
         self._draft_sampler = None
 
         runtime_config = resolve_runtime_config(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config,
+            draft_hf_config=(
+                self.draft_model_runner.model_config.hf_config
+                if self.draft_model_runner is not None
+                else target_worker.model_runner.model_config.hf_config
+            ),
             speculative_num_draft_tokens=server_args.speculative_num_draft_tokens,
             target_vocab_size=int(
                 self.target_worker.model_runner.model_config.vocab_size
@@ -129,7 +207,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.speculative_num_draft_tokens = self.verify_num_draft_tokens
         self._mask_token_id = runtime_config.mask_token_id
 
-        if self.tp_rank == 0:
+        if self.tp_rank == 0 and self._has_local_draft:
+            assert bundle is not None
             logger.info(
                 "Initialized DSpark draft runner. attention_backend=%s, model=%s, "
                 "gamma=%s, verify_num_draft_tokens=%s, mask_token_id=%s, "
@@ -141,6 +220,11 @@ class DSparkWorkerV2(BaseSpecWorker):
                 self._mask_token_id,
                 type(self.draft_model.markov_head).__name__,
             )
+        elif self.tp_rank == 0:
+            logger.info(
+                "Initialized PP DSpark target-only stage; the complete draft "
+                "runner is placed on the last pipeline rank."
+            )
 
         self._block_pos_offsets = build_block_pos_offsets(
             length=self.verify_num_draft_tokens, device=self.device
@@ -149,58 +233,65 @@ class DSparkWorkerV2(BaseSpecWorker):
             draft_token_num=int(self.gamma), device=self.device
         )
 
-        target_model = self.target_worker.model_runner.model
-        lm_head = getattr(target_model, "lm_head", None)
-        if lm_head is None or not hasattr(lm_head, "weight"):
-            raise RuntimeError(
-                "DSpark requires the target model to expose `lm_head` with `weight`."
+        self._verify_planner = None
+        self._kv_injector = None
+        self._proposer = None
+        if self._has_local_draft:
+            assert self.draft_model is not None
+            assert self.draft_model_runner is not None
+            target_model = self.target_worker.model_runner.model
+            lm_head = getattr(target_model, "lm_head", None)
+            if lm_head is None or not hasattr(lm_head, "weight"):
+                raise RuntimeError(
+                    "DSpark requires the target model to expose `lm_head` with `weight`."
+                )
+            self.draft_model.attach_shared_modules(
+                embed_tokens=self._resolve_target_embed_tokens(target_model),
+                lm_head=lm_head,
             )
-        self.draft_model.attach_shared_modules(
-            embed_tokens=self._resolve_target_embed_tokens(target_model),
-            lm_head=lm_head,
-        )
 
-        self._verify_planner = DSparkVerifyPlanner(
-            draft_model=self.draft_model,
-            gamma=self.gamma,
-            model_runner=self.model_runner,
-            device=self.device,
-            tp_rank=self.tp_rank,
-            server_args=self.server_args,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-        )
-        if (
-            server_args.enable_dp_attention
-            and not self._draft_is_moe
-            and self._verify_planner.is_compact_mode
-            and not server_args.disable_cuda_graph
-        ):
-            raise ValueError(
-                "DSpark dense-draft compact verify under --enable-dp-attention does not "
-                "yet support cuda graph (idle DP groups cannot join the token-keyed "
-                "compact graph). Re-run with --disable-cuda-graph (eager is lossless), "
-                "or use SGLANG_RAGGED_VERIFY_MODE=static. The dsv4 (MoE) draft supports "
-                "cuda graph under DP."
+            self._verify_planner = DSparkVerifyPlanner(
+                draft_model=self.draft_model,
+                gamma=self.gamma,
+                model_runner=self.model_runner,
+                device=self.device,
+                tp_rank=self.tp_rank,
+                server_args=self.server_args,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
             )
-        self._kv_injector = TargetHiddenKvInjector(
-            draft_model=self.draft_model,
-            draft_model_runner=self.draft_model_runner,
-            model_runner=self.model_runner,
-            device=self.device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            block_pos_offsets=self._block_pos_offsets,
-        )
-        self._proposer = DraftBlockProposer(
-            draft_model=self.draft_model,
-            draft_model_runner=self.draft_model_runner,
-            gamma=self.gamma,
-            mask_token_id=self._mask_token_id,
-            draft_block_spec_info=self._draft_block_spec_info,
-            dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
-        )
+            if (
+                server_args.enable_dp_attention
+                and not self._draft_is_moe
+                and self._verify_planner.is_compact_mode
+                and not server_args.disable_cuda_graph
+            ):
+                raise ValueError(
+                    "DSpark dense-draft compact verify under --enable-dp-attention does not "
+                    "yet support cuda graph (idle DP groups cannot join the token-keyed "
+                    "compact graph). Re-run with --disable-cuda-graph (eager is lossless), "
+                    "or use SGLANG_RAGGED_VERIFY_MODE=static. The dsv4 (MoE) draft supports "
+                    "cuda graph under DP."
+                )
+            self._kv_injector = TargetHiddenKvInjector(
+                draft_model=self.draft_model,
+                draft_model_runner=self.draft_model_runner,
+                model_runner=self.model_runner,
+                device=self.device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+            )
+            self._proposer = DraftBlockProposer(
+                draft_model=self.draft_model,
+                draft_model_runner=self.draft_model_runner,
+                gamma=self.gamma,
+                mask_token_id=self._mask_token_id,
+                draft_block_spec_info=self._draft_block_spec_info,
+                dp_moe_sync=self._draft_is_moe and server_args.enable_dp_attention,
+            )
         self._verify_epilogue = None
         if (
-            self._verify_planner.is_compact_mode
+            self._verify_planner is not None
+            and self._verify_planner.is_compact_mode
             and not server_args.disable_cuda_graph
             and is_cuda()
         ):
@@ -225,6 +316,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         if (
             self._simulate_acc_len > 0
             and self._simulate_acc_len != 1.0
+            and self._verify_planner is not None
             and not self._verify_planner.is_verify_all
         ):
             raise ValueError(
@@ -252,23 +344,41 @@ class DSparkWorkerV2(BaseSpecWorker):
 
         self._forced_budget_frac: Optional[float] = None
 
-        self._observers = DsparkStepObservers(
-            planner=self._verify_planner,
-            gamma=self.gamma,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            tp_rank=self.tp_rank,
-            device=self.device,
-            simulate_acc_len=self._simulate_acc_len,
+        self._observers = (
+            DsparkStepObservers(
+                planner=self._verify_planner,
+                gamma=self.gamma,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                tp_rank=self.tp_rank,
+                device=self.device,
+                simulate_acc_len=self._simulate_acc_len,
+            )
+            if self._verify_planner is not None
+            else None
         )
 
     def _resolve_target_embed_tokens(self, target_model):
         if hasattr(target_model, "get_input_embeddings"):
-            return target_model.get_input_embeddings()
-        return target_model.model.get_input_embeddings()
+            embed_tokens = target_model.get_input_embeddings()
+        else:
+            embed_tokens = target_model.model.get_input_embeddings()
+        if hasattr(embed_tokens, "weight"):
+            return embed_tokens
+        if self._is_pipeline_parallel and self._is_last_pipeline_rank:
+            logger.info(
+                "PP DSpark last stage uses lazy safetensors embedding rows "
+                "from %s.",
+                self.server_args.model_path,
+            )
+            return LazySafetensorTokenEmbedding(self.server_args.model_path)
+        return embed_tokens
 
     @property
     def carries_confidence(self) -> bool:
-        return self._verify_planner.carries_confidence
+        return (
+            self._verify_planner is not None
+            and self._verify_planner.carries_confidence
+        )
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -280,20 +390,28 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
-        return (
-            self._target_worker.model_runner.attn_backend,
-            self.draft_model_runner.attn_backend,
-        )
+        target_backend = self._target_worker.model_runner.attn_backend
+        if self.draft_model_runner is None:
+            return (target_backend,)
+        return (target_backend, self.draft_model_runner.attn_backend)
 
     def __getattr__(self, name):
         if name == "_target_worker":
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group)
-        return nullcontext()
+        with ExitStack() as stack:
+            if self._draft_pp_group is not None:
+                stack.enter_context(
+                    patch_pipeline_parallel_group(self._draft_pp_group)
+                )
+            if self._draft_dp_context_enabled:
+                stack.enter_context(draft_tp_context(get_parallel().attn_tp_group))
+            else:
+                stack.enter_context(nullcontext())
+            yield
 
     def alloc_memory_pool(
         self,
@@ -301,18 +419,33 @@ class DSparkWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        self._draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        )
+        if self._draft_worker is None:
+            return
+        with self._draft_context():
+            self._draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
 
     def init_attention_backends(self):
+        if self._draft_worker is None:
+            return
         with self._draft_context():
             self._draft_worker.init_attention_backends()
 
     def init_cuda_graphs(self):
+        if self._draft_worker is None:
+            return
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
+        if os.environ.get("SGLANG_DSV4_DRAFT_DISABLE_CUDA_GRAPH") == "1":
+            capture_decode_cuda_graph = False
+            if self.tp_rank == 0:
+                logger.info(
+                    "Disable DSpark draft CUDA graph by "
+                    "SGLANG_DSV4_DRAFT_DISABLE_CUDA_GRAPH=1; "
+                    "target verify CUDA graph remains enabled."
+                )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             if available_mem < 1.0:
@@ -324,7 +457,19 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
         with self._draft_context():
             if capture_decode_cuda_graph:
-                self._draft_sampler = self._maybe_build_draft_sampler()
+                disable_folded_sampler = (
+                    os.environ.get("SGLANG_DSV4_DRAFT_DISABLE_FOLDED_SAMPLER") == "1"
+                )
+                self._draft_sampler = (
+                    None
+                    if disable_folded_sampler
+                    else self._maybe_build_draft_sampler()
+                )
+                if disable_folded_sampler and self.tp_rank == 0:
+                    logger.info(
+                        "DSpark draft model CUDA graph enabled with eager proposal "
+                        "sampling by SGLANG_DSV4_DRAFT_DISABLE_FOLDED_SAMPLER=1."
+                    )
                 if self._draft_sampler is not None:
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
@@ -335,6 +480,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
     def _maybe_build_draft_sampler(self):
+        if self.draft_model is None or self._verify_planner is None:
+            return None
         return maybe_build_draft_sampler(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -358,24 +505,30 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
-        self._verify_planner.set_forced_budget_frac(frac)
+        if self._verify_planner is not None:
+            self._verify_planner.set_forced_budget_frac(frac)
 
     def dump_info_records(self) -> Optional[dict]:
-        return self._observers.dump_info_records()
+        return None if self._observers is None else self._observers.dump_info_records()
 
     def clear_info_records(self) -> None:
-        self._observers.clear_info_records()
+        if self._observers is not None:
+            self._observers.clear_info_records()
 
     def block_accept_estimate_log_suffix(self) -> Optional[str]:
+        if self._observers is None:
+            return None
         return self._observers.block_accept_estimate_log_suffix()
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
-        self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
+        if self._observers is not None:
+            self._observers.note_request_finished(rid=rid, natural_stop=natural_stop)
 
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
         on_publish=None,
+        pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
             raise ValueError(
@@ -383,23 +536,31 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            self._verify_planner.note_non_decode_step()
-            self._observers.note_prefill_step()
-            return self._forward_prefill(batch, on_publish)
+            if self._verify_planner is not None:
+                self._verify_planner.note_non_decode_step()
+            if self._observers is not None:
+                self._observers.note_prefill_step()
+            return self._forward_prefill(batch, on_publish, pp_proxy_tensors)
 
-        return self._forward_decode(batch, on_publish)
+        return self._forward_decode(batch, on_publish, pp_proxy_tensors)
 
     def _forward_prefill(
-        self, batch: ScheduleBatch, on_publish
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         if batch.forward_mode.is_idle():
             if self.server_args.enable_dp_attention:
                 batch.capture_hidden_mode = CaptureHiddenMode.FULL
-                self.target_worker.forward_batch_generation(batch)
+                self.target_worker.forward_batch_generation(
+                    batch, pp_proxy_tensors=pp_proxy_tensors
+                )
             return self._decode_idle_result(on_publish=on_publish)
 
         batch.capture_hidden_mode = CaptureHiddenMode.FULL
-        batch_output = self.target_worker.forward_batch_generation(batch)
+        batch_output = self.target_worker.forward_batch_generation(
+            batch, pp_proxy_tensors=pp_proxy_tensors
+        )
+        if not self._is_last_pipeline_rank:
+            return batch_output
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
         batch_output.new_seq_lens = batch.seq_lens
@@ -417,6 +578,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         if batch.out_cache_loc is None:
             raise RuntimeError("DSpark prefill expected out_cache_loc, but got None.")
+        if self._kv_injector is None:
+            raise RuntimeError("PP DSpark last stage has no target-hidden KV injector.")
 
         device = next_token_ids.device
         ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
@@ -491,8 +654,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _forward_decode(
-        self, batch: ScheduleBatch, on_publish
+        self, batch: ScheduleBatch, on_publish, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
+        if self._is_pipeline_parallel:
+            return self._forward_decode_pp(
+                batch=batch,
+                on_publish=on_publish,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
         draft_input = batch.spec_info
@@ -502,6 +671,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_idle():
+            assert self._observers is not None
             self._observers.note_idle_decode_step()
             if self.server_args.enable_dp_attention:
                 if self._draft_is_moe:
@@ -519,6 +689,8 @@ class DSparkWorkerV2(BaseSpecWorker):
         prefix_lens = batch.seq_lens
 
         self._observers.begin_step()
+        assert self._verify_planner is not None
+        assert self._proposer is not None
 
         target_model = self.target_worker.model_runner.model
 
@@ -689,5 +861,317 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=accept.new_seq_lens,
         )
 
+    def _forward_decode_pp(
+        self,
+        *,
+        batch: ScheduleBatch,
+        on_publish,
+        pp_proxy_tensors,
+    ) -> GenerationBatchResult:
+        if batch.spec_info is None:
+            batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
+        draft_input = batch.spec_info
+        if not isinstance(draft_input, DFlashDraftInputV2):
+            raise RuntimeError(
+                "PP DSpark expected DFlashDraftInputV2 state on every pipeline rank."
+            )
+        if batch.forward_mode.is_idle():
+            raise RuntimeError("PP DSpark does not support DP idle batches.")
+
+        batch.seq_lens.record_stream(
+            torch.get_device_module(self.device).current_stream()
+        )
+        if draft_input.pp_draft_block_ids is None:
+            return self._forward_decode_pp_bootstrap(
+                batch=batch,
+                draft_input=draft_input,
+                on_publish=on_publish,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        return self._forward_decode_pp_verify(
+            batch=batch,
+            draft_input=draft_input,
+            on_publish=on_publish,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+
+    def _forward_decode_pp_bootstrap(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        on_publish,
+        pp_proxy_tensors,
+    ) -> GenerationBatchResult:
+        """Run one ordinary target token, then seed the first ring proposal."""
+        bs = len(batch.seq_lens)
+        prefix_lens = batch.seq_lens
+        verify_window = alloc_verify_window(
+            batch=batch,
+            bs=bs,
+            device=self.device,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            block_pos_offsets=self._block_pos_offsets,
+            model_runner=self.model_runner,
+        )
+        bootstrap_cache_loc = verify_window.verify_cache_loc_2d[:, 0].contiguous()
+        batch.input_ids = draft_input.bonus_tokens.reshape(-1)
+        batch.out_cache_loc = bootstrap_cache_loc
+        batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch_output = self.target_worker.forward_batch_generation(
+            batch, pp_proxy_tensors=pp_proxy_tensors
+        )
+        if not self._is_last_pipeline_rank:
+            return batch_output
+
+        logits_output = batch_output.logits_output
+        next_token_ids = batch_output.next_token_ids
+        if logits_output is None or logits_output.hidden_states is None:
+            raise RuntimeError(
+                "PP DSpark bootstrap requires target aux hidden states on the "
+                "last pipeline rank."
+            )
+        if next_token_ids is None:
+            raise RuntimeError("PP DSpark bootstrap target produced no sampled token.")
+        if self._kv_injector is None:
+            raise RuntimeError("PP DSpark bootstrap has no draft KV injector.")
+
+        self._kv_injector.inject_target_hidden(
+            target_hidden=logits_output.hidden_states,
+            cache_loc=bootstrap_cache_loc,
+            positions=prefix_lens,
+        )
+        logits_output.hidden_states = None
+
+        new_seq_lens = prefix_lens + 1
+        next_draft_input = make_next_draft_input(
+            bonus_tokens=next_token_ids,
+            new_seq_lens=new_seq_lens,
+        )
+        self._attach_next_pp_proposal(
+            batch=batch,
+            draft_input=next_draft_input,
+            new_seq_lens=new_seq_lens,
+        )
+
+        padded_tokens = torch.zeros(
+            (bs, self.verify_num_draft_tokens),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        padded_tokens[:, 0].copy_(next_token_ids.reshape(-1))
+        accept_lens = torch.ones((bs,), dtype=torch.int32, device=self.device)
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=padded_tokens.reshape(-1),
+            accept_lens=accept_lens,
+            block_accept_lens=accept_lens,
+            can_run_cuda_graph=batch_output.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
+            speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
+            new_seq_lens=new_seq_lens,
+        )
+
+    def _forward_decode_pp_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        on_publish,
+        pp_proxy_tensors,
+    ) -> GenerationBatchResult:
+        draft_block_ids = draft_input.pp_draft_block_ids
+        draft_tokens = draft_input.pp_draft_tokens
+        greedy_mask = draft_input.pp_greedy_mask
+        temperatures = draft_input.pp_temperatures
+        if (
+            draft_block_ids is None
+            or draft_tokens is None
+            or greedy_mask is None
+            or temperatures is None
+        ):
+            raise RuntimeError("PP DSpark received an incomplete draft proposal.")
+
+        corrected_logits = draft_input.pp_corrected_logits
+        if corrected_logits is not None and corrected_logits.numel() == 0:
+            corrected_logits = None
+        draft_block = DraftBlockResult(
+            draft_tokens=draft_tokens,
+            corrected_logits=corrected_logits,
+            greedy_mask=greedy_mask,
+            temperatures=temperatures,
+        )
+        confidence = draft_input.pp_confidence
+        if confidence is not None and confidence.numel() == 0:
+            confidence = None
+
+        bs = len(batch.seq_lens)
+        prefix_lens = batch.seq_lens
+        verify_window = alloc_verify_window(
+            batch=batch,
+            bs=bs,
+            device=self.device,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            block_pos_offsets=self._block_pos_offsets,
+            model_runner=self.model_runner,
+        )
+        verify_ids_2d = torch.cat(
+            [draft_block_ids[:, :1], draft_tokens], dim=1
+        ).contiguous()
+        target_verify = self._verify_executor.run_non_compact(
+            batch=batch,
+            draft_input=draft_input,
+            verify_ids_2d=verify_ids_2d,
+            verify_window=verify_window,
+            sampling_info=batch.sampling_info,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        if not self._is_last_pipeline_rank:
+            return GenerationBatchResult(
+                pp_hidden_states_proxy_tensors=(
+                    target_verify.pp_hidden_states_proxy_tensors
+                ),
+                can_run_cuda_graph=target_verify.can_run_cuda_graph,
+            )
+
+        logits_output = target_verify.logits_output
+        if logits_output is None:
+            raise RuntimeError("PP DSpark last stage returned no target logits.")
+        accept = self._verify_executor.accept_and_finalize(
+            folded_accept=False,
+            bs=bs,
+            verify_ids_2d=verify_ids_2d,
+            target_logits=logits_output.next_token_logits,
+            draft_block=draft_block,
+            sampling_info=batch.sampling_info,
+            draft_input=draft_input,
+            layout=None,
+            prefix_lens=prefix_lens,
+            draft_tokens=draft_tokens,
+        )
+        if on_publish is not None:
+            on_publish(accept.new_seq_lens, confidence=confidence)
+
+        self._verify_executor.commit_hidden(
+            batch=batch,
+            layout=None,
+            hidden_strided=None,
+            verify_window=verify_window,
+            logits_output=logits_output,
+            commit_lens=accept.commit_lens,
+            bs=bs,
+            run_compact=False,
+        )
+        logits_output.hidden_states = None
+
+        if self._observers is not None:
+            self._observers.begin_step()
+            self._observers.observe_verify_step(
+                forward_ct=int(batch.forward_iter),
+                reqs=batch.reqs,
+                bs=bs,
+                proposal_folded=False,
+                verify_ids_2d=verify_ids_2d,
+                target_logits=logits_output.next_token_logits,
+                layout=None,
+                confidence=confidence,
+                prefix_lens=prefix_lens,
+                draft_tokens=draft_tokens,
+                draft_block=draft_block,
+                sampling_info=batch.sampling_info,
+                correct_len=accept.correct_len,
+                cap_trim_lens=accept.cap_trim_lens,
+                bonus=accept.bonus,
+                commit_lens=accept.commit_lens,
+                verify_token_budget=None,
+                req_pool_indices=batch.req_pool_indices,
+                verify_tier_num_tokens=int(batch.spec_verify_tier_num_tokens),
+                dp_tier_num_tokens=None,
+            )
+
+        next_draft_input = make_next_draft_input(
+            bonus_tokens=accept.bonus,
+            new_seq_lens=accept.new_seq_lens,
+        )
+        self._attach_next_pp_proposal(
+            batch=batch,
+            draft_input=next_draft_input,
+            new_seq_lens=accept.new_seq_lens,
+        )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=accept.out_tokens.reshape(-1),
+            accept_lens=accept.commit_lens,
+            block_accept_lens=accept.commit_lens + accept.cap_trim_lens,
+            can_run_cuda_graph=target_verify.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
+            speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
+            new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _attach_next_pp_proposal(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInputV2,
+        new_seq_lens: torch.Tensor,
+    ) -> None:
+        if (
+            self._proposer is None
+            or self._verify_planner is None
+            or self.draft_model is None
+        ):
+            raise RuntimeError("PP DSpark proposal attempted without a local draft.")
+
+        saved_seq_lens = batch.seq_lens
+        saved_seq_lens_cpu = batch.seq_lens_cpu
+        saved_seq_lens_sum = batch.seq_lens_sum
+        saved_out_cache_loc = batch.out_cache_loc
+        try:
+            batch.seq_lens = new_seq_lens
+            batch.seq_lens_cpu = new_seq_lens.to("cpu")
+            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            verify_window = alloc_verify_window(
+                batch=batch,
+                bs=len(new_seq_lens),
+                device=self.device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+                model_runner=self.model_runner,
+            )
+            with self._draft_context():
+                proposal = self._proposer.propose(
+                    batch=batch,
+                    draft_input=draft_input,
+                    verify_window=verify_window,
+                    bs=len(new_seq_lens),
+                    device=self.device,
+                    target_model=self.target_worker.model_runner.model,
+                    sampling_info=batch.sampling_info,
+                )
+            confidence = proposal.confidence
+            if confidence is None and self._verify_planner.carries_confidence:
+                confidence = self._verify_planner.compute_confidence_tensor(
+                    draft_hidden=proposal.draft_hidden,
+                    anchor_tokens=proposal.draft_block_ids[:, 0],
+                    draft_tokens=proposal.draft_block.draft_tokens,
+                    confidence_tap=proposal.confidence_tap,
+                )
+            draft_input.pp_draft_block_ids = proposal.draft_block_ids
+            draft_input.pp_draft_tokens = proposal.draft_block.draft_tokens
+            draft_input.pp_corrected_logits = proposal.draft_block.corrected_logits
+            draft_input.pp_greedy_mask = proposal.draft_block.greedy_mask
+            draft_input.pp_temperatures = proposal.draft_block.temperatures
+            draft_input.pp_confidence = confidence
+        finally:
+            batch.seq_lens = saved_seq_lens
+            batch.seq_lens_cpu = saved_seq_lens_cpu
+            batch.seq_lens_sum = saved_seq_lens_sum
+            batch.out_cache_loc = saved_out_cache_loc
+
     def get_confidence_budget_prepare(self):
+        if self._verify_planner is None:
+            return None
         return self._verify_planner.confidence_budget_prepare()

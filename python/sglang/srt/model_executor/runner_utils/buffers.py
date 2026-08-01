@@ -130,14 +130,17 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
+                # PP proxy tensors are token-major, not request-major.  A
+                # speculative verify graph carries multiple token rows per
+                # request and must retain all of them between pipeline stages.
                 is_mhc = hc_hidden_size is not None
                 hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                    "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
                 }
                 if not is_mhc:
                     pp_proxy_tensors["residual"] = torch.zeros(
-                        (max_bs, hidden_size), dtype=dtype
+                        (max_num_token, hidden_size), dtype=dtype
                     )
                 if pp_proxy_topk_size is not None:
                     pp_proxy_tensors["topk_indices"] = torch.zeros(

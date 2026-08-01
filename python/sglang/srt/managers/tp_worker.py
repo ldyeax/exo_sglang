@@ -307,12 +307,25 @@ class TpModelWorker(BaseTpWorker):
         self.world_group = get_world_group()
 
         # Sync random seed across TP workers
-        self.random_seed = broadcast_pyobj(
-            [server_args.random_seed],
-            self.tp_size * self.pp_rank + tp_rank,
-            self.world_group.cpu_group,
-            src=self.world_group.ranks[0],
-        )[0]
+        local_only_draft = (
+            self.is_draft_worker
+            and self.tp_size == 1
+            and self.pp_size == 1
+            and server_args.nnodes == 1
+            and self.world_group.world_size > 1
+        )
+        if local_only_draft:
+            # PP DSpark builds its complete draft only on the last target
+            # stage. Other target ranks cannot join a draft-only world
+            # broadcast, and TP=PP=1 needs no seed synchronization.
+            self.random_seed = server_args.random_seed
+        else:
+            self.random_seed = broadcast_pyobj(
+                [server_args.random_seed],
+                self.tp_size * self.pp_rank + tp_rank,
+                self.world_group.cpu_group,
+                src=self.world_group.ranks[0],
+            )[0]
         set_random_seed(self.random_seed)
 
         self.enable_overlap = not server_args.disable_overlap_schedule

@@ -115,7 +115,14 @@ class StandardDispatcher(BaseDispatcher):
             self.num_local_experts - self.num_local_shared_experts
         )
         self.moe_ep_rank = get_parallel().moe_ep_rank
-        self.local_expert_mapping = None
+        kt_mapping = getattr(
+            moe_runner_config, "kt_global_to_local_expert_mapping", None
+        )
+        self.local_expert_mapping = (
+            None
+            if kt_mapping is None
+            else kt_mapping.to(device=get_device(), non_blocking=True)
+        )
         self.expert_mask_gpu = None
 
     def dispatch(

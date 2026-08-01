@@ -148,6 +148,34 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
         return F.embedding(input_, layer.weight)
 
+    def embedding_into(
+        self,
+        layer: torch.nn.Module,
+        input_: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        expected_shape = (*input_.shape, layer.weight.shape[1])
+        if (
+            output.shape != expected_shape
+            or output.dtype != layer.weight.dtype
+            or output.device != layer.weight.device
+            or not output.is_contiguous()
+        ):
+            raise RuntimeError(
+                "invalid caller-owned embedding output: "
+                f"expected={expected_shape}/{layer.weight.dtype}/"
+                f"{layer.weight.device}/contiguous, got={tuple(output.shape)}/"
+                f"{output.dtype}/{output.device}/"
+                f"contiguous={output.is_contiguous()}"
+            )
+        torch.index_select(
+            layer.weight,
+            0,
+            input_.reshape(-1),
+            out=output.view(-1, layer.weight.shape[1]),
+        )
+        return output
+
 
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""

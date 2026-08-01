@@ -28,8 +28,9 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Union
 
 import torch
 import tqdm
@@ -393,6 +394,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # --- backend ---------------------------------------------------
         self.backend = resolve_decode_backend(self)
+        if (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and self.model_runner.is_draft_worker
+            and os.environ.get("SGLANG_DSV4_DRAFT_BCG_EAGER") == "1"
+        ):
+            # DSpark's block draft is an ordinary DecodeCudaGraphRunner, not
+            # EAGLEDraftCudaGraphRunner. Its block/model host mutations need
+            # the same whole-forward eager break until they are device-backed.
+            self.backend._debug_eager = True
+        self.use_captured_attn_metadata = (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and self.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+        )
+        self.attn_metadata_buffers: Dict[ShapeKey, Any] = {}
 
         # --- capture --------------------------------------------------
         try:
@@ -406,6 +421,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _build_ragged_verify_token_buckets(self) -> list[int]:
         buckets = sorted({bs * self.num_tokens_per_bs for bs in self.capture_bs})
         assert buckets and buckets[0] > 0, f"{buckets=}"
+        if os.environ.get("SGLANG_DSV4_FINE_RAGGED_VERIFY_TIERS") == "1":
+            # The ordinary decode buckets are expressed in request counts, so
+            # bs=1 captures only the full speculative block. For latency-bound
+            # single-stream DSpark, also capture each sub-block token tier;
+            # otherwise a one-token verification still executes every padded
+            # candidate through all MoE layers.
+            buckets = sorted(
+                {
+                    *buckets,
+                    *range(1, min(self.num_tokens_per_bs, buckets[-1]) + 1),
+                }
+            )
         return buckets
 
     def _autotune_buffers(self):
@@ -497,6 +524,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        # A speculative target runner captures TARGET_VERIFY graphs with
+        # ``num_tokens_per_bs`` physical token rows.  Bootstrap forwards are
+        # ordinary one-token DECODE batches; padding one of those into a verify
+        # graph fabricates attention/KV metadata for tokens that do not exist.
+        # This matters in pipeline mode because DSpark explicitly runs one
+        # eager target token before the first proposal enters the ring.
+        if self.capture_forward_mode.is_target_verify() and (
+            not forward_batch.forward_mode.is_target_verify()
+        ):
+            return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
@@ -505,6 +543,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if ragged_layout is not None:
             return self._can_run_ragged_verify_graph(forward_batch, ragged_layout)
         if self.ragged_verify_mode and forward_batch.forward_mode.is_target_verify():
+            return False
+
+        if self.capture_forward_mode.is_target_verify() and (
+            forward_batch.input_ids.numel()
+            != forward_batch.batch_size * self.num_tokens_per_bs
+        ):
             return False
 
         if self.require_mlp_tp_gather:
@@ -863,17 +907,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             empty_cache=False,
         )
         # Reverse so cuda graphs share memory better.
+        capture_units = (
+            self.capture_num_tokens if self.ragged_verify_mode else self.capture_bs
+        )
         capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
+            tqdm.tqdm(list(reversed(capture_units)))
             if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
+            else reversed(capture_units)
         )
         lora_variants = (
             [("lora", True), ("nolora", False)]
             if getattr(self, "record_nolora_graph", False)
             else [(None, None)]
         )
-        for bs in capture_range:
+        for capture_unit in capture_range:
+            num_tokens = (
+                capture_unit
+                if self.ragged_verify_mode
+                else capture_unit * self.num_tokens_per_bs
+            )
+            bs = (
+                self._ragged_capture_slots(num_tokens)
+                if self.ragged_verify_mode
+                else capture_unit
+            )
             if get_parallel().tp_rank == 0:
                 avail_mem = get_available_gpu_memory(
                     self.model_runner.device,
@@ -889,10 +946,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 with torch_compile_decoration.patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
-                    num_tokens=bs * self.num_tokens_per_bs,
+                    num_tokens=num_tokens,
                     tp_group=self.model_runner.tp_group,
                 ) as forward:
-                    self.capture_one_shape(bs, forward, stream_idx, variant_label)
+                    self.capture_one_shape(
+                        bs,
+                        forward,
+                        stream_idx,
+                        variant_label,
+                        num_tokens=num_tokens,
+                    )
 
     def capture_one_shape(
         self,
@@ -900,8 +963,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        num_tokens: Optional[int] = None,
     ):
-        num_tokens = size * self.num_tokens_per_bs
+        if num_tokens is None:
+            num_tokens = size * self.num_tokens_per_bs
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
@@ -913,6 +978,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, stream_idx=stream_idx, num_tokens=num_tokens
         )
+        shape_key = self._make_graph_key(
+            self._capture_graph_size(bs=bs, num_tokens=num_tokens),
+            stream_idx,
+            variant_label,
+        )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -923,7 +993,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
-            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+            if self.use_captured_attn_metadata:
+                self.attn_metadata_buffers[shape_key] = (
+                    attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+                        forward_batch
+                    )
+                )
+            else:
+                attn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=True
+                )
 
             def run_once():
                 # Graph-recordable metadata-prep hook. The unified memory pool
@@ -951,8 +1030,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self.pp_size > 1
                     and "pp_proxy_tensors" in inspect.signature(forward).parameters
                 ):
+                    # A breakable graph replays only its captured CUDA
+                    # segments; Python tensor construction between segments is
+                    # not re-executed.  Cloning the PP input here therefore
+                    # freezes the capture-time payload on non-first stages even
+                    # though fill_from() refreshes the stable proxy buffers.
+                    # Monolithic graphs record the clone as a device copy and
+                    # retain their existing isolation behavior.
+                    proxy_tensors = (
+                        pp_proxy_tensors.tensors
+                        if isinstance(self.backend, BreakableCudaGraphBackend)
+                        else {
+                            key: value.clone()
+                            for key, value in pp_proxy_tensors.tensors.items()
+                        }
+                    )
                     kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                        {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                        proxy_tensors
                     )
                 if (
                     self.model_runner.spec_algorithm.is_dflash_family()
@@ -983,15 +1077,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
             with canary_ctx:
-                shape_key = self._make_graph_key(
-                    self._capture_graph_size(bs=bs, num_tokens=num_tokens),
-                    stream_idx,
-                    variant_label,
-                )
-                post_warmup_hook = getattr(
-                    self.model_runner.attn_backend,
-                    "on_after_cuda_graph_warmup",
-                    None,
+                post_warmup_hook = (
+                    None
+                    if self.use_captured_attn_metadata
+                    else getattr(
+                        self.model_runner.attn_backend,
+                        "on_after_cuda_graph_warmup",
+                        None,
+                    )
                 )
                 maybe_flashinfer_autotune_speculative_draft(
                     self,
@@ -1169,8 +1262,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
-        attn_backend.init_forward_metadata_out_graph(fb_view)
-
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
@@ -1185,6 +1276,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label
         )
+        if self.use_captured_attn_metadata:
+            attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+                self.attn_metadata_buffers[self._replay_graph_key],
+                forward_batch,
+                static_forward_batch=fb_view,
+            )
+        else:
+            attn_backend.init_forward_metadata_out_graph(fb_view)
 
     def _ragged_graph_num_tokens(self, total_verify_tokens: int) -> int:
         from sglang.srt.speculative.ragged_verify import round_up_grid
@@ -1272,7 +1371,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # PP outputs are token-major.  For ordinary decode
+            # num_tokens_per_bs == 1, while speculative target verification
+            # carries a fixed block of token rows per request.
+            output_rows = (
+                self._ragged_graph_size
+                if self.ragged_verify_mode
+                else self.bs * self.num_tokens_per_bs
+            )
+            return PPProxyTensors(
+                {k: v[:output_rows] for k, v in output.tensors.items()}
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

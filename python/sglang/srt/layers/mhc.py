@@ -2,6 +2,7 @@ import functools
 import importlib
 import logging
 import math
+import os
 import threading
 from typing import Tuple
 
@@ -212,7 +213,6 @@ def hc_split_sinkhorn(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
     },
 )
 def mhc_pre_big_fuse_tilelang(
@@ -606,7 +606,6 @@ def prewarm_mhc_pre(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
     },
 )
 def mhc_pre_big_fuse_with_norm_tilelang(
@@ -789,6 +788,7 @@ def mhc_pre(
     *,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    layer_input_output: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
@@ -818,9 +818,27 @@ def mhc_pre(
     comb_mix = torch.empty(
         num_tokens, hc_mult2, dtype=torch.float32, device=residual.device
     )
-    layer_input = torch.empty(
-        num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
-    )
+    expected_layer_input_shape = (*outer_shape, hidden_size)
+    if layer_input_output is None:
+        layer_input = torch.empty(
+            num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
+        )
+    else:
+        if (
+            layer_input_output.shape != expected_layer_input_shape
+            or layer_input_output.dtype != torch.bfloat16
+            or layer_input_output.device != residual.device
+            or not layer_input_output.is_contiguous()
+        ):
+            raise RuntimeError(
+                "invalid caller-owned mHC pre layer-input output: "
+                f"expected={expected_layer_input_shape}/torch.bfloat16/"
+                f"{residual.device}/contiguous, "
+                f"got={tuple(layer_input_output.shape)}/"
+                f"{layer_input_output.dtype}/{layer_input_output.device}/"
+                f"contiguous={layer_input_output.is_contiguous()}"
+            )
+        layer_input = layer_input_output.view(num_tokens, hidden_size)
 
     if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
@@ -973,7 +991,6 @@ def mhc_pre(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
     },
 )
 def mhc_post_tilelang(
@@ -1036,7 +1053,15 @@ def mhc_post(
         residual = strict_contiguous(residual)
         post_layer_mix = strict_contiguous(post_layer_mix)
         comb_res_mix = strict_contiguous(comb_res_mix)
-    out = torch.empty_like(residual)
+    # The kernel copies every HC row for a hidden tile into shared memory
+    # before its first output store. DSV4 no longer needs the incoming
+    # residual after mhc_post, so the production prefill path can overwrite
+    # its 224 MiB residual instead of allocating a duplicate at 4K tokens.
+    out = (
+        residual
+        if os.environ.get("SGLANG_DSV4_INPLACE_MHC_POST") == "1"
+        else torch.empty_like(residual)
+    )
     mhc_post_tilelang(
         comb_res_mix,
         residual,
@@ -1053,7 +1078,6 @@ def mhc_post(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
     },
 )
 def mhc_fused_post_pre_fma_tilelang(

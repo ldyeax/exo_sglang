@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import os
 import time
 from contextlib import nullcontext
 from typing import (
@@ -74,6 +75,9 @@ from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear_into,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
@@ -155,6 +159,15 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
+_CAPTURE_DSV4_ATTENTION_IN_BCG = (
+    os.environ.get("SGLANG_DSV4_CAPTURE_ATTN_IN_BCG") == "1"
+)
+_WO_PROJECTION_CHUNK_SIZE = int(
+    os.environ.get("SGLANG_DSV4_WO_PROJECTION_CHUNK_SIZE", "0")
+)
+_INDEXER_BEFORE_MAIN_Q_MIN_TOKENS = int(
+    os.environ.get("SGLANG_DSV4_INDEXER_BEFORE_MAIN_Q_MIN_TOKENS", "0")
+)
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
@@ -331,6 +344,205 @@ def deepseek_v4_attention_with_output(
 bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
     deepseek_v4_attention_with_output
 )
+
+
+def deepseek_v4_attention_bcg(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    attention_backend,
+    attention_layer,
+    forward_batch: "ForwardBatch",
+    compress_ratio: int,
+    attn_sink: torch.Tensor,
+    save_kv_cache: bool,
+) -> torch.Tensor:
+    """Run DSV4 attention at a segmented-graph break with explicit context.
+
+    The TC-piecewise custom op above obtains its metadata from a compiler
+    context. Breakable CUDA graph warmup/capture does not install that context,
+    so carrying the static forward batch and attention objects explicitly
+    avoids a bogus ``None.forward_batch`` lookup. ``eager_on_graph`` retains
+    these non-tensor objects and copies each replay result into the stable
+    bridge tensor consumed by the following graph segment.
+    """
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    query = query[:real_num_tokens]
+    key_value = key_value[:real_num_tokens]
+
+    if os.environ.get("SGLANG_KT_GRAPH_DEBUG_SYNC") == "1":
+        torch.cuda.synchronize(query.device)
+        metadata = attention_backend.forward_metadata
+        core_metadata = getattr(metadata, "core_attn_metadata", None)
+        logger.info(
+            "KTransformers graph debug: attention_layer=%d step=%d entry "
+            "query_shape=%s swa_indices_shape=%s",
+            attention_layer.layer_id,
+            getattr(attention_backend, "speculative_step_id", -1),
+            tuple(query.shape),
+            (
+                None
+                if core_metadata is None
+                else tuple(core_metadata.swa_page_indices.shape)
+            ),
+        )
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    try:
+        output = attention_backend.forward(
+            q=query,
+            k=key_value,
+            v=key_value,
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            compress_ratio=compress_ratio,
+            attn_sink=attn_sink,
+            save_kv_cache=save_kv_cache,
+        )
+        if os.environ.get("SGLANG_KT_GRAPH_DEBUG_SYNC") == "1":
+            torch.cuda.synchronize(query.device)
+            logger.info(
+                "KTransformers graph debug: attention_layer=%d synchronized",
+                attention_layer.layer_id,
+            )
+        return output
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+
+
+bcg_deepseek_v4_attention = eager_on_graph(True)(deepseek_v4_attention_bcg)
+
+
+def deepseek_v4_attention_module_bcg(
+    attention_module: nn.Module,
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    x_quant: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Run query/KV preparation, cache stores, and attention at one BCG break."""
+    return attention_module(
+        x=x,
+        positions=positions,
+        forward_batch=forward_batch,
+        x_quant=x_quant,
+    )
+
+
+bcg_deepseek_v4_attention_module = eager_on_graph(True)(
+    deepseek_v4_attention_module_bcg
+)
+
+
+def deepseek_v4_mhc_fused_post_pre_bcg(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    layer_id: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the cross-layer fused mHC transition at one BCG eager boundary."""
+    if os.environ.get("SGLANG_KT_GRAPH_DEBUG_SYNC") == "1":
+        torch.cuda.synchronize(x.device)
+        logger.info(
+            "KTransformers graph debug: mhc_transition_layer=%d entry",
+            layer_id,
+        )
+
+    output = mhc_fused_post_pre(
+        x,
+        residual,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+
+    if os.environ.get("SGLANG_KT_GRAPH_DEBUG_SYNC") == "1":
+        torch.cuda.synchronize(x.device)
+        logger.info(
+            "KTransformers graph debug: mhc_transition_layer=%d synchronized",
+            layer_id,
+        )
+    return output
+
+
+bcg_deepseek_v4_mhc_fused_post_pre = eager_on_graph(True)(
+    deepseek_v4_mhc_fused_post_pre_bcg
+)
+
+
+def deepseek_v4_hc_post_bcg(
+    decoder_layer: nn.Module,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    layer_id: int,
+) -> torch.Tensor:
+    """Run a layer's trailing mHC post kernel at one BCG eager boundary."""
+    if os.environ.get("SGLANG_KT_GRAPH_DEBUG_SYNC") == "1":
+        torch.cuda.synchronize(x.device)
+        logger.info(
+            "KTransformers graph debug: post_moe_hc_layer=%d entry",
+            layer_id,
+        )
+
+    output = decoder_layer.hc_post(x, residual, post, comb)
+
+    if os.environ.get("SGLANG_KT_GRAPH_DEBUG_SYNC") == "1":
+        torch.cuda.synchronize(x.device)
+        logger.info(
+            "KTransformers graph debug: post_moe_hc_layer=%d synchronized",
+            layer_id,
+        )
+    return output
+
+
+bcg_deepseek_v4_hc_post = eager_on_graph(True)(deepseek_v4_hc_post_bcg)
+
+
+def deepseek_v4_moe_ffn_bcg(
+    decoder_layer: nn.Module,
+    hidden_states: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    input_ids: torch.Tensor,
+    input_ids_global: torch.Tensor,
+) -> torch.Tensor:
+    """Run MoE dispatch, experts, combine, and collectives at one BCG break."""
+    # BCG replays this eager bridge after the model's per-layer Python context
+    # has exited. Re-establish the layer here so expert recording during replay
+    # indexes a row rather than treating ``None`` as a tensor dimension.
+    with get_global_expert_distribution_recorder().with_current_layer_if_absent(
+        decoder_layer.layer_id
+    ):
+        return decoder_layer._run_moe_ffn_dp_sync(
+            hidden_states,
+            forward_batch,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+        )
+
+
+bcg_deepseek_v4_moe_ffn = eager_on_graph(True)(deepseek_v4_moe_ffn_bcg)
 
 
 class MqaAttentionBase(nn.Module):
@@ -614,11 +826,36 @@ class MQALayer(MqaAttentionBase):
         q: torch.Tensor,
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
+        project_into_q_out: bool = False,
     ) -> torch.Tensor:
-        q, _ = self.wq_b(q)
+        if project_into_q_out:
+            if q_out is None:
+                raise ValueError("main-Q projection reuse requires q_out")
+            quant_method = self.wq_b.quant_method
+            if not getattr(quant_method, "use_marlin", False):
+                raise RuntimeError(
+                    "caller-owned DSV4 main Q output requires FP8 Marlin"
+                )
+            q = apply_fp8_marlin_linear_into(
+                input=q,
+                weight=self.wq_b.weight,
+                weight_scale=self.wq_b.weight_scale,
+                workspace=self.wq_b.workspace,
+                size_n=self.wq_b.output_size_per_partition,
+                size_k=self.wq_b.input_size_per_partition,
+                bias=self.wq_b.bias,
+                output=q_out.view(q.shape[0], -1),
+            )
+        else:
+            q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if q_out is None:
-            q_out = torch.empty_like(q)
+            # FusedQNormRopeKernel loads the complete (token, head) vector
+            # into registers before its first store, and each warp owns a
+            # disjoint vector. Reuse q as the destination instead of keeping
+            # a second [tokens, heads, head_dim] BF16 tensor alive. At the
+            # production 4K chunk this removes a 512 MiB allocation.
+            q_out = q
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
         return q_out
@@ -881,6 +1118,152 @@ class MQALayer(MqaAttentionBase):
         do_fused_store = (unified and is_decode) or (
             not unified and self.use_fused_qk_norm_rope
         )
+        reuse_main_q_workspace = (
+            _INDEXER_BEFORE_MAIN_Q_MIN_TOKENS > 0
+            and x.shape[0] >= _INDEXER_BEFORE_MAIN_Q_MIN_TOKENS
+            and not do_fused_store
+            and not _is_npu
+            and not unified
+            and not use_cp
+        )
+        defer_main_q = reuse_main_q_workspace and (
+            self.indexer is not None or self.compressor is not None
+        )
+        q_staging: Optional[torch.Tensor] = None
+        indexer_q_projection_output: Optional[torch.Tensor] = None
+        indexer_q_quant_output: Optional[torch.Tensor] = None
+        indexer_compressor_score_output: Optional[torch.Tensor] = None
+        indexer_logits_workspace: Optional[torch.Tensor] = None
+        core_compressor_score_output: Optional[torch.Tensor] = None
+        if reuse_main_q_workspace:
+            # Reserve one full configured-chunk main-Q block on the shared
+            # attention backend and reuse it across serial layers and batches.
+            # A per-layer 512 MiB allocation lets smaller intermediates split
+            # the returned caching-allocator segment before a later C128 layer.
+            workspace_shape = (
+                get_server_args().chunked_prefill_size,
+                self.n_local_heads,
+                self.head_dim,
+            )
+            workspace = getattr(attn_backend, "_dsv4_main_q_workspace", None)
+            if workspace is None:
+                workspace = torch.empty(
+                    workspace_shape,
+                    dtype=q_lora.dtype,
+                    device=q_lora.device,
+                )
+                setattr(attn_backend, "_dsv4_main_q_workspace", workspace)
+            if (
+                workspace.shape != workspace_shape
+                or workspace.dtype != q_lora.dtype
+                or workspace.device != q_lora.device
+                or not workspace.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "invalid shared DSV4 main-Q workspace: "
+                    f"expected shape={workspace_shape} dtype={q_lora.dtype} "
+                    f"device={q_lora.device}, got shape={tuple(workspace.shape)} "
+                    f"dtype={workspace.dtype} device={workspace.device} "
+                    f"contiguous={workspace.is_contiguous()}"
+                )
+            if q_lora.shape[0] > workspace.shape[0]:
+                raise RuntimeError(
+                    "DSV4 main-Q workspace is smaller than the current chunk: "
+                    f"workspace_tokens={workspace.shape[0]} "
+                    f"chunk_tokens={q_lora.shape[0]}"
+                )
+            q_staging = workspace[: q_lora.shape[0]]
+            protected_suffix_start_bytes = (
+                q_staging.numel() * q_staging.element_size()
+            )
+            if (
+                x.untyped_storage().data_ptr()
+                == workspace.untyped_storage().data_ptr()
+            ):
+                x_start_bytes = x.data_ptr() - workspace.data_ptr()
+                x_end_bytes = x_start_bytes + x.numel() * x.element_size()
+                # mHC places the current token rows at the end of the full
+                # persistent workspace.  For a short final chunk, q_staging
+                # is only the live prefix view, so its byte length is smaller
+                # than the backing allocation even though x still ends at the
+                # allocation boundary.
+                workspace_bytes_total = workspace.numel() * workspace.element_size()
+                if (
+                    x_start_bytes < 0
+                    or x_end_bytes != workspace_bytes_total
+                    or not x.is_contiguous()
+                ):
+                    raise RuntimeError(
+                        "mHC pre output must occupy a contiguous main-Q "
+                        f"workspace suffix: start={x_start_bytes}, "
+                        f"end={x_end_bytes}, workspace={workspace_bytes_total}, "
+                        f"contiguous={x.is_contiguous()}"
+                    )
+                protected_suffix_start_bytes = x_start_bytes
+            staging_fp32 = q_staging.view(torch.float32).view(-1)
+            # The C4 indexer temporarily uses the first contiguous 64 MiB,
+            # then its compressor consumes another typed view. Main-Q Marlin
+            # overwrites the complete workspace only after both are consumed.
+            if self.indexer is not None:
+                indexer_logits_workspace = q_staging.view(torch.uint8).view(-1)[
+                    :protected_suffix_start_bytes
+                ]
+                indexer_width = (
+                    self.indexer.n_local_heads * self.indexer.head_dim
+                )
+                indexer_elements = q_lora.shape[0] * indexer_width
+                indexer_q_projection_output = q_staging.view(-1)[
+                    :indexer_elements
+                ].view(q_lora.shape[0], indexer_width)
+                indexer_projection_bytes = (
+                    indexer_elements * q_staging.element_size()
+                )
+                indexer_quant_bytes = indexer_elements
+                if (
+                    indexer_projection_bytes + indexer_quant_bytes
+                    > protected_suffix_start_bytes
+                ):
+                    raise RuntimeError(
+                        "DSV4 indexer workspace overlaps protected mHC pre "
+                        f"output: indexer_bytes="
+                        f"{indexer_projection_bytes + indexer_quant_bytes}, "
+                        f"protected_suffix_start={protected_suffix_start_bytes}"
+                    )
+                workspace_bytes = q_staging.view(torch.uint8).view(-1)
+                indexer_q_quant_output = workspace_bytes[
+                    indexer_projection_bytes :
+                    indexer_projection_bytes + indexer_quant_bytes
+                ].view(torch.float8_e4m3fn).view(
+                    q_lora.shape[0],
+                    self.indexer.n_local_heads,
+                    self.indexer.head_dim,
+                )
+                indexer_compressor_width = (
+                    self.indexer.compressor.wkv_gate.weight.shape[0]
+                )
+                indexer_compressor_elements = (
+                    q_lora.shape[0] * indexer_compressor_width
+                )
+                indexer_compressor_score_output = staging_fp32[
+                    :indexer_compressor_elements
+                ].view(q_lora.shape[0], indexer_compressor_width)
+            if self.compressor is not None:
+                core_compressor_width = self.compressor.wkv_gate.weight.shape[0]
+                core_compressor_elements = (
+                    q_lora.shape[0] * core_compressor_width
+                )
+                core_compressor_bytes = (
+                    core_compressor_elements * torch.float32.itemsize
+                )
+                if core_compressor_bytes > protected_suffix_start_bytes:
+                    raise RuntimeError(
+                        "DSV4 core-compressor workspace overlaps protected "
+                        f"mHC pre output: compressor_bytes={core_compressor_bytes}, "
+                        f"protected_suffix_start={protected_suffix_start_bytes}"
+                    )
+                core_compressor_score_output = staging_fp32[
+                    :core_compressor_elements
+                ].view(q_lora.shape[0], core_compressor_width)
 
         if do_fused_store:
             if _is_gfx95_supported:
@@ -978,7 +1361,22 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora = self.q_norm(q_lora)
-            q = self._compute_q_b(q_lora, positions, q_out)
+            # On the ordinary single-rank NVIDIA prefill path, compressors
+            # consume views of the shared workspace first. Main Q then
+            # overwrites it in place; layers without compressors write it
+            # immediately.
+            if defer_main_q:
+                q = None
+            elif reuse_main_q_workspace:
+                assert q_staging is not None
+                q = self._compute_q_b(
+                    q_lora,
+                    positions,
+                    q_staging,
+                    project_into_q_out=True,
+                )
+            else:
+                q = self._compute_q_b(q_lora, positions, q_out)
             if unified:
                 # unified_kv prefill: keep bf16 kv; the backend writes
                 # the ring AFTER attention (2-source path).
@@ -1025,15 +1423,30 @@ class MQALayer(MqaAttentionBase):
                 q_lora=q_lora,
                 forward_batch=forward_batch,
                 attn_backend=attn_backend,
+                q_projection_output=indexer_q_projection_output,
+                q_quant_output=indexer_q_quant_output,
+                compressor_score_output=indexer_compressor_score_output,
+                logits_workspace=indexer_logits_workspace,
             )
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
-                x,
-                forward_batch,
-                self.layer_id,
-                self.compressor,
+                x=x,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+                compressor=self.compressor,
+                kv_score_output=core_compressor_score_output,
             )
 
+        if defer_main_q:
+            assert q is None
+            assert q_staging is not None
+            q = self._compute_q_b(
+                q_lora,
+                positions,
+                q_staging,
+                project_into_q_out=True,
+            )
+        assert q is not None
         return q, kv
 
     def forward(
@@ -1052,6 +1465,17 @@ class MQALayer(MqaAttentionBase):
                 attn_backend,
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
             )
+
+        # A full 4K BF16 wo_a result is [4096, 16, 1024] (128 MiB).
+        # The normalized attention input becomes dead after Q/KV, indexer, and
+        # compressor preparation. Reuse its exact [tokens, hidden] storage for
+        # the streamed wo_b result below instead of reserving another 56 MiB.
+        # Decode and ordinary small prefills retain the single-GEMM path.
+        stream_wo_projection = (
+            not _FP8_WO_A_GEMM
+            and _WO_PROJECTION_CHUNK_SIZE > 0
+            and x.shape[0] > _WO_PROJECTION_CHUNK_SIZE
+        )
 
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
@@ -1121,6 +1545,8 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
+        streamed_wo_output = x if stream_wo_projection else None
+
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
@@ -1144,15 +1570,16 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
-                o = attn_q.new_empty(
-                    (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
-                )
-                bcg_deepseek_v4_attention_with_output(
+            if (
+                is_in_breakable_cuda_graph()
+                and not _CAPTURE_DSV4_ATTENTION_IN_BCG
+            ):
+                o = bcg_deepseek_v4_attention(
                     attn_q,
                     attn_k,
-                    o,
-                    self.attn_mqa.layer_id,
+                    attn_backend,
+                    self.attn_mqa,
+                    forward_batch,
                     self.compress_ratio,
                     self._attn_sink_local,
                     save_kv_cache,
@@ -1205,9 +1632,32 @@ class MQALayer(MqaAttentionBase):
             o = output
         else:
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            o = torch.einsum("tgd,grd->tgr", o, wo_a)
+            if streamed_wo_output is None:
+                o = torch.einsum("tgd,grd->tgr", o, wo_a)
+            else:
+                if o.shape[0] != streamed_wo_output.shape[0]:
+                    raise RuntimeError(
+                        "Streamed DSV4 wo projection requires attention and "
+                        "input token counts to match"
+                    )
+                for token_start in range(
+                    0, o.shape[0], _WO_PROJECTION_CHUNK_SIZE
+                ):
+                    token_end = min(
+                        token_start + _WO_PROJECTION_CHUNK_SIZE,
+                        o.shape[0],
+                    )
+                    o_low_rank = torch.einsum(
+                        "tgd,grd->tgr",
+                        o[token_start:token_end],
+                        wo_a,
+                    )
+                    o_chunk, _ = self.wo_b(o_low_rank.flatten(1))
+                    streamed_wo_output[token_start:token_end].copy_(o_chunk)
+                o = streamed_wo_output
 
-        o, _ = self.wo_b(o.flatten(1))
+        if streamed_wo_output is None:
+            o, _ = self.wo_b(o.flatten(1))
         if self.tp_size > 1 and self.tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
@@ -1372,6 +1822,30 @@ class DeepseekV4DecoderLayer(nn.Module):
             if norm is not None:
                 norm_kwargs["norm_weight"] = norm.weight.data
                 norm_kwargs["norm_eps"] = norm.variance_epsilon
+            layer_input_output = None
+            if (
+                os.environ.get("SGLANG_DSV4_REUSE_MHC_PRE_OUTPUT") == "1"
+                and x.shape[0] >= 512
+            ):
+                # The shared main-Q workspace is dead at the start of every
+                # layer. Keep mHC's normalized layer input in its contiguous
+                # suffix until Q/KV, indexer, and compressor projections have
+                # consumed it; main-Q may then overwrite the whole workspace.
+                attn_backend = get_attn_backend()
+                q_workspace = getattr(
+                    attn_backend, "_dsv4_main_q_workspace", None
+                )
+                output_elements = x.shape[0] * shape[-1]
+                if (
+                    q_workspace is not None
+                    and q_workspace.dtype == torch.bfloat16
+                    and q_workspace.device == x.device
+                    and q_workspace.is_contiguous()
+                    and q_workspace.numel() >= output_elements
+                ):
+                    layer_input_output = q_workspace.view(-1)[
+                        -output_elements:
+                    ].view(x.shape[0], shape[-1])
 
             post, comb, y = mhc_pre(
                 residual=x,
@@ -1383,6 +1857,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 hc_sinkhorn_eps=self.hc_eps,
                 hc_post_mult_value=_MHC_POST_MULT_VALUE,
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
+                layer_input_output=layer_input_output,
                 **norm_kwargs,
             )
             return y, post.squeeze(-1), comb, norm is not None
@@ -1493,26 +1968,48 @@ class DeepseekV4DecoderLayer(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
 
         if prev_residual is not None and use_fused:
-            residual, post, comb, hidden_states = mhc_fused_post_pre(
-                hidden_states,
-                prev_residual,
-                prev_post,
-                prev_comb,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
-                self.rms_norm_eps,
-                self.hc_eps,
-                self.hc_eps,
-                _MHC_POST_MULT_VALUE,
-                self.hc_sinkhorn_iters,
-                norm_weight=(
-                    self._input_layernorm_weight_bf16
-                    if self._input_layernorm_weight_bf16 is not None
-                    else self.input_layernorm.weight.data
-                ),
-                norm_eps=self.input_layernorm.variance_epsilon,
+            norm_weight = (
+                self._input_layernorm_weight_bf16
+                if self._input_layernorm_weight_bf16 is not None
+                else self.input_layernorm.weight.data
             )
+            if is_in_breakable_cuda_graph():
+                residual, post, comb, hidden_states = (
+                    bcg_deepseek_v4_mhc_fused_post_pre(
+                        hidden_states,
+                        prev_residual,
+                        prev_post,
+                        prev_comb,
+                        self.hc_attn_fn,
+                        self.hc_attn_scale,
+                        self.hc_attn_base,
+                        self.rms_norm_eps,
+                        self.hc_eps,
+                        self.hc_eps,
+                        _MHC_POST_MULT_VALUE,
+                        self.hc_sinkhorn_iters,
+                        norm_weight,
+                        self.input_layernorm.variance_epsilon,
+                        self.layer_id,
+                    )
+                )
+            else:
+                residual, post, comb, hidden_states = mhc_fused_post_pre(
+                    hidden_states,
+                    prev_residual,
+                    prev_post,
+                    prev_comb,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    _MHC_POST_MULT_VALUE,
+                    self.hc_sinkhorn_iters,
+                    norm_weight=norm_weight,
+                    norm_eps=self.input_layernorm.variance_epsilon,
+                )
             x_quant = None
         else:
             residual = hidden_states
@@ -1537,12 +2034,24 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        hidden_states = self.self_attn(
-            x=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            x_quant=x_quant,
-        )
+        if (
+            is_in_breakable_cuda_graph()
+            and not _CAPTURE_DSV4_ATTENTION_IN_BCG
+        ):
+            hidden_states = bcg_deepseek_v4_attention_module(
+                self.self_attn,
+                hidden_states,
+                positions,
+                forward_batch,
+                x_quant,
+            )
+        else:
+            hidden_states = self.self_attn(
+                x=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                x_quant=x_quant,
+            )
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1598,12 +2107,21 @@ class DeepseekV4DecoderLayer(nn.Module):
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self._run_moe_ffn_dp_sync(
-            hidden_states,
-            forward_batch,
-            input_ids=input_ids,
-            input_ids_global=input_ids_global,
-        )
+        if is_in_breakable_cuda_graph():
+            hidden_states = bcg_deepseek_v4_moe_ffn(
+                self,
+                hidden_states,
+                forward_batch,
+                input_ids,
+                input_ids_global,
+            )
+        else:
+            hidden_states = self._run_moe_ffn_dp_sync(
+                hidden_states,
+                forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+            )
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
@@ -2186,8 +2704,84 @@ class DeepseekV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if self.pp_group.is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
-            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            reuse_mhc_input = (
+                os.environ.get("SGLANG_DSV4_REUSE_MHC_INPUT_WORKSPACE") == "1"
+                and input_ids.shape[0] >= 512
+            )
+            embedding_output: Optional[torch.Tensor] = None
+            if reuse_mhc_input:
+                # From the second large prefill chunk onward, the persistent
+                # main-Q workspace already exists and is idle until layer 0
+                # attention. Gather embeddings into its contiguous prefix,
+                # then copy/expand them into the persistent mHC input. This
+                # removes a transient 56 MiB allocation at peak KV-pool
+                # residency without adding another persistent buffer.
+                attn_backend = get_attn_backend()
+                q_workspace = getattr(
+                    attn_backend, "_dsv4_main_q_workspace", None
+                )
+                embedding_weight = getattr(self.embed_tokens, "weight", None)
+                embedding_elements = input_ids.numel() * self.hidden_size
+                if (
+                    q_workspace is not None
+                    and embedding_weight is not None
+                    and q_workspace.dtype == embedding_weight.dtype
+                    and q_workspace.device == embedding_weight.device
+                    and q_workspace.is_contiguous()
+                    and q_workspace.numel() >= embedding_elements
+                ):
+                    embedding_output = q_workspace.view(-1)[
+                        :embedding_elements
+                    ].view(*input_ids.shape, self.hidden_size)
+            hidden_states = self.embed_tokens(
+                input_ids, output=embedding_output
+            )
+            if reuse_mhc_input:
+                workspace_shape = (
+                    get_server_args().chunked_prefill_size,
+                    self.hc_mult,
+                    self.hidden_size,
+                )
+                workspace = getattr(
+                    self, "_dsv4_mhc_input_workspace", None
+                )
+                if workspace is None:
+                    workspace = torch.empty(
+                        workspace_shape,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                    )
+                    setattr(self, "_dsv4_mhc_input_workspace", workspace)
+                if (
+                    workspace.shape != workspace_shape
+                    or workspace.dtype != hidden_states.dtype
+                    or workspace.device != hidden_states.device
+                    or not workspace.is_contiguous()
+                ):
+                    raise RuntimeError(
+                        "invalid persistent DSV4 mHC input workspace: "
+                        f"expected={workspace_shape}/{hidden_states.dtype}/"
+                        f"{hidden_states.device}, got={tuple(workspace.shape)}/"
+                        f"{workspace.dtype}/{workspace.device}, "
+                        f"contiguous={workspace.is_contiguous()}"
+                    )
+                if hidden_states.shape[0] > workspace.shape[0]:
+                    raise RuntimeError(
+                        "DSV4 mHC input workspace is smaller than the current "
+                        f"chunk: workspace_tokens={workspace.shape[0]} "
+                        f"chunk_tokens={hidden_states.shape[0]}"
+                    )
+                mhc_input = workspace[: hidden_states.shape[0]]
+                mhc_input.copy_(
+                    hidden_states.unsqueeze(1).expand(
+                        -1, self.hc_mult, -1
+                    )
+                )
+                hidden_states = mhc_input
+            else:
+                hidden_states = hidden_states.unsqueeze(1).repeat(
+                    1, self.hc_mult, 1
+                )
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]

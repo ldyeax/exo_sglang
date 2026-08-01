@@ -162,6 +162,7 @@ class CompressorBackendMixin:
         forward_batch: ForwardBatch,
         layer_id: int,
         compressor: Compressor,
+        kv_score_output: Optional[torch.Tensor] = None,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
@@ -169,7 +170,12 @@ class CompressorBackendMixin:
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        new_compressed_kv = compressor(x, forward_batch, attn_backend=self)
+        new_compressed_kv = compressor(
+            x,
+            forward_batch,
+            attn_backend=self,
+            kv_score_output=kv_score_output,
+        )
         core_metadata = self.forward_metadata.core_metadata
         out_loc = (
             core_metadata.c4_out_loc
@@ -194,13 +200,19 @@ class CompressorBackendMixin:
         forward_batch: ForwardBatch,
         layer_id: int,
         compressor: Compressor,
+        kv_score_output: Optional[torch.Tensor] = None,
     ) -> None:
         assert is_overlap_compress(compressor.ratio)
         token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        new_compressed_kv = compressor(x, forward_batch, attn_backend=self)
+        new_compressed_kv = compressor(
+            x,
+            forward_batch,
+            attn_backend=self,
+            kv_score_output=kv_score_output,
+        )
         out_loc = self.forward_metadata.core_metadata.c4_out_loc
         if out_loc.shape[0] > new_compressed_kv.shape[0]:
             out_loc = out_loc[: new_compressed_kv.shape[0]]
@@ -418,8 +430,13 @@ class Compressor(MultiPlatformOp):
         assert isinstance(ret, CompressStatePool)
         return ret
 
-    def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+    def compute_kv_score(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        output: Optional[torch.Tensor] = None,
+    ):
+        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight, output=output)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -436,12 +453,17 @@ class Compressor(MultiPlatformOp):
         x: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend: Optional[AttentionBackend] = None,
+        kv_score_output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
 
-        kv_score = self.compute_kv_score(x, forward_batch)
+        kv_score = self.compute_kv_score(
+            x,
+            forward_batch,
+            output=kv_score_output,
+        )
 
         if TYPE_CHECKING:
             assert isinstance(attn_backend, DeepseekV4AttnBackend)

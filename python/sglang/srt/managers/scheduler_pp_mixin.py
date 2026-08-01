@@ -998,6 +998,59 @@ class SchedulerPPMixin:
             "next_token_ids": result.next_token_ids,
         }
 
+        if not batch.spec_algorithm.is_none():
+            device = result.next_token_ids.device
+
+            def optional_tensor(value, *, dtype):
+                if value is None:
+                    return torch.empty((0,), dtype=dtype, device=device)
+                return value
+
+            tensor_dict.update(
+                {
+                    "spec_accept_lens": optional_tensor(
+                        result.accept_lens, dtype=torch.int32
+                    ),
+                    "spec_block_accept_lens": optional_tensor(
+                        result.block_accept_lens, dtype=torch.int32
+                    ),
+                    "spec_cap_lens": optional_tensor(
+                        result.cap_lens, dtype=torch.int32
+                    ),
+                    "spec_new_seq_lens": optional_tensor(
+                        result.new_seq_lens, dtype=torch.int64
+                    ),
+                }
+            )
+            next_draft_input = result.next_draft_input
+            tensor_dict["spec_has_next_draft"] = torch.tensor(
+                [next_draft_input is not None], dtype=torch.uint8, device=device
+            )
+            if next_draft_input is not None:
+                tensor_dict.update(
+                    {
+                        "spec_bonus_tokens": next_draft_input.bonus_tokens,
+                        "spec_pp_draft_block_ids": optional_tensor(
+                            next_draft_input.pp_draft_block_ids, dtype=torch.int64
+                        ),
+                        "spec_pp_draft_tokens": optional_tensor(
+                            next_draft_input.pp_draft_tokens, dtype=torch.int64
+                        ),
+                        "spec_pp_corrected_logits": optional_tensor(
+                            next_draft_input.pp_corrected_logits, dtype=torch.float32
+                        ),
+                        "spec_pp_greedy_mask": optional_tensor(
+                            next_draft_input.pp_greedy_mask, dtype=torch.bool
+                        ),
+                        "spec_pp_temperatures": optional_tensor(
+                            next_draft_input.pp_temperatures, dtype=torch.float32
+                        ),
+                        "spec_pp_confidence": optional_tensor(
+                            next_draft_input.pp_confidence, dtype=torch.float32
+                        ),
+                    }
+                )
+
         if batch.return_logprob:
             logprob_dict = get_logprob_dict_from_result(result)
             tensor_dict = {
@@ -1129,6 +1182,75 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
+        if not batch.spec_algorithm.is_none():
+            from sglang.srt.speculative.dspark_components.dspark_draft import (
+                make_next_draft_input,
+            )
+
+            next_token_ids = pp_outputs["next_token_ids"]
+            accept_lens = pp_outputs["spec_accept_lens"]
+            block_accept_lens = pp_outputs["spec_block_accept_lens"]
+            cap_lens = pp_outputs["spec_cap_lens"]
+            new_seq_lens = pp_outputs["spec_new_seq_lens"].to(torch.int64)
+            next_draft_input = None
+            if bool(pp_outputs["spec_has_next_draft"].item()):
+                next_draft_input = make_next_draft_input(
+                    bonus_tokens=pp_outputs["spec_bonus_tokens"],
+                    new_seq_lens=new_seq_lens,
+                )
+
+                def present_or_none(name: str):
+                    value = pp_outputs[name]
+                    return value if value.numel() > 0 else None
+
+                next_draft_input.pp_draft_block_ids = present_or_none(
+                    "spec_pp_draft_block_ids"
+                )
+                next_draft_input.pp_draft_tokens = present_or_none(
+                    "spec_pp_draft_tokens"
+                )
+                next_draft_input.pp_corrected_logits = present_or_none(
+                    "spec_pp_corrected_logits"
+                )
+                next_draft_input.pp_greedy_mask = present_or_none(
+                    "spec_pp_greedy_mask"
+                )
+                next_draft_input.pp_temperatures = present_or_none(
+                    "spec_pp_temperatures"
+                )
+                next_draft_input.pp_confidence = present_or_none(
+                    "spec_pp_confidence"
+                )
+                batch.spec_info = next_draft_input
+
+            if new_seq_lens.numel() > 0:
+                batch.seq_lens = new_seq_lens
+                batch.seq_lens_cpu = new_seq_lens.to("cpu")
+                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            batch.input_ids = None
+            return GenerationBatchResult(
+                logits_output=logits_output,
+                pp_hidden_states_proxy_tensors=None,
+                next_token_ids=next_token_ids.to("cpu"),
+                accept_lens=(
+                    accept_lens.to("cpu") if accept_lens.numel() > 0 else None
+                ),
+                block_accept_lens=(
+                    block_accept_lens.to("cpu")
+                    if block_accept_lens.numel() > 0
+                    else None
+                ),
+                cap_lens=cap_lens.to("cpu") if cap_lens.numel() > 0 else None,
+                extend_input_len_per_req=extend_input_len_per_req,
+                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
+                can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
+                speculative_num_draft_tokens=int(
+                    self.server_args.speculative_num_draft_tokens
+                ),
+                new_seq_lens=new_seq_lens,
+                next_draft_input=next_draft_input,
+            )
+
         batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
         # PP rank 0 also relays into output_tokens_buf so the next iter's
         # resolve_forward_inputs finds these tokens for the decode portion

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 import torch
 
@@ -30,6 +31,9 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
+)
+from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+    BreakableCudaGraphBackend,
 )
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
@@ -261,6 +265,20 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         self.buffers.share_buffers()
 
         self.backend = resolve_decode_backend(self)
+        if (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and os.environ.get("SGLANG_DSV4_DRAFT_BCG_EAGER") == "1"
+        ):
+            # The multistep proposal loop mutates ForwardBatch Python fields
+            # between steps. Segment replay cannot reproduce those host-side
+            # mutations, so keep the complete draft loop at one eager break
+            # while target verification remains segmented/captured.
+            self.backend._debug_eager = True
+        self.use_captured_attn_metadata = (
+            isinstance(self.backend, BreakableCudaGraphBackend)
+            and self.draft_attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+        )
+        self.attn_metadata_buffers: Dict[ShapeKey, Any] = {}
 
         # Capture
         try:
@@ -450,17 +468,28 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
+        shape_key = self._make_graph_key(num_seqs)
         with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
-            self.draft_attn_backend.init_forward_metadata_out_graph(
-                forward_batch, in_capture=True
-            )
+            if self.use_captured_attn_metadata:
+                self.attn_metadata_buffers[shape_key] = (
+                    self.draft_attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+                        forward_batch
+                    )
+                )
+            else:
+                self.draft_attn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=True
+                )
             # The capture batch is planned here (out-of-forward), so the
             # per-step forwards inside draft_forward must not re-plan.
             forward_batch.mark_forward_metadata_ready()
             self.deepep_adapter.capture(is_extend_in_batch=False)
-            shape_key = self._make_graph_key(num_seqs)
-            post_warmup_hook = getattr(
-                self.draft_attn_backend, "on_after_cuda_graph_warmup", None
+            post_warmup_hook = (
+                None
+                if self.use_captured_attn_metadata
+                else getattr(
+                    self.draft_attn_backend, "on_after_cuda_graph_warmup", None
+                )
             )
             maybe_flashinfer_autotune_speculative_draft(
                 self,
@@ -631,13 +660,20 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
-        # forward_batch.batch_size was overwritten to bs above when padding.
-        self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
         self.raw_bs = raw_bs
         self.bs = bs
 
         # Replay via backend
         shape_key = self._make_graph_key(bs)
+        if self.use_captured_attn_metadata:
+            self.draft_attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+                self.attn_metadata_buffers[shape_key],
+                forward_batch,
+                static_forward_batch=forward_batch,
+            )
+        else:
+            # forward_batch.batch_size was overwritten to bs above when padding.
+            self.draft_attn_backend.init_forward_metadata_out_graph(forward_batch)
         timer_ctx = (
             self.model_runner.device_timer.wrap(metadata={"category": "eagle_draft"})
             if self.model_runner.device_timer

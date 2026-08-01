@@ -50,10 +50,16 @@ def dequantize_k_cache_paged(
     bytes_per_page = quant_k_cache_u8.shape[-1]
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
-    # Three typed views over the same underlying bytes.
-    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+    # Typed views over the same underlying bytes.  SM86 cannot lower Triton's
+    # fp8e4nv type, so the kernel decodes raw uint8 values through an exact
+    # E4M3 lookup table instead of receiving an FP8-typed pointer.
     buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
     buf_uint8 = quant_k_cache_u8.reshape(-1)
+    from sglang.srt.layers.attention.nsa.v4_triton_kernel import (
+        _get_fp8_e4m3_lut,
+    )
+
+    fp8_lut = _get_fp8_e4m3_lut(quant_k_cache.device)
 
     if out is None:
         out = torch.empty(
@@ -67,9 +73,9 @@ def dequantize_k_cache_paged(
 
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
-        buf_fp8,
         buf_bf16,
         buf_uint8,
+        fp8_lut,
         page_table_1_flattened,
         out.stride(0),
         BYTES_PER_PAGE=bytes_per_page,
@@ -88,9 +94,9 @@ def dequantize_k_cache_paged(
 @triton.jit
 def _dequantize_k_cache_paged_kernel(
     output_ptr,
-    buf_fp8_ptr,
     buf_bf16_ptr,
     buf_uint8_ptr,
+    fp8_lut_ptr,
     page_table_ptr,
     output_stride_0,
     BYTES_PER_PAGE: tl.constexpr,
@@ -119,7 +125,9 @@ def _dequantize_k_cache_paged_kernel(
     nope_offs = tl.arange(0, TILE_SIZE)
     for tile_id in tl.static_range(NUM_SCALE_TILES):
         fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
-        fp8_vals = tl.load(buf_fp8_ptr + fp8_off).to(tl.float32)
+        fp8_raw = tl.load(buf_uint8_ptr + fp8_off)
+        fp8_index = fp8_raw.to(tl.uint32).to(tl.int32)
+        fp8_vals = tl.load(fp8_lut_ptr + fp8_index)
 
         scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
         scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))

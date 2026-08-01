@@ -3349,7 +3349,15 @@ class Scheduler(
                 # future_map relay / on_publish).
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
-                    batch_result = self.model_worker.forward_batch_generation(batch)
+                    batch_result = self.model_worker.forward_batch_generation(
+                        batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
+                if self.ps.pp_size > 1:
+                    # The authoritative accepted-token and next-proposal state
+                    # is produced by the last stage and returns through the PP
+                    # output ring.  Applying a target-only intermediate result
+                    # here would diverge the schedulers.
+                    return batch_result
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
                 batch.spec_info = batch_result.next_draft_input

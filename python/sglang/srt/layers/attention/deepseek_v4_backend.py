@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -50,6 +51,10 @@ from sglang.srt.layers.attention.dsv4.quant_k_cache import (
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillWorkspace,
+)
+from sglang.srt.layers.attention.debug_flash_mla_adapter import (
+    flash_mla_with_kvcache_entrypoint,
+    should_use_triton_fallback,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -131,7 +136,7 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120 or _is_xpu:
+    if _is_sm120 or _is_xpu or should_use_triton_fallback():
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -246,16 +251,30 @@ class DSV4AttnMetadata:
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
         ]
-        reference_assign_fields = [
+        attention_is_captured = (
+            os.environ.get("SGLANG_DSV4_CAPTURE_ATTN_IN_BCG") == "1"
+        )
+        captured_attention_tensor_fields = [
             "page_table",
             "swa_page_indices",
             "swa_topk_lengths",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
-            "c1_flashmla_metadata",
-            "c4_flashmla_metadata",
-            "c128_flashmla_metadata",
         ]
+        if attention_is_captured:
+            tensor_copy_fields.extend(captured_attention_tensor_fields)
+            reference_assign_fields = [
+                "c1_flashmla_metadata",
+                "c4_flashmla_metadata",
+                "c128_flashmla_metadata",
+            ]
+        else:
+            reference_assign_fields = [
+                *captured_attention_tensor_fields,
+                "c1_flashmla_metadata",
+                "c4_flashmla_metadata",
+                "c128_flashmla_metadata",
+            ]
         # Keep graph-captured tensor objects alive for fields that captured
         # kernels read by address; overwrite only their contents.
         for field_name in tensor_copy_fields:
@@ -406,6 +425,18 @@ class DSV4Metadata:
             static_metadata.core_attn_metadata
         )
         maybe_copy_inplace(self.indexer_metadata, src=static_metadata.indexer_metadata)
+        if self.indexer_metadata is not None:
+            # The C4 indexer and attention core deliberately share these
+            # objects. The core refresh replaces page_table with the live
+            # static-batch reference, while PagedIndexerMetadata.copy_ keeps
+            # its captured tensor object. Re-link them before eager BCG
+            # attention so index selection and sparse attention use the exact
+            # same live mapping.
+            self.indexer_metadata.page_table = self.core_attn_metadata.page_table
+            assert self.core_attn_metadata.c4_topk_lengths_raw is not None
+            self.indexer_metadata.c4_seq_lens = (
+                self.core_attn_metadata.c4_topk_lengths_raw
+            )
         maybe_copy_inplace(
             self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
         )
@@ -1444,6 +1475,11 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
+        # PREP_IN_CUDA_GRAPH deliberately leaves decode/verify metadata raw for
+        # a monolithic graph to materialize.  A BCG attention break executes in
+        # Python, so retain the fully materialized capture object that replay
+        # refreshes in place.
+        self.init_forward_metadata_in_graph(forward_batch)
         return self.forward_metadata
 
     def prepare_forward_metadata_for_breakable_cuda_graph_replay(
@@ -1456,12 +1492,20 @@ class DeepseekV4AttnBackend(
         # Build graph-compatible metadata against the padded static batch. The
         # batch still carries live seq/extend lens, so the online c128 prefill
         # plan remains batch-specific without constructing a second metadata set.
+        replay_forward_batch = (
+            static_forward_batch if static_forward_batch is not None else forward_batch
+        )
         static_metadata = self._build_forward_metadata(
-            static_forward_batch if static_forward_batch is not None else forward_batch,
+            replay_forward_batch,
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
+        if not isinstance(static_metadata, DSV4Metadata):
+            self.forward_metadata = static_metadata
+            self.init_forward_metadata_in_graph(replay_forward_batch)
+            static_metadata = self.forward_metadata
         assert isinstance(capture_metadata, DSV4Metadata)
+        assert isinstance(static_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
 
@@ -1690,25 +1734,43 @@ class DeepseekV4AttnBackend(
             else:
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
+                    o = flash_mla_with_kvcache(
+                        q=q,
+                        k_cache=swa_k_cache,
+                        head_dim_v=self.head_dim_v,
+                        block_table=None,
+                        cache_seqlens=None,
+                        tile_scheduler_metadata=flashmla_metadata,
+                        softmax_scale=self.softmax_scale,
+                        is_fp8_kvcache=True,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices_in_kvcache=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                    )[0]
                 else:
-                    from sgl_kernel.flash_mla import flash_mla_with_kvcache
-
-                o = flash_mla_with_kvcache(
-                    q=q,
-                    k_cache=swa_k_cache,
-                    head_dim_v=self.head_dim_v,
-                    block_table=None,
-                    cache_seqlens=None,
-                    tile_scheduler_metadata=flashmla_metadata,
-                    softmax_scale=self.softmax_scale,
-                    is_fp8_kvcache=True,
-                    indices=swa_page_indices,
-                    topk_length=swa_topk_lengths,
-                    attn_sink=attn_sink,
-                    extra_k_cache=extra_k_cache,
-                    extra_indices_in_kvcache=extra_indices,
-                    extra_topk_length=extra_topk_lengths,
-                )[0]
+                    backend = (
+                        "triton" if should_use_triton_fallback() else "kernel"
+                    )
+                    o = flash_mla_with_kvcache_entrypoint(
+                        q=q,
+                        k_cache=swa_k_cache,
+                        head_dim_v=self.head_dim_v,
+                        block_table=None,
+                        cache_seqlens=None,
+                        tile_scheduler_metadata=flashmla_metadata,
+                        softmax_scale=self.softmax_scale,
+                        is_fp8_kvcache=True,
+                        indices=swa_page_indices,
+                        topk_length=swa_topk_lengths,
+                        attn_sink=attn_sink,
+                        extra_k_cache=extra_k_cache,
+                        extra_indices_in_kvcache=extra_indices,
+                        extra_topk_length=extra_topk_lengths,
+                        backend=backend,
+                    )[0]
 
             o = o.squeeze(1)
             return o
@@ -2011,22 +2073,13 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                 )
             )
 
-    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
-        for attn_backend in self.attn_backends:
-            attn_backend.init_forward_metadata_in_graph(forward_batch)
-
-    def init_forward_metadata_out_graph(
-        self,
-        forward_batch: ForwardBatch,
-        in_capture: bool = False,
-    ):
+    @staticmethod
+    def _make_inner_decode_forward_batch(forward_batch: ForwardBatch):
         from types import SimpleNamespace
 
-        inner_fb = SimpleNamespace(
+        return SimpleNamespace(
             batch_size=forward_batch.batch_size,
             forward_mode=ForwardMode.DECODE,
-            # Propagate the real runtime mode so inner backends can detect IDLE
-            # and apply their idle substitution.
             actual_forward_mode=getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             ),
@@ -2040,6 +2093,17 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
             spec_info=forward_batch.spec_info,
         )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch) -> None:
+        for attn_backend in self.attn_backends:
+            attn_backend.init_forward_metadata_in_graph(forward_batch)
+
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        inner_fb = self._make_inner_decode_forward_batch(forward_batch)
         if in_capture:
             for i in range(self.speculative_num_steps):
                 self.attn_backends[i].init_forward_metadata_out_graph(
@@ -2064,12 +2128,13 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     def init_forward_metadata_for_breakable_cuda_graph_capture(
         self, forward_batch: ForwardBatch
     ):
+        inner_fb = self._make_inner_decode_forward_batch(forward_batch)
         ret = []
         for i in range(self.speculative_num_steps - 1):
             ret.append(
                 self.attn_backends[
                     i
-                ].init_forward_metadata_for_breakable_cuda_graph_capture(forward_batch)
+                ].init_forward_metadata_for_breakable_cuda_graph_capture(inner_fb)
             )
         return ret
 
@@ -2081,13 +2146,19 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
         static_forward_batch: Optional[ForwardBatch] = None,
     ) -> None:
         assert len(capture_metadata) == self.speculative_num_steps - 1
+        inner_fb = self._make_inner_decode_forward_batch(forward_batch)
+        inner_static_fb = self._make_inner_decode_forward_batch(
+            static_forward_batch
+            if static_forward_batch is not None
+            else forward_batch
+        )
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[
                 i
             ].prepare_forward_metadata_for_breakable_cuda_graph_replay(
                 capture_metadata[i],
-                forward_batch,
-                static_forward_batch=static_forward_batch,
+                inner_fb,
+                static_forward_batch=inner_static_fb,
             )
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
