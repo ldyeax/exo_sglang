@@ -132,6 +132,16 @@ class DeepSeekV4SingleKVPool(KVCache):
             device=self.device,
         )
 
+    def _get_local_layer_id(self, layer_id: int) -> int:
+        local_layer_id = layer_id - self.start_layer
+        if not 0 <= local_layer_id < len(self.kv_buffer):
+            raise IndexError(
+                "DeepSeek V4 KV layer is outside this pipeline stage: "
+                f"{layer_id=} stage=[{self.start_layer}, "
+                f"{self.start_layer + len(self.kv_buffer)})"
+            )
+        return local_layer_id
+
     def set_key_buffer(
         self,
         layer_id: int,
@@ -139,17 +149,18 @@ class DeepSeekV4SingleKVPool(KVCache):
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
         cache_bf16_pack: Any = None,
     ):
+        local_layer_id = self._get_local_layer_id(layer_id)
         if self.use_bf16_cache and cache_bf16_pack is not None:
             index_buf_accessor_v4.SetBf16KAndS.execute(
                 pool=self,
-                buf=self.kv_buffer[layer_id],
+                buf=self.kv_buffer[local_layer_id],
                 loc=loc,
                 pack=cache_bf16_pack,
             )
         elif cache_nope_fp8_rope_bf16_pack is not None:
             index_buf_accessor_v4.SetKAndS.execute(
                 pool=self,
-                buf=self.kv_buffer[layer_id],
+                buf=self.kv_buffer[local_layer_id],
                 loc=loc,
                 nope_fp8_rope_bf16_pack=cache_nope_fp8_rope_bf16_pack,
             )
@@ -160,22 +171,24 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        local_layer_id = self._get_local_layer_id(layer_id)
         return fused_store_cache(
             input=cache_k,
-            cache=self.kv_buffer[layer_id],
+            cache=self.kv_buffer[local_layer_id],
             indices=loc,
             page_size=self.page_size,
             type="flashmla",
         )
 
     def get_key_buffer(self, layer_id: int):
+        local_layer_id = self._get_local_layer_id(layer_id)
         if self.use_bf16_cache:
             # Return raw uint8 buffer — the dispatch will view as bf16.
-            return self.kv_buffer[layer_id - self.start_layer]
+            return self.kv_buffer[local_layer_id]
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
+            return self.kv_buffer[local_layer_id].view(self.dtype)
 
-        return self.kv_buffer[layer_id]
+        return self.kv_buffer[local_layer_id]
 
     def set_kv_buffer(self, *args, **kwargs) -> None:
         raise NotImplementedError()
@@ -489,6 +502,30 @@ class DeepSeekV4TokenToKVPool(KVCache):
         self.c128_state_pool_size = c128_state_pool_size
         self.state_dtype = state_dtype
         self.compression_ratios = compression_ratios
+        self.local_start_layer = 0 if start_layer is None else start_layer
+        self.local_end_layer = (
+            self.local_start_layer + layer_num if end_layer is None else end_layer
+        )
+        if not (
+            0
+            <= self.local_start_layer
+            < self.local_end_layer
+            <= len(self.compression_ratios)
+        ):
+            raise ValueError(
+                "Invalid DeepSeek V4 KV pipeline layer range: "
+                f"[{self.local_start_layer}, {self.local_end_layer}) for "
+                f"{len(self.compression_ratios)} compression ratios"
+            )
+        if self.local_end_layer - self.local_start_layer != layer_num:
+            raise ValueError(
+                "DeepSeek V4 KV local layer count does not match the pipeline range: "
+                f"{layer_num=} range="
+                f"[{self.local_start_layer}, {self.local_end_layer})"
+            )
+        local_compression_ratios = self.compression_ratios[
+            self.local_start_layer : self.local_end_layer
+        ]
 
         assert page_size % swa_page_size == 0
 
@@ -507,8 +544,8 @@ class DeepSeekV4TokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.indexer_head_dim = indexer_head_dim
 
-        c4_layer_num = sum(1 for r in compression_ratios if r == 4)
-        c128_layer_num = sum(1 for r in compression_ratios if r == 128)
+        c4_layer_num = sum(1 for r in local_compression_ratios if r == 4)
+        c128_layer_num = sum(1 for r in local_compression_ratios if r == 128)
         c4_page_size = page_size // 4
         c128_page_size = page_size // 128
         self.swa_kv_pool = DeepSeekV4SingleKVPool(
@@ -520,6 +557,8 @@ class DeepSeekV4TokenToKVPool(KVCache):
             layer_num,
             device,
             enable_memory_saver,
+            start_layer=self.local_start_layer,
+            end_layer=self.local_end_layer,
             is_swa_pool=True,
             use_bf16_cache=_bf16,
         )
@@ -705,10 +744,14 @@ class DeepSeekV4TokenToKVPool(KVCache):
     def _init_paged_compress_states(self, enable_memory_saver: bool):
         c4_state_pool_size = self.c4_state_pool_size
         c128_state_pool_size = self.c128_state_pool_size
-        self.compress_state_pools: List[CompressStatePool] = []
-        self.indexer_compress_state_pools: List[CompressStatePool] = []
+        self.compress_state_pools: List[Optional[CompressStatePool]] = []
+        self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = []
 
-        for ratio in self.compression_ratios:
+        for layer_id, ratio in enumerate(self.compression_ratios):
+            if not self.local_start_layer <= layer_id < self.local_end_layer:
+                self.compress_state_pools.append(None)
+                self.indexer_compress_state_pools.append(None)
+                continue
             overlap = ratio == 4
             compress_state_pool = indexer_compress_state_pool = None
             size = c4_state_pool_size if ratio == 4 else c128_state_pool_size
@@ -747,7 +790,15 @@ class DeepSeekV4TokenToKVPool(KVCache):
         c1_cnt, c4_cnt, c128_cnt = 0, 0, 0
         self.layer_mapping: List[DeepSeekV4LayerItem] = []
 
-        for ratio in self.compression_ratios:
+        for layer_id, ratio in enumerate(self.compression_ratios):
+            if not self.local_start_layer <= layer_id < self.local_end_layer:
+                self.layer_mapping.append(
+                    DeepSeekV4LayerItem(
+                        compress_ratio=ratio,
+                        compress_layer_id=-1,
+                    )
+                )
+                continue
             if ratio == 0:
                 self.layer_mapping.append(
                     DeepSeekV4LayerItem(

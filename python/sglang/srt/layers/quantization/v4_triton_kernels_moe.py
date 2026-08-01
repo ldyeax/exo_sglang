@@ -42,6 +42,11 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    has_forward_context,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -188,6 +193,125 @@ def _make_routing_data_v4(
     return routing_from_bitmatrix(
         bitmatrix, topk_weights_bf, topk_ids_i16, num_local_experts, n_topk
     )
+
+
+@triton.jit
+def _reduce_compact_routes_kernel(
+    compact_output_ptr,
+    compact_lookup_ptr,
+    output_ptr,
+    output_columns,
+    TOP_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Reduce compact GPU-route rows back to tokens in original slot order."""
+    token_idx = tl.program_id(0)
+    column_offsets = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    column_mask = column_offsets < output_columns
+    accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for slot_idx in range(TOP_K):
+        compact_idx = tl.load(compact_lookup_ptr + token_idx * TOP_K + slot_idx)
+        route_mask = (compact_idx >= 0) & column_mask
+        route_values = tl.load(
+            compact_output_ptr + compact_idx * output_columns + column_offsets,
+            mask=route_mask,
+            other=0.0,
+        )
+        accumulator += route_values.to(tl.float32)
+    tl.store(
+        output_ptr + token_idx * output_columns + column_offsets,
+        accumulator,
+        mask=column_mask,
+    )
+
+
+def _make_compact_routing_data_v4(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_local_experts: int,
+):
+    """Build top-1 routing over only valid GPU routes.
+
+    KTransformers masks CPU and remote expert slots to ``-1`` before invoking
+    this backend.  The ordinary top-6-to-top-8 routing path nevertheless sizes
+    every GEMM intermediate for all eight slots.  On the tiered V4 deployment
+    only about 20% of routes are GPU-owned, so that wastes most Ampere memory
+    and work during prefill.
+
+    Compact rows remain in original token/slot order.  Expert sorting still
+    happens inside ``routing_from_bitmatrix``; its gather indices are remapped
+    directly to original token rows, avoiding a compact copy of the large
+    hidden-state tensor.  The returned lookup restores route rows with a
+    deterministic fixed-order reduction after GEMM2.
+    """
+    from triton_kernels.routing import GatherIndx
+
+    flat_ids = topk_ids.reshape(-1)
+    flat_weights = topk_weights.reshape(-1)
+    valid_flat_indices = torch.nonzero(flat_ids >= 0, as_tuple=False).flatten()
+    top_k = topk_ids.shape[1]
+    compact_lookup = torch.full(
+        (flat_ids.numel(),),
+        -1,
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    if valid_flat_indices.numel() == 0:
+        return None, None, None, compact_lookup.view_as(topk_ids)
+
+    token_indices = torch.div(
+        valid_flat_indices, top_k, rounding_mode="floor"
+    ).to(torch.int32)
+    compact_ids = flat_ids[valid_flat_indices].reshape(-1, 1)
+    compact_weights = flat_weights[valid_flat_indices].reshape(-1, 1)
+    routing_data, gather_indx, scatter_indx = _make_routing_data_v4(
+        compact_ids,
+        compact_weights,
+        num_local_experts,
+    )
+
+    # top-1 routing's gather indices refer to compact route rows. Point them
+    # at the matching original token rows instead, so GEMM1 gathers directly
+    # from hidden_states without allocating hidden_states[token_indices].
+    original_token_gather = token_indices[gather_indx.src_indx.to(torch.int64)]
+    gather_indx = GatherIndx(
+        src_indx=original_token_gather.to(gather_indx.src_indx.dtype),
+        dst_indx=gather_indx.dst_indx,
+    )
+
+    compact_lookup[valid_flat_indices] = torch.arange(
+        valid_flat_indices.numel(),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    return (
+        routing_data,
+        gather_indx,
+        scatter_indx,
+        compact_lookup.view_as(topk_ids),
+    )
+
+
+def _reduce_compact_routes(
+    compact_output: torch.Tensor,
+    compact_lookup: torch.Tensor,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor:
+    """Restore compact routes over the now-dead hidden-state storage."""
+    output = hidden_states
+    output_columns = hidden_states.shape[1]
+    block_n = 256
+    _reduce_compact_routes_kernel[
+        (hidden_states.shape[0], triton.cdiv(output_columns, block_n))
+    ](
+        compact_output,
+        compact_lookup,
+        output,
+        output_columns,
+        TOP_K=compact_lookup.shape[1],
+        BLOCK_N=block_n,
+    )
+    return output
 
 
 # -----------------------------------------------------------------------------
@@ -428,9 +552,116 @@ def apply_v4_triton_kernels_moe(
     # Build routing data from sglang topk → triton_kernels (RoutingData,
     # GatherIndx, ScatterIndx). Note: this rebuilds per-call. Cheap
     # (O(M * n_topk)) compared to the gemms themselves.
-    routing_data, gather_indx, scatter_indx = _make_routing_data_v4(
-        topk_ids, topk_weights, num_experts
+    compact_lookup = None
+    compact_route_threshold = int(
+        os.environ.get("SGLANG_V4_COMPACT_GPU_ROUTE_MIN_TOKENS", "512")
     )
+    if (
+        os.environ.get("SGLANG_V4_COMPACT_GPU_ROUTES") == "1"
+        and M >= compact_route_threshold
+    ):
+        routing_data, gather_indx, scatter_indx, compact_lookup = (
+            _make_compact_routing_data_v4(
+                topk_ids,
+                topk_weights,
+                num_experts,
+            )
+        )
+        if routing_data is None:
+            return hidden_states.zero_()
+    else:
+        routing_data, gather_indx, scatter_indx = _make_routing_data_v4(
+            topk_ids, topk_weights, num_experts
+        )
+
+    intermediate1_output = None
+    intermediate2_output = None
+    gemm2_output = None
+    if (
+        compact_lookup is not None
+        and M >= compact_route_threshold
+        and has_forward_context()
+    ):
+        attn_backend = get_attn_backend()
+        workspace = getattr(attn_backend, "_dsv4_main_q_workspace", None)
+        workspace_cursor = getattr(
+            attn_backend, "_dsv4_mlp_workspace_live_elements", None
+        )
+        workspace_limit = workspace.numel() if workspace is not None else 0
+        if (
+            workspace is not None
+            and workspace.dtype == hidden_states.dtype
+            and hidden_states.untyped_storage().data_ptr()
+            == workspace.untyped_storage().data_ptr()
+        ):
+            # mHC pre can place hidden_states in the workspace's final
+            # contiguous suffix. Compact GPU routes may reuse only the dead
+            # prefix until GEMM1 has consumed that input.
+            input_start_bytes = hidden_states.data_ptr() - workspace.data_ptr()
+            input_end_bytes = (
+                input_start_bytes
+                + hidden_states.numel() * hidden_states.element_size()
+            )
+            workspace_bytes = workspace.numel() * workspace.element_size()
+            if (
+                input_start_bytes < 0
+                or input_end_bytes > workspace_bytes
+                or input_start_bytes % workspace.element_size() != 0
+                or not hidden_states.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "invalid DSV4 GPU-MoE input view in shared main-Q "
+                    f"workspace: start={input_start_bytes}, "
+                    f"end={input_end_bytes}, workspace={workspace_bytes}, "
+                    f"contiguous={hidden_states.is_contiguous()}"
+                )
+            workspace_limit = input_start_bytes // workspace.element_size()
+            if (
+                workspace_cursor is not None
+                and workspace_cursor > workspace_limit
+            ):
+                raise RuntimeError(
+                    "DSV4 GPU-MoE workspace cursor already overlaps protected "
+                    f"input: cursor={workspace_cursor}, limit={workspace_limit}"
+                )
+        route_rows = gather_indx.src_indx.numel()
+        intermediate1_elements = route_rows * 2 * N
+        intermediate2_elements = route_rows * N
+        gemm2_output_elements = route_rows * K
+        reusable_output_elements = max(
+            intermediate1_elements,
+            gemm2_output_elements,
+        )
+        required_elements = (
+            reusable_output_elements + intermediate2_elements
+        )
+        if (
+            workspace is not None
+            and workspace_cursor is not None
+            and workspace.dtype == hidden_states.dtype
+            and workspace.device == hidden_states.device
+            and workspace.is_contiguous()
+            and workspace_cursor + required_elements <= workspace_limit
+        ):
+            reusable_output = workspace.view(-1)[
+                workspace_cursor : workspace_cursor + reusable_output_elements
+            ]
+            intermediate1_output = reusable_output[
+                :intermediate1_elements
+            ].view(1, route_rows, 2 * N)
+            gemm2_output = reusable_output[:gemm2_output_elements].view(
+                1, route_rows, K
+            )
+            intermediate2_output = workspace.view(-1)[
+                workspace_cursor
+                + reusable_output_elements : workspace_cursor
+                + required_elements
+            ].view(route_rows, N)
+            setattr(
+                attn_backend,
+                "_dsv4_mlp_workspace_live_elements",
+                workspace_cursor + required_elements,
+            )
 
     # gemm1: hidden_states (M, K) @ w13 → (M*topk, 2*N) bf16
     intermediate1 = matmul_ogs(
@@ -440,7 +671,13 @@ def apply_v4_triton_kernels_moe(
         routing_data,
         gather_indx=gather_indx,
         precision_config=w13_pcg,
+        y=intermediate1_output,
     )
+    if (
+        intermediate1_output is not None
+        and intermediate1.data_ptr() != intermediate1_output.data_ptr()
+    ):
+        raise RuntimeError("MXFP4 GEMM1 did not preserve caller-owned output")
     # intermediate1 shape: [M*topk, 2*N]; layout = [gate, up] along last dim.
     # We skipped reorder_w1w3_to_w3w1 for this path so the natural [w1, w3]
     # = [gate, up] order from the checkpoint is preserved.
@@ -452,8 +689,14 @@ def apply_v4_triton_kernels_moe(
         intermediate1[..., :N_int].clamp_(max=swiglu_limit)
         intermediate1[..., N_int:].clamp_(min=-swiglu_limit, max=swiglu_limit)
     M_topk = intermediate1.shape[0]
-    intermediate2 = torch.empty(
-        (M_topk, N), device=hidden_states.device, dtype=hidden_states.dtype
+    intermediate2 = (
+        intermediate2_output
+        if intermediate2_output is not None
+        else torch.empty(
+            (M_topk, N),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
     )
     silu_and_mul(intermediate1.view(-1, 2 * N), intermediate2)
 
@@ -466,7 +709,12 @@ def apply_v4_triton_kernels_moe(
         scatter_indx=scatter_indx,
         precision_config=w2_pcg,
         gammas=routing_data.gate_scal,
+        y=gemm2_output,
     )
+    if gemm2_output is not None and output.data_ptr() != gemm2_output.data_ptr():
+        raise RuntimeError("MXFP4 GEMM2 did not preserve caller-owned output")
+    if compact_lookup is not None:
+        output = _reduce_compact_routes(output, compact_lookup, hidden_states)
 
     # routed_scaling_factor is NOT applied here; the caller
     # (mxfp4_deepseek.apply) handles it to stay consistent with the trtllm

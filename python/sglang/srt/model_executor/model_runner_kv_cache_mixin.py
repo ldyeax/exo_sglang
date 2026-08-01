@@ -430,6 +430,8 @@ class ModelRunnerKVCacheMixin:
             swa_ratio=self.server_args.swa_full_tokens_ratio,
             is_speculative=self.server_args.speculative_algorithm is not None,
             c4_shrink_factor=c4_shrink,
+            start_layer=self.start_layer,
+            end_layer=self.end_layer,
         )
 
         pool_sizes = calculator.get_pool_sizes_by_profiling(self)
@@ -439,6 +441,16 @@ class ModelRunnerKVCacheMixin:
         ):
             pool_sizes = calculator.get_pool_sizes_by_configuration(
                 max_total_tokens=self.max_total_num_tokens
+            )
+        elif (
+            self.server_args.max_total_tokens is not None
+            and pool_sizes.full_max_total_num_tokens < self.max_total_num_tokens
+        ):
+            logger.warning(
+                "max_total_tokens=%s exceeds the stage-local DeepSeek V4 "
+                "compressed-cache capacity %s; using the profiled capacity.",
+                self.max_total_num_tokens,
+                pool_sizes.full_max_total_num_tokens,
             )
 
         self.full_max_total_num_tokens = pool_sizes.full_max_total_num_tokens
@@ -468,6 +480,7 @@ class ModelRunnerKVCacheMixin:
     def init_memory_pool(self: ModelRunner):
         max_num_reqs = self.server_args.max_running_requests
         max_total_tokens_configured = self.server_args.max_total_tokens
+        is_dsv4_compressed = is_deepseek_compressed(self.model_config.hf_config)
         self.max_total_num_tokens = self.profile_max_num_token()
 
         if max_num_reqs is None:
@@ -505,14 +518,19 @@ class ModelRunnerKVCacheMixin:
                 )
 
         if max_total_tokens_configured is not None:
-            if max_total_tokens_configured > self.max_total_num_tokens:
+            if (
+                max_total_tokens_configured > self.max_total_num_tokens
+                and not is_dsv4_compressed
+            ):
                 logging.warning(
                     f"max_total_tokens={max_total_tokens_configured} is larger than the profiled value "
                     f"{self.max_total_num_tokens}. "
                     f"Use the profiled value instead."
                 )
-            self.max_total_num_tokens = min(
-                self.max_total_num_tokens, max_total_tokens_configured
+            self.max_total_num_tokens = (
+                max_total_tokens_configured
+                if is_dsv4_compressed
+                else min(self.max_total_num_tokens, max_total_tokens_configured)
             )
 
         self.max_total_num_tokens = (

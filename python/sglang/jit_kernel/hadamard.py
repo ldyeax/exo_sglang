@@ -6,6 +6,21 @@ import torch
 
 from sglang.jit_kernel.utils import KERNEL_PATH, cache_once, load_jit, make_cpp_args
 
+try:
+    from sgl_kernel import (
+        hadamard_transform as _aot_hadamard_transform,
+        hadamard_transform_12n as _aot_hadamard_transform_12n,
+        hadamard_transform_20n as _aot_hadamard_transform_20n,
+        hadamard_transform_28n as _aot_hadamard_transform_28n,
+        hadamard_transform_40n as _aot_hadamard_transform_40n,
+    )
+except ImportError:
+    _aot_hadamard_transform = None
+    _aot_hadamard_transform_12n = None
+    _aot_hadamard_transform_20n = None
+    _aot_hadamard_transform_28n = None
+    _aot_hadamard_transform_40n = None
+
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
@@ -33,6 +48,9 @@ def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     if not x.is_cuda:
         raise RuntimeError("hadamard_transform only supports CUDA tensors")
 
+    if _aot_hadamard_transform is not None:
+        return _aot_hadamard_transform(x, scale)
+
     shapes_og = x.size()
     dim_og = x.size(-1)
     x = x.reshape(-1, dim_og)
@@ -55,6 +73,9 @@ def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
 def hadamard_transform_12n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     if not x.is_cuda:
         raise RuntimeError("hadamard_transform_12n only supports CUDA tensors")
+
+    if _aot_hadamard_transform_12n is not None:
+        return _aot_hadamard_transform_12n(x, scale)
 
     shapes_og = x.size()
     dim_og = x.size(-1)
@@ -79,6 +100,9 @@ def hadamard_transform_20n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     if not x.is_cuda:
         raise RuntimeError("hadamard_transform_20n only supports CUDA tensors")
 
+    if _aot_hadamard_transform_20n is not None:
+        return _aot_hadamard_transform_20n(x, scale)
+
     shapes_og = x.size()
     dim_og = x.size(-1)
     x = x.reshape(-1, dim_og)
@@ -102,6 +126,9 @@ def hadamard_transform_28n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     if not x.is_cuda:
         raise RuntimeError("hadamard_transform_28n only supports CUDA tensors")
 
+    if _aot_hadamard_transform_28n is not None:
+        return _aot_hadamard_transform_28n(x, scale)
+
     shapes_og = x.size()
     dim_og = x.size(-1)
     x = x.reshape(-1, dim_og)
@@ -124,6 +151,9 @@ def hadamard_transform_28n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
 def hadamard_transform_40n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     if not x.is_cuda:
         raise RuntimeError("hadamard_transform_40n only supports CUDA tensors")
+
+    if _aot_hadamard_transform_40n is not None:
+        return _aot_hadamard_transform_40n(x, scale)
 
     shapes_og = x.size()
     dim_og = x.size(-1)

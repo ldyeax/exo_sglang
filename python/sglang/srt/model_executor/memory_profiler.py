@@ -8,13 +8,39 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.distributed.parallel_state import get_pp_group, get_world_group
 from sglang.srt.mem_cache.deepseekv4_memory_pool import get_compress_state_ring_size
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _preinitialize_pipeline_communicators(device: str) -> None:
+    pp_group = get_pp_group()
+    if pp_group.world_size == 1:
+        return
+
+    warmup = torch.empty(1, dtype=torch.uint8, device=device)
+    if pp_group.rank_in_group > 0:
+        torch.distributed.recv(
+            warmup,
+            src=pp_group.ranks[pp_group.rank_in_group - 1],
+            group=pp_group.device_group,
+        )
+    if pp_group.rank_in_group + 1 < pp_group.world_size:
+        torch.distributed.send(
+            warmup,
+            dst=pp_group.ranks[pp_group.rank_in_group + 1],
+            group=pp_group.device_group,
+        )
+    del warmup
+    torch.cuda.synchronize()
+    logger.info(
+        "DeepSeek V4 preinitialized pipeline NCCL edge before "
+        "compressed-cache profiling."
+    )
 
 
 @dataclass
@@ -37,11 +63,23 @@ class DSv4MemoryCalculator:
         swa_ratio: float,
         is_speculative: bool = False,
         c4_shrink_factor: int = 1,
+        start_layer: int = 0,
+        end_layer: int | None = None,
     ):
         self.qk_nope_head_dim = model_config.qk_nope_head_dim
         self.qk_rope_head_dim = model_config.qk_rope_head_dim
         self.indexer_head_dim = model_config.index_head_dim
-        self.compression_ratios = model_config.compress_ratios
+        all_compression_ratios = model_config.compress_ratios
+        end_layer = (
+            len(all_compression_ratios) if end_layer is None else end_layer
+        )
+        if not 0 <= start_layer < end_layer <= len(all_compression_ratios):
+            raise ValueError(
+                "Invalid DeepSeek V4 pipeline layer range: "
+                f"[{start_layer}, {end_layer}) for "
+                f"{len(all_compression_ratios)} layers"
+            )
+        self.compression_ratios = all_compression_ratios[start_layer:end_layer]
         self.swa_page_size = model_config.window_size
         self.page_size = page_size
         self.swa_ratio = swa_ratio
@@ -127,13 +165,20 @@ class DSv4MemoryCalculator:
         return pool_sizes
 
     def get_pool_sizes_by_profiling(self, mr: ModelRunner) -> DSv4PoolSizes:
+        # ProcessGroupNCCL creates peer-to-peer communicators lazily on the
+        # first pipeline send. If the KV pool consumes nearly all free memory,
+        # that first real request can fail while NCCL allocates its channel
+        # buffers even though startup and graph capture succeeded. Exercise
+        # the exact forward PP edges before measuring cache capacity so those
+        # persistent allocations are included in the profile.
+        _preinitialize_pipeline_communicators(mr.device)
+
         available_bytes = profile_available_bytes(
             device=mr.device,
             gpu_id=mr.gpu_id,
             total_gpu_memory=mr.total_gpu_memory,
             mem_fraction_static=mr.mem_fraction_static,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+            distributed=False,
         )
 
         if self.is_speculative:
@@ -142,7 +187,40 @@ class DSv4MemoryCalculator:
             target_ratio = target_layers / (target_layers + draft_layers)
             available_bytes = int(available_bytes * target_ratio)
 
-        return self.calculate_pool_sizes(available_bytes)
+        local_pool_sizes = self.calculate_pool_sizes(available_bytes)
+        world_group = get_world_group()
+        if world_group.world_size == 1:
+            return local_pool_sizes
+
+        # PP stages can have different layer counts, bytes per token, and
+        # resident-weight footprints. Reducing raw free bytes makes the rank
+        # with a larger per-token cache spuriously smaller even when every
+        # stage can hold the requested context. Agree on token capacity
+        # instead, then let each stage allocate that capacity using its own
+        # bytes-per-token value.
+        common_full_tokens = torch.tensor(
+            local_pool_sizes.full_max_total_num_tokens,
+            dtype=torch.int64,
+        )
+        torch.distributed.all_reduce(
+            common_full_tokens,
+            op=torch.distributed.ReduceOp.MIN,
+            group=world_group.cpu_group,
+        )
+        common_full_token_count = int(common_full_tokens.item())
+        if (
+            common_full_token_count
+            == local_pool_sizes.full_max_total_num_tokens
+        ):
+            return local_pool_sizes
+
+        logger.info(
+            "DeepSeek V4 distributed token-capacity reduction: "
+            "local_full_token=%s, common_full_token=%s",
+            local_pool_sizes.full_max_total_num_tokens,
+            common_full_token_count,
+        )
+        return self.get_pool_sizes_by_configuration(common_full_token_count)
 
     def get_pool_sizes_by_configuration(self, max_total_tokens: int) -> DSv4PoolSizes:
         available_bytes = max_total_tokens * self.bytes_per_full_token

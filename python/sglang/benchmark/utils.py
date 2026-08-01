@@ -59,6 +59,24 @@ def get_tokenizer(
         pretrained_model_name_or_path
     ):
         pretrained_model_name_or_path = get_model(pretrained_model_name_or_path)
+
+    # New architectures can ship a completely standard fast tokenizer before
+    # their model config is registered in Transformers.  AutoTokenizer still
+    # tries AutoConfig first and makes bench_serving unusable even though
+    # tokenizer.json and tokenizer_config.json are self-contained.  Honor the
+    # explicit generic tokenizer class without loading the model config.
+    if os.path.isdir(pretrained_model_name_or_path):
+        tokenizer_config_path = os.path.join(
+            pretrained_model_name_or_path, "tokenizer_config.json"
+        )
+        if os.path.isfile(tokenizer_config_path):
+            with open(tokenizer_config_path, encoding="utf-8") as tokenizer_file:
+                tokenizer_config = json.load(tokenizer_file)
+            if tokenizer_config.get("tokenizer_class") == "PreTrainedTokenizerFast":
+                return PreTrainedTokenizerFast.from_pretrained(
+                    pretrained_model_name_or_path
+                )
+
     return AutoTokenizer.from_pretrained(
         pretrained_model_name_or_path, trust_remote_code=True
     )

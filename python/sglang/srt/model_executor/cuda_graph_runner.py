@@ -133,6 +133,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
+        pp_proxy_tensor_specs: Optional[Dict[str, tuple[int, ...]]] = None,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -161,9 +162,13 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
+                specs = pp_proxy_tensor_specs or {
+                    "hidden_states": (hidden_size,),
+                    "residual": (hidden_size,),
+                }
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hidden_size), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
+                    name: torch.zeros((max_bs, *shape), dtype=dtype)
+                    for name, shape in specs.items()
                 }
             else:
                 pp_proxy_tensors = None
@@ -552,6 +557,9 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            pp_proxy_tensor_specs=getattr(
+                self.model_runner.model, "pp_proxy_tensor_specs", None
+            ),
         )
         self.buffers.share_buffers()
 

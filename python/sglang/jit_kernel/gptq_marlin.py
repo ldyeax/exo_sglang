@@ -6,6 +6,11 @@ import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit, make_cpp_args
 
+try:
+    from sgl_kernel import gptq_marlin_gemm as _aot_gptq_marlin_gemm
+except ImportError:
+    _aot_gptq_marlin_gemm = None
+
 if TYPE_CHECKING:
     from sgl_kernel.scalar_type import ScalarType
     from tvm_ffi.module import Module
@@ -50,6 +55,31 @@ def gptq_marlin_gemm(
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
 ) -> torch.Tensor:
+    # The matching SGL-Kernel wheel exports this operator with the same typed
+    # interface. Prefer it to avoid compiling another CUDA-runtime stub per
+    # dtype during server graph capture; those independently interposed stubs
+    # cannot all resolve PyTorch's locally scoped libcudart on SM86.
+    if _aot_gptq_marlin_gemm is not None:
+        return _aot_gptq_marlin_gemm(
+            a,
+            c,
+            b_q_weight,
+            b_scales,
+            global_scale,
+            b_zeros,
+            g_idx,
+            perm,
+            workspace,
+            b_q_type,
+            size_m,
+            size_n,
+            size_k,
+            is_k_full,
+            use_atomic_add,
+            use_fp32_reduce,
+            is_zp_float,
+        )
+
     device = a.device
 
     # Allocate output if not provided

@@ -6,6 +6,11 @@ import torch
 
 from sglang.jit_kernel.utils import cache_once, load_jit
 
+try:
+    from sgl_kernel import gptq_marlin_repack as _aot_gptq_marlin_repack
+except ImportError:
+    _aot_gptq_marlin_repack = None
+
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
@@ -29,6 +34,16 @@ def gptq_marlin_repack(
     size_n: int,
     num_bits: int,
 ) -> torch.Tensor:
+    # Prefer the prebuilt SGL-Kernel implementation when the installed wheel
+    # exports it. Besides avoiding redundant startup compilation, this keeps
+    # Ampere deployments independent of TileLang's CUDA-runtime stub loader,
+    # which cannot discover libcudart when its own interposed symbols precede
+    # PyTorch's locally loaded CUDA runtime in the dynamic-linker scope.
+    if _aot_gptq_marlin_repack is not None:
+        return _aot_gptq_marlin_repack(
+            b_q_weight, perm, size_k, size_n, num_bits
+        )
+
     pack_factor = 32 // num_bits
 
     # Allocate output tensor
