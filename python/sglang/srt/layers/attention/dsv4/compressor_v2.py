@@ -205,13 +205,18 @@ class CompressorBackendMixin:
         forward_batch: ForwardBatch,
         layer_id: int,
         compressor: Compressor,
+        kv_score_output: Optional[torch.Tensor] = None,
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
 
         token_to_kv_pool = self.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
-        kv_score_input = compressor.compute_kv_score(x, forward_batch)
+        kv_score_input = compressor.compute_kv_score(
+            x,
+            forward_batch,
+            output=kv_score_output,
+        )
 
         state_pool = compressor.get_state_pool(self)
         from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate import (
@@ -233,7 +238,15 @@ class CompressorBackendMixin:
             )
             bf16_store = False
             if compressor.is_in_indexer:
-                kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
+                if token_to_kv_pool.c4_indexer_kv_pool.use_bf16_cache:
+                    kv_cache = token_to_kv_pool.get_index_k_bf16_buffer(
+                        layer_id
+                    ).flatten(1)
+                    bf16_store = True
+                else:
+                    kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
+                        layer_id
+                    )
                 page_size = token_to_kv_pool.get_index_k_page_size()
                 bf16_store = token_to_kv_pool.c4_indexer_kv_pool.use_bf16_cache
             elif is_unified_kv_triton():

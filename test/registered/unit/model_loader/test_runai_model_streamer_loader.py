@@ -6,11 +6,10 @@ from types import SimpleNamespace
 from typing import cast
 from unittest.mock import patch
 
-import torch
-
 import sglang.srt.model_loader.loader as loader_mod
 import sglang.srt.model_loader.utils as model_loader_utils
 import sglang.srt.model_loader.weight_utils as weight_utils
+import torch
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.configs.model_config import ModelConfig

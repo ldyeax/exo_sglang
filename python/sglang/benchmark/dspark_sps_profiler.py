@@ -1160,7 +1160,12 @@ def build_additive_table_from_cells(*, cells: list[dict]) -> SpsAdditiveCostTabl
     )
 
 
-def ols_resid_backfit(cells: list, mbin_w: int = 64):
+def ols_resid_backfit(cells: list, mbin_w: int = 1):
+    # M is an exact replay-graph tier, not merely a noisy continuous load
+    # measure.  Binning by 64 collapses every single-stream DSpark tier
+    # (normally M=1..gamma+1) into M=0 and erases the measured cost curve.
+    # Keep exact observed tiers; callers that deliberately profile broad,
+    # noisy aggregate loads can still request a coarser bin explicitly.
     def mbin(m):
         return round(m / mbin_w) * mbin_w
 

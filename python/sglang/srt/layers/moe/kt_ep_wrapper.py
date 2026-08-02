@@ -32,8 +32,10 @@ import ctypes
 import json
 import logging
 import os
+import re
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from pathlib import Path
@@ -49,6 +51,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.layers.quantization.marlin_utils import marlin_permute_scales
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_compiler_backend, is_cuda
 
 if is_cuda():
@@ -76,6 +79,21 @@ logger = logging.getLogger(__name__)
 
 # Global cache for GPU experts masks (initialized once per session)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
+_KT_PROFILE_MASKS: dict[tuple[str, int, int, int], torch.Tensor] = {}
+_KT_GPU_EXPERT_MASK_PLANS: dict[str, torch.Tensor] = {}
+_KT_CPU_EXPERT_SHARD_PLANS: dict[str, tuple[torch.Tensor, ...]] = {}
+_KT_REMOTE_EXPERT_PLANS: dict[str, torch.Tensor] = {}
+_KT_REMOTE_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="kt-remote-tier",
+)
+
+
+@dataclass(frozen=True)
+class _KTRemotePending:
+    prepared_tiers: tuple[tuple, ...]
+    futures: tuple[Future[torch.Tensor], ...]
+    token_count: int
 
 
 @dataclass
@@ -110,6 +128,11 @@ class KTConfig:
     gpu_prefill_token_threshold: Optional[int] = None
     kt_enable_dynamic_expert_update: bool = False
     expert_lora_path: Optional[str] = None
+    weight_key_prefix: Optional[str] = None
+    cpu_expert_ids: Optional[torch.Tensor] = None
+    global_num_experts: Optional[int] = None
+    remote_expert_id_tiers: Optional[tuple[torch.Tensor, ...]] = None
+    remote_expert_endpoints: Optional[tuple[str, ...]] = None
 
 
 @dataclass
@@ -223,9 +246,7 @@ def _load_kt_expert_lora_weights(
             weight_file_str, device="cpu"
         )
     state_dict = _KT_LORA_STATE_DICT_CACHE[weight_file_str]
-    sample = _get_expert_lora_tensor(
-        state_dict, layer_idx, 0, "gate_proj", "lora_A"
-    )
+    sample = _get_expert_lora_tensor(state_dict, layer_idx, 0, "gate_proj", "lora_A")
     rank = rank_from_config or int(sample.shape[0])
     if int(sample.shape[0]) != rank:
         raise ValueError(
@@ -237,12 +258,24 @@ def _load_kt_expert_lora_weights(
     # KT SFT CPU kernels consume raw host pointers, so these adapter staging
     # buffers must be explicitly allocated on CPU.
     device = torch.device("cpu")
-    gate_lora_a = torch.zeros((num_experts, rank, hidden_size), dtype=dtype, device=device)
-    gate_lora_b = torch.zeros((num_experts, moe_intermediate_size, rank), dtype=dtype, device=device)
-    up_lora_a = torch.zeros((num_experts, rank, hidden_size), dtype=dtype, device=device)
-    up_lora_b = torch.zeros((num_experts, moe_intermediate_size, rank), dtype=dtype, device=device)
-    down_lora_a = torch.zeros((num_experts, rank, moe_intermediate_size), dtype=dtype, device=device)
-    down_lora_b = torch.zeros((num_experts, hidden_size, rank), dtype=dtype, device=device)
+    gate_lora_a = torch.zeros(
+        (num_experts, rank, hidden_size), dtype=dtype, device=device
+    )
+    gate_lora_b = torch.zeros(
+        (num_experts, moe_intermediate_size, rank), dtype=dtype, device=device
+    )
+    up_lora_a = torch.zeros(
+        (num_experts, rank, hidden_size), dtype=dtype, device=device
+    )
+    up_lora_b = torch.zeros(
+        (num_experts, moe_intermediate_size, rank), dtype=dtype, device=device
+    )
+    down_lora_a = torch.zeros(
+        (num_experts, rank, moe_intermediate_size), dtype=dtype, device=device
+    )
+    down_lora_b = torch.zeros(
+        (num_experts, hidden_size, rank), dtype=dtype, device=device
+    )
 
     targets = [
         ("gate_proj", "lora_A", gate_lora_a),
@@ -425,6 +458,7 @@ class SharedFullContext:
                 DeepSeekMxfp4MoEMethod,
             )
             from sglang.srt.server_args import get_global_server_args
+
             _v4_env = _os_v4.environ.get("SGLANG_V4_USE_TRITON_KERNELS")
             if _v4_env == "1":
                 _do_v4_wrap = True
@@ -432,8 +466,8 @@ class SharedFullContext:
                 _do_v4_wrap = False
             else:
                 _do_v4_wrap = (
-                    (get_global_server_args().kt_method or "").upper() == "MXFP4"
-                )
+                    get_global_server_args().kt_method or ""
+                ).upper() == "MXFP4"
             if _do_v4_wrap and isinstance(self.gpu_method, Fp8MoEMethod):
                 self.gpu_method = DeepSeekMxfp4MoEMethod(self.gpu_method, prefix="")
         except Exception as _v4_tk_wrap_exc:
@@ -457,8 +491,13 @@ class SharedFullContext:
         # always sees the original quant type even if a Marlin repack
         # later renames attributes (e.g. _inv → _weight_scale).
         self._detect_quant_type_from_created_weights()
-        for _attr in ("is_mxfp4_quant", "is_mxfp8_quant", "is_fp8_quant",
-                       "is_fp8_channel_quant", "is_bf16_quant"):
+        for _attr in (
+            "is_mxfp4_quant",
+            "is_mxfp8_quant",
+            "is_fp8_quant",
+            "is_fp8_channel_quant",
+            "is_bf16_quant",
+        ):
             if hasattr(self, _attr):
                 setattr(self, f"_{_attr}", getattr(self, _attr))
 
@@ -562,7 +601,9 @@ class SharedFullContext:
             return
 
         # FP8 block
-        if hasattr(layer, "w13_weight_scale_inv") and hasattr(layer, "w2_weight_scale_inv"):
+        if hasattr(layer, "w13_weight_scale_inv") and hasattr(
+            layer, "w2_weight_scale_inv"
+        ):
             self.is_mxfp4_quant = False
             self.is_mxfp8_quant = False
             self.is_fp8_quant = True
@@ -791,9 +832,9 @@ class SharedFullContext:
             gpu_tensor = getattr(self.gpu_layer, name)
             # Only allocate 2 experts worth of buffer (double buffering)
             expert_shape = gpu_tensor.shape[1:]  # Shape per expert
-            if (
-                getattr(self, "_is_mxfp4_quant", False)
-                and name in ("w13_weight_scale_inv", "w2_weight_scale_inv")
+            if getattr(self, "_is_mxfp4_quant", False) and name in (
+                "w13_weight_scale_inv",
+                "w2_weight_scale_inv",
             ):
                 buf_dtype = torch.bfloat16
             else:
@@ -1052,8 +1093,13 @@ class SharedFullContext:
         w13_p.set_(w13_p.view(num_experts, w13_k // 16, w13_n * (num_bits // 2)))
         w2_p.set_(w2_p.view(num_experts, w2_k // 16, w2_n * (num_bits // 2)))
 
-    def _prepare_weight_fp8(self, wrapper, original_layer=None, gpu_experts_mask=None,
-                            logical_to_gpu_index=None):
+    def _prepare_weight_fp8(
+        self,
+        wrapper,
+        original_layer=None,
+        gpu_experts_mask=None,
+        logical_to_gpu_index=None,
+    ):
         """Prepare FP8 block quant weights by writing from KT and copying to GPU.
 
         Pipeline: write(e+1) || copy(e) || postprocess(e-1)
@@ -1092,7 +1138,11 @@ class SharedFullContext:
         # Separate GPU experts (direct copy) from CPU experts (KT transfer)
         gpu_expert_ids = []
         cpu_expert_ids = []
-        if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
+        if (
+            gpu_experts_mask is not None
+            and original_layer is not None
+            and logical_to_gpu_index is not None
+        ):
             for e in range(num_experts):
                 if gpu_experts_mask[e].item():
                     gpu_expert_ids.append(e)
@@ -1221,8 +1271,13 @@ class SharedFullContext:
     # NOTE: DeepGemm ue8m0 conversion is not used in KT fallback path.
     # The conversion is handled separately in the normal weight loading path.
 
-    def _prepare_weight_mxfp8(self, wrapper, original_layer=None, gpu_experts_mask=None,
-                              logical_to_gpu_index=None):
+    def _prepare_weight_mxfp8(
+        self,
+        wrapper,
+        original_layer=None,
+        gpu_experts_mask=None,
+        logical_to_gpu_index=None,
+    ):
         """Byte-copy M3 MXFP8 weights from CPU staging buffer to GPU for the
         full-GPU layerwise prefill fallback.
 
@@ -1253,8 +1308,13 @@ class SharedFullContext:
             logical_to_gpu_index=None,
         )
 
-    def _prepare_weight_mxfp4(self, wrapper, original_layer=None, gpu_experts_mask=None,
-                              logical_to_gpu_index=None):
+    def _prepare_weight_mxfp4(
+        self,
+        wrapper,
+        original_layer=None,
+        gpu_experts_mask=None,
+        logical_to_gpu_index=None,
+    ):
         """Prepare V4-Flash MXFP4 weights for the full-GPU prefill fallback.
 
         V4-Flash MXFP4 routed-experts share flat attribute names with FP8 block
@@ -1297,8 +1357,13 @@ class SharedFullContext:
             torch.cuda.synchronize()
         self.gpu_method.process_weights_after_loading(self.gpu_layer)
 
-    def _prepare_weight_fp8_channel(self, wrapper, original_layer=None, gpu_experts_mask=None,
-                                     logical_to_gpu_index=None):
+    def _prepare_weight_fp8_channel(
+        self,
+        wrapper,
+        original_layer=None,
+        gpu_experts_mask=None,
+        logical_to_gpu_index=None,
+    ):
         """Prepare FP8 per-channel quant weights by writing from KT and copying to GPU.
 
         Pipeline: write(e+1) || copy(e) || postprocess(e-1)
@@ -1340,7 +1405,11 @@ class SharedFullContext:
         # Separate GPU experts (direct copy) from CPU experts (KT transfer)
         gpu_expert_ids = []
         cpu_expert_ids = []
-        if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
+        if (
+            gpu_experts_mask is not None
+            and original_layer is not None
+            and logical_to_gpu_index is not None
+        ):
             for e in range(num_experts):
                 if gpu_experts_mask[e].item():
                     gpu_expert_ids.append(e)
@@ -1466,8 +1535,13 @@ class SharedFullContext:
 
         torch.cuda.current_stream(device).wait_stream(post_stream)
 
-    def _prepare_weight_bf16(self, wrapper, original_layer=None, gpu_experts_mask=None,
-                             logical_to_gpu_index=None):
+    def _prepare_weight_bf16(
+        self,
+        wrapper,
+        original_layer=None,
+        gpu_experts_mask=None,
+        logical_to_gpu_index=None,
+    ):
         """Prepare BF16/unquantized weights by writing from KT and copying to GPU.
 
         Pipeline: write(e+1) || copy(e) || postprocess(e-1)
@@ -1505,7 +1579,11 @@ class SharedFullContext:
         # Separate GPU experts (direct copy) from CPU experts (KT transfer)
         gpu_expert_ids = []
         cpu_expert_ids = []
-        if gpu_experts_mask is not None and original_layer is not None and logical_to_gpu_index is not None:
+        if (
+            gpu_experts_mask is not None
+            and original_layer is not None
+            and logical_to_gpu_index is not None
+        ):
             for e in range(num_experts):
                 if gpu_experts_mask[e].item():
                     gpu_expert_ids.append(e)
@@ -1631,11 +1709,22 @@ class SharedFullContext:
         for _sn, (_shape, _dtype, _device) in self._raw_weight_shapes.items():
             _cur = getattr(self.gpu_layer, _sn, None)
             if _cur is None or _cur.shape != _shape or _cur.dtype != _dtype:
-                setattr(self.gpu_layer, _sn,
-                        torch.nn.Parameter(
-                            torch.empty(_shape, dtype=_dtype, device=_device)))
-    def load(self, layer_idx, wrapper, original_layer=None, gpu_experts_mask=None,
-             logical_to_gpu_index=None):
+                setattr(
+                    self.gpu_layer,
+                    _sn,
+                    torch.nn.Parameter(
+                        torch.empty(_shape, dtype=_dtype, device=_device)
+                    ),
+                )
+
+    def load(
+        self,
+        layer_idx,
+        wrapper,
+        original_layer=None,
+        gpu_experts_mask=None,
+        logical_to_gpu_index=None,
+    ):
         """Load weights from disk to GPU via shared memory.
 
         Args:
@@ -1664,27 +1753,32 @@ class SharedFullContext:
         if getattr(self, "_is_mxfp4_quant", False):
             # V4-Flash MXFP4: byte-copy via FP8 path + re-swizzle into
             # triton_kernels form. Origin: sglang 本身.
-            self._prepare_weight_mxfp4(wrapper, original_layer, gpu_experts_mask,
-                                       logical_to_gpu_index)
+            self._prepare_weight_mxfp4(
+                wrapper, original_layer, gpu_experts_mask, logical_to_gpu_index
+            )
         elif getattr(self, "_is_mxfp8_quant", False):
             # M3 MXFP8: byte-copy via FP8 path with original_layer=None
             # (Phase 1 shortcut disabled) + Triton MXFP8->block-FP8 convert
             # on shadow gpu_layer so apply() runs the standard block-FP8
             # deep_gemm path. Origin: kt-sglang 耦合 (v2 bridge).
-            self._prepare_weight_mxfp8(wrapper, original_layer, gpu_experts_mask,
-                                       logical_to_gpu_index)
+            self._prepare_weight_mxfp8(
+                wrapper, original_layer, gpu_experts_mask, logical_to_gpu_index
+            )
         elif self._is_fp8_quant:
             # When the inference layer is Marlin-repacked (int32), the
             # raw fp8 context layer can't share GPU→GPU copies.
             # Disable Phase 1 shortcut by passing original_layer=None.
-            self._prepare_weight_fp8(wrapper, None, gpu_experts_mask,
-                                     logical_to_gpu_index)
+            self._prepare_weight_fp8(
+                wrapper, None, gpu_experts_mask, logical_to_gpu_index
+            )
         elif self._is_fp8_channel_quant:
-            self._prepare_weight_fp8_channel(wrapper, None, gpu_experts_mask,
-                                             logical_to_gpu_index)
+            self._prepare_weight_fp8_channel(
+                wrapper, None, gpu_experts_mask, logical_to_gpu_index
+            )
         elif self._is_bf16_quant:
-            self._prepare_weight_bf16(wrapper, original_layer, gpu_experts_mask,
-                                      logical_to_gpu_index)
+            self._prepare_weight_bf16(
+                wrapper, original_layer, gpu_experts_mask, logical_to_gpu_index
+            )
         else:
             # INT4 Marlin format: write(e+1) || copy(e) || postprocess(e-1)
             self._prepare_weight_int4(wrapper)
@@ -1700,6 +1794,313 @@ class SharedFullContext:
                 layer_idx,
                 total_time,
             )
+
+
+def _get_hf_config(server_args: "ServerArgs"):
+    get_hf_config = getattr(server_args, "get_hf_config", None)
+    hf_config = (
+        get_hf_config()
+        if get_hf_config is not None
+        else server_args.get_model_config().hf_config
+    )
+    return getattr(hf_config, "text_config", None) or hf_config
+
+
+def load_remote_expert_plan(
+    plan_path: str,
+    *,
+    num_experts: int,
+) -> torch.Tensor:
+    """Load one validated [layers, experts] sidecar placement plan."""
+    real_path = os.path.realpath(plan_path)
+    cached = _KT_REMOTE_EXPERT_PLANS.get(real_path)
+    if cached is not None:
+        return cached
+    loaded = torch.load(real_path, map_location="cpu", weights_only=True)
+    if not isinstance(loaded, dict) or "remote_expert_ids" not in loaded:
+        raise ValueError(
+            "KTransformers remote expert plan must contain "
+            f"'remote_expert_ids': {real_path}"
+        )
+    raw_ids = loaded["remote_expert_ids"]
+    expert_ids = (
+        raw_ids.to(device="cpu", dtype=torch.int64).contiguous()
+        if isinstance(raw_ids, torch.Tensor)
+        else torch.as_tensor(raw_ids, dtype=torch.int64).contiguous()
+    )
+    if expert_ids.ndim != 2 or expert_ids.shape[1] == 0:
+        raise ValueError(
+            "KTransformers remote expert IDs must have non-empty shape "
+            f"[layers, experts], got {tuple(expert_ids.shape)}"
+        )
+    if expert_ids.numel() and (
+        int(expert_ids.min()) < 0 or int(expert_ids.max()) >= num_experts
+    ):
+        raise ValueError(
+            f"KTransformers remote expert plan contains an ID outside [0, {num_experts})"
+        )
+    for layer_idx, layer_ids in enumerate(expert_ids):
+        if torch.unique(layer_ids).numel() != layer_ids.numel():
+            raise ValueError(
+                "KTransformers remote expert IDs must be unique within "
+                f"layer {layer_idx}"
+            )
+    _KT_REMOTE_EXPERT_PLANS[real_path] = expert_ids
+    return expert_ids
+
+
+def load_cpu_expert_shard_plan(
+    plan_path: str,
+    *,
+    num_layers: int,
+    num_experts: int,
+    ep_size: int,
+    ep_rank: int,
+) -> torch.Tensor:
+    """Load a lossless, variable-width native CPU expert partition."""
+    real_path = os.path.realpath(plan_path)
+    shards = _KT_CPU_EXPERT_SHARD_PLANS.get(real_path)
+    if shards is None:
+        loaded = torch.load(real_path, map_location="cpu", weights_only=True)
+        raw_shards = (
+            loaded.get("expert_ids_by_rank") if isinstance(loaded, dict) else None
+        )
+        if not isinstance(raw_shards, (list, tuple)):
+            raise ValueError(
+                "KTransformers CPU expert shard plan must contain "
+                f"'expert_ids_by_rank': {real_path}"
+            )
+        shards = tuple(
+            shard.to(device="cpu", dtype=torch.int64).contiguous()
+            if isinstance(shard, torch.Tensor)
+            else torch.as_tensor(shard, dtype=torch.int64).contiguous()
+            for shard in raw_shards
+        )
+        _KT_CPU_EXPERT_SHARD_PLANS[real_path] = shards
+    if len(shards) != ep_size or not 0 <= ep_rank < ep_size:
+        raise ValueError(
+            "KTransformers CPU expert shard rank count does not match EP: "
+            f"plan={len(shards)} ep_rank={ep_rank} ep_size={ep_size}"
+        )
+    expected = torch.arange(num_experts, dtype=torch.int64)
+    for rank, shard in enumerate(shards):
+        if shard.ndim != 2 or shard.shape[0] < num_layers:
+            raise ValueError(
+                f"KTransformers CPU shard rank {rank} has invalid shape {tuple(shard.shape)}"
+            )
+    for layer_idx in range(num_layers):
+        assigned = torch.cat([shard[layer_idx] for shard in shards])
+        if assigned.numel() != num_experts or not torch.equal(
+            torch.sort(assigned).values, expected
+        ):
+            raise ValueError(
+                "KTransformers CPU expert shards must form an exact, disjoint "
+                f"partition at layer {layer_idx}"
+            )
+    return shards[ep_rank][:num_layers].contiguous()
+
+
+def build_logical_to_gpu_index(gpu_experts_mask: torch.Tensor) -> torch.Tensor:
+    """Map global logical IDs to compact GPU-weight indices."""
+    if gpu_experts_mask.ndim != 1 or gpu_experts_mask.dtype != torch.bool:
+        raise ValueError("gpu_experts_mask must be a one-dimensional bool tensor")
+    gpu_ids = torch.where(gpu_experts_mask.to(device="cpu"))[0]
+    mapping = torch.full((gpu_experts_mask.numel(),), -1, dtype=torch.int32)
+    mapping[gpu_ids] = torch.arange(gpu_ids.numel(), dtype=torch.int32)
+    return mapping
+
+
+def partition_remote_local_gpu_experts(
+    gpu_experts_mask: torch.Tensor,
+    remote_expert_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Make GPU, sidecar, and local-CPU ownership disjoint."""
+    if gpu_experts_mask.ndim != 1 or gpu_experts_mask.dtype != torch.bool:
+        raise ValueError("gpu_experts_mask must be a one-dimensional bool tensor")
+    remote_ids = remote_expert_ids.to(device="cpu", dtype=torch.int64).contiguous()
+    if remote_ids.ndim != 1:
+        raise ValueError("remote_expert_ids must be one-dimensional")
+    num_experts = gpu_experts_mask.numel()
+    if remote_ids.numel() and (
+        int(remote_ids.min()) < 0 or int(remote_ids.max()) >= num_experts
+    ):
+        raise ValueError(f"remote_expert_ids contains an ID outside [0, {num_experts})")
+    if torch.unique(remote_ids).numel() != remote_ids.numel():
+        raise ValueError("remote_expert_ids must be unique")
+    disjoint_gpu_mask = gpu_experts_mask.to(device="cpu").clone()
+    disjoint_gpu_mask[remote_ids] = False
+    local_mask = ~disjoint_gpu_mask
+    local_mask[remote_ids] = False
+    local_ids = torch.arange(num_experts, dtype=torch.int64)[local_mask]
+    return disjoint_gpu_mask, local_ids
+
+
+def combine_remote_expert_tiers(
+    remote_expert_id_tiers: tuple[torch.Tensor, ...],
+    *,
+    num_experts: int,
+) -> torch.Tensor:
+    """Validate disjoint sidecar tiers and return their global-ID union."""
+    tiers = tuple(
+        tier.to(device="cpu", dtype=torch.int64).contiguous()
+        for tier in remote_expert_id_tiers
+    )
+    for tier_idx, tier in enumerate(tiers):
+        if tier.ndim != 1:
+            raise ValueError(f"remote expert tier {tier_idx} must be one-dimensional")
+        if tier.numel() and (int(tier.min()) < 0 or int(tier.max()) >= num_experts):
+            raise ValueError(
+                f"remote expert tier {tier_idx} contains an ID outside [0, {num_experts})"
+            )
+        if torch.unique(tier).numel() != tier.numel():
+            raise ValueError(
+                f"remote expert tier {tier_idx} contains duplicate experts"
+            )
+    if not tiers:
+        return torch.empty(0, dtype=torch.int64)
+    combined = torch.cat(tiers)
+    if torch.unique(combined).numel() != combined.numel():
+        raise ValueError("remote expert tiers must be disjoint")
+    return combined
+
+
+def load_profile_guided_gpu_expert_masks(
+    profile_path: str,
+    *,
+    num_layers: int,
+    num_experts: int,
+    num_gpu_experts_per_layer: int,
+) -> torch.Tensor:
+    """Select globally hottest expert slots from a route profile."""
+    cache_key = (
+        os.path.realpath(profile_path),
+        num_layers,
+        num_experts,
+        num_gpu_experts_per_layer,
+    )
+    cached = _KT_PROFILE_MASKS.get(cache_key)
+    if cached is not None:
+        return cached
+    loaded = torch.load(profile_path, map_location="cpu", weights_only=True)
+    counts = loaded.get("logical_count") if isinstance(loaded, dict) else loaded
+    if not isinstance(counts, torch.Tensor):
+        raise TypeError("KTransformers expert profile logical_count must be a tensor")
+    expected_shape = (num_layers, num_experts)
+    if counts.ndim == 3 and tuple(counts.shape[1:]) == expected_shape:
+        frequency = counts.sum(dim=0).float()
+    elif counts.ndim == 2 and tuple(counts.shape) == expected_shape:
+        frequency = counts.float()
+    else:
+        raise ValueError(
+            "KTransformers expert profile must have shape "
+            f"{expected_shape} or [samples, {num_layers}, {num_experts}], "
+            f"got {tuple(counts.shape)}"
+        )
+    requested = num_gpu_experts_per_layer * num_layers
+    if not 0 <= requested <= num_layers * num_experts:
+        raise ValueError("Requested GPU expert count is outside the model")
+    masks = generate_gpu_experts_masks(frequency, requested).to(
+        device="cpu", dtype=torch.bool
+    )
+    if tuple(masks.shape) != expected_shape:
+        raise RuntimeError(
+            f"kt_kernel returned mask shape {tuple(masks.shape)}, expected {expected_shape}"
+        )
+    _KT_PROFILE_MASKS[cache_key] = masks
+    return masks
+
+
+def load_gpu_expert_mask_plan(
+    plan_path: str,
+    *,
+    num_layers: int,
+    num_experts: int,
+) -> torch.Tensor:
+    """Load an explicit variable-width logical GPU expert mask."""
+    real_path = os.path.realpath(plan_path)
+    cached = _KT_GPU_EXPERT_MASK_PLANS.get(real_path)
+    if cached is not None:
+        return cached
+    loaded = torch.load(real_path, map_location="cpu", weights_only=True)
+    raw_masks = loaded.get("gpu_experts_mask") if isinstance(loaded, dict) else None
+    if raw_masks is None:
+        raise ValueError(
+            "KTransformers GPU expert mask plan must contain "
+            f"'gpu_experts_mask': {real_path}"
+        )
+    masks = (
+        raw_masks.to(device="cpu", dtype=torch.bool).contiguous()
+        if isinstance(raw_masks, torch.Tensor)
+        else torch.as_tensor(raw_masks, dtype=torch.bool).contiguous()
+    )
+    expected_shape = (num_layers, num_experts)
+    if tuple(masks.shape) != expected_shape:
+        raise ValueError(
+            f"KTransformers GPU expert mask must have shape {expected_shape}, "
+            f"got {tuple(masks.shape)}"
+        )
+    _KT_GPU_EXPERT_MASK_PLANS[real_path] = masks
+    return masks
+
+
+def resolve_gpu_experts_mask(
+    server_args: "ServerArgs",
+    *,
+    layer_idx: int,
+    weight_key_prefix: Optional[str],
+) -> torch.Tensor:
+    """Resolve target or draft placement in global logical-ID space."""
+    hf_config = _get_hf_config(server_args)
+    num_layers = int(hf_config.num_hidden_layers)
+    num_experts = int(
+        getattr(
+            hf_config,
+            "n_routed_experts",
+            getattr(
+                hf_config, "num_experts", getattr(hf_config, "num_local_experts", 0)
+            ),
+        )
+    )
+    if num_experts <= 0:
+        raise ValueError("Unable to determine the model's routed expert count")
+    if weight_key_prefix is not None:
+        draft_count = int(os.environ.get("SGLANG_KT_DRAFT_GPU_EXPERTS", "0"))
+        if not 0 <= draft_count <= num_experts:
+            raise ValueError("SGLANG_KT_DRAFT_GPU_EXPERTS is outside the model")
+        return torch.arange(num_experts, dtype=torch.int64) < draft_count
+    mask_plan = os.environ.get("SGLANG_KT_GPU_EXPERT_MASK_PLAN")
+    profile = os.environ.get("SGLANG_KT_EXPERT_PROFILE")
+    if mask_plan and profile:
+        raise ValueError(
+            "SGLANG_KT_GPU_EXPERT_MASK_PLAN and SGLANG_KT_EXPERT_PROFILE "
+            "are mutually exclusive"
+        )
+    requested = getattr(server_args, "kt_num_gpu_experts", None)
+    if requested is None:
+        raise ValueError("--kt-num-gpu-experts is required with --kt-weight-path")
+    if mask_plan:
+        masks = load_gpu_expert_mask_plan(
+            mask_plan, num_layers=num_layers, num_experts=num_experts
+        )
+        return masks[layer_idx].clone()
+    if profile:
+        masks = load_profile_guided_gpu_expert_masks(
+            profile,
+            num_layers=num_layers,
+            num_experts=num_experts,
+            num_gpu_experts_per_layer=requested,
+        )
+        return masks[layer_idx].clone()
+    if not dist.is_initialized():
+        if requested == -1:
+            return torch.ones(num_experts, dtype=torch.bool, device="cpu")
+        if not 0 <= requested <= num_experts:
+            raise ValueError(f"--kt-num-gpu-experts must be in [-1, {num_experts}]")
+        return torch.arange(num_experts, dtype=torch.int64, device="cpu") < requested
+    masks = _init_kt_gpu_experts_masks(server_args)
+    if masks is None:
+        raise ValueError("Unable to initialize KTransformers GPU expert masks")
+    return masks[layer_idx].clone()
 
 
 def generate_front_loading_masks(
@@ -1761,7 +2162,8 @@ def generate_uniform_masks(
 
     # Identify MoE layers
     moe_layers = [
-        i for i in range(num_layers)
+        i
+        for i in range(num_layers)
         if i >= first_k_dense_replace and i % moe_layer_freq == 0
     ]
     num_moe_layers = len(moe_layers)
@@ -1820,10 +2222,12 @@ def generate_random_masks(
 
     # Randomly select positions
     if len(moe_positions) > 0:
-        rng = torch.Generator(device='cpu')
+        rng = torch.Generator(device="cpu")
         rng.manual_seed(seed)
         num_to_select = min(num_gpu_experts, len(moe_positions))
-        selected_indices = torch.randperm(len(moe_positions), generator=rng, device='cpu')[:num_to_select]
+        selected_indices = torch.randperm(
+            len(moe_positions), generator=rng, device="cpu"
+        )[:num_to_select]
 
         for idx in selected_indices:
             layer_idx, expert_idx = moe_positions[idx]
@@ -1903,7 +2307,8 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
 
     # Count actual MoE layers
     num_moe_layers = sum(
-        1 for i in range(num_layers)
+        1
+        for i in range(num_layers)
         if i >= first_k_dense_replace and i % moe_layer_freq == 0
     )
     total_experts = num_moe_layers * num_experts
@@ -1911,13 +2316,17 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         "[kt-mask] num_layers=%d num_experts=%d first_k_dense_replace=%s (type=%s) "
         "moe_layer_freq=%s (type=%s) computed_num_moe_layers=%d "
         "hf_config_class=%s.%s num_hash_layers=%s n_hash_layers=%s",
-        num_layers, num_experts,
-        first_k_dense_replace, type(first_k_dense_replace).__name__,
-        moe_layer_freq, type(moe_layer_freq).__name__,
+        num_layers,
+        num_experts,
+        first_k_dense_replace,
+        type(first_k_dense_replace).__name__,
+        moe_layer_freq,
+        type(moe_layer_freq).__name__,
         num_moe_layers,
-        type(hf_config).__module__, type(hf_config).__name__,
-        getattr(hf_config, 'num_hash_layers', '<missing>'),
-        getattr(hf_config, 'n_hash_layers', '<missing>'),
+        type(hf_config).__module__,
+        type(hf_config).__name__,
+        getattr(hf_config, "num_hash_layers", "<missing>"),
+        getattr(hf_config, "n_hash_layers", "<missing>"),
     )
 
     # Determine num_gpu_experts (total across all layers)
@@ -1947,7 +2356,9 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             f"(= {server_args.kt_num_gpu_experts} × {num_moe_layers} MoE layers)"
         )
     else:
-        logger.warning("Either kt_num_gpu_experts or kt_gpu_experts_ratio is required but not set.")
+        logger.warning(
+            "Either kt_num_gpu_experts or kt_gpu_experts_ratio is required but not set."
+        )
         return None
 
     # Get GPU expert placement strategy
@@ -1993,7 +2404,9 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
                     f"model num_experts ({num_experts})"
                 )
             # Sum across buffer_size (dim0) to get total activation counts per expert
-            activation_freq = activation_counts.sum(dim=0).float()  # [num_layers, num_experts]
+            activation_freq = activation_counts.sum(
+                dim=0
+            ).float()  # [num_layers, num_experts]
             logger.info("Using frequency-based strategy with activation frequency data")
         else:
             # No activation frequency file, use zeros (uniform distribution)
@@ -2004,7 +2417,10 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             activation_freq = torch.zeros(num_layers, num_experts, dtype=torch.float32)
             # For layers that are actually MoE layers, set uniform distribution
             for layer_idx in range(num_layers):
-                if layer_idx >= first_k_dense_replace and layer_idx % moe_layer_freq == 0:
+                if (
+                    layer_idx >= first_k_dense_replace
+                    and layer_idx % moe_layer_freq == 0
+                ):
                     activation_freq[layer_idx, :] = 1.0
 
         # Generate masks on rank 0
@@ -2021,8 +2437,11 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         if tp_rank == 0:
             logger.info("Using front-loading strategy for GPU expert placement")
             masks = generate_front_loading_masks(
-                num_layers, num_experts, num_gpu_experts,
-                first_k_dense_replace, moe_layer_freq
+                num_layers,
+                num_experts,
+                num_gpu_experts,
+                first_k_dense_replace,
+                moe_layer_freq,
             )
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
@@ -2031,8 +2450,11 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         if tp_rank == 0:
             logger.info("Using uniform strategy for GPU expert placement")
             masks = generate_uniform_masks(
-                num_layers, num_experts, num_gpu_experts,
-                first_k_dense_replace, moe_layer_freq
+                num_layers,
+                num_experts,
+                num_gpu_experts,
+                first_k_dense_replace,
+                moe_layer_freq,
             )
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
@@ -2041,8 +2463,12 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         if tp_rank == 0:
             logger.info("Using random strategy for GPU expert placement (seed=42)")
             masks = generate_random_masks(
-                num_layers, num_experts, num_gpu_experts,
-                first_k_dense_replace, moe_layer_freq, seed=42
+                num_layers,
+                num_experts,
+                num_gpu_experts,
+                first_k_dense_replace,
+                moe_layer_freq,
+                seed=42,
             )
         else:
             masks = torch.zeros(num_layers, num_experts, dtype=torch.bool, device="cpu")
@@ -2060,8 +2486,7 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
         per_layer_gpu_experts = masks.sum(dim=1).cpu().tolist()
         for layer_idx, num_gpu in enumerate(per_layer_gpu_experts):
             is_moe_layer = (
-                layer_idx >= first_k_dense_replace
-                and layer_idx % moe_layer_freq == 0
+                layer_idx >= first_k_dense_replace and layer_idx % moe_layer_freq == 0
             )
             # Only log for actual MoE layers
             if is_moe_layer:
@@ -2078,20 +2503,25 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             if i >= first_k_dense_replace and i % moe_layer_freq == 0
         )
         num_moe_layers = sum(
-            1 for i in range(num_layers)
+            1
+            for i in range(num_layers)
             if i >= first_k_dense_replace and i % moe_layer_freq == 0
         )
         logger.info(
             "Generated KT GPU experts masks using '%s' strategy: %d MoE layers (out of %d total layers) x %d experts, "
             "total GPU experts in MoE layers = %d",
-            strategy, num_moe_layers, num_layers, num_experts, total_moe_gpu_experts
+            strategy,
+            num_moe_layers,
+            num_layers,
+            num_experts,
+            total_moe_gpu_experts,
         )
 
     return _KT_GPU_EXPERTS_MASKS
 
 
 def create_kt_config_from_server_args(
-    server_args: "ServerArgs", layer_idx: int
+    server_args: "ServerArgs", layer_idx: int, prefix: str = ""
 ) -> Optional[KTConfig]:
     """Create KTConfig from ServerArgs if KT is configured.
 
@@ -2106,7 +2536,9 @@ def create_kt_config_from_server_args(
     try:
         from sglang.srt.layers.moe.utils import is_kt_ep_wrapper_disabled
     except ImportError:
-        is_kt_ep_wrapper_disabled = lambda: False
+
+        def is_kt_ep_wrapper_disabled() -> bool:
+            return False
 
     if is_kt_ep_wrapper_disabled():
         return None
@@ -2114,28 +2546,115 @@ def create_kt_config_from_server_args(
     if server_args.kt_weight_path is None:
         return None
 
-    # Get GPU experts masks (initializes if needed)
-    masks = _init_kt_gpu_experts_masks(server_args)
-    if masks is None:
-        return None
-
-    # Get num_layers from model config (unwrap VL configs)
-    hf_config = (
-        server_args.get_hf_config()
-        if hasattr(server_args, "get_hf_config")
-        else server_args.get_model_config().hf_config
-    )
-    if hasattr(hf_config, "text_config"):
-        hf_config = hf_config.text_config
+    hf_config = _get_hf_config(server_args)
     num_layers = getattr(hf_config, "num_hidden_layers", None)
+    global_num_experts = int(
+        getattr(
+            hf_config,
+            "n_routed_experts",
+            getattr(
+                hf_config, "num_experts", getattr(hf_config, "num_local_experts", 0)
+            ),
+        )
+    )
+    dspark_stage_match = re.search(r"(?:^|\.)stages\.(\d+)(?:\.|$)", prefix)
+    weight_key_prefix = (
+        f"mtp.{int(dspark_stage_match.group(1))}"
+        if dspark_stage_match is not None
+        else None
+    )
+    gpu_experts_mask = resolve_gpu_experts_mask(
+        server_args,
+        layer_idx=layer_idx,
+        weight_key_prefix=weight_key_prefix,
+    )
+    cpu_expert_ids = None
+    remote_expert_id_tiers = None
+    remote_expert_endpoints = None
 
-    # NOTE: hash-layer skip experiment was tried here (return None when
-    # layer_idx < num_hash_layers); it didn't help because the underlying
-    # fused_moe shape-mismatch in V4 hash MoE happens with or without KT wrap.
-    # Reverted; root cause is in V4 MoE weight layout vs sglang fused_moe.
+    legacy_endpoint = os.environ.get("SGLANG_KT_REMOTE_EXPERT_ENDPOINT")
+    legacy_plan = os.environ.get("SGLANG_KT_REMOTE_EXPERT_PLAN")
+    tier_endpoints = os.environ.get("SGLANG_KT_REMOTE_EXPERT_ENDPOINTS")
+    tier_plans = os.environ.get("SGLANG_KT_REMOTE_EXPERT_PLANS")
+    if (legacy_endpoint or legacy_plan) and (tier_endpoints or tier_plans):
+        raise ValueError(
+            "Use singular or plural KTransformers remote settings, not both"
+        )
+    if bool(legacy_endpoint) != bool(legacy_plan):
+        raise ValueError(
+            "SGLANG_KT_REMOTE_EXPERT_ENDPOINT and SGLANG_KT_REMOTE_EXPERT_PLAN "
+            "must be set together"
+        )
+    if bool(tier_endpoints) != bool(tier_plans):
+        raise ValueError(
+            "SGLANG_KT_REMOTE_EXPERT_ENDPOINTS and SGLANG_KT_REMOTE_EXPERT_PLANS "
+            "must be set together"
+        )
+    if legacy_plan:
+        remote_plan_paths = (legacy_plan,)
+        configured_endpoints = (legacy_endpoint,)
+    elif tier_plans:
+        remote_plan_paths = tuple(
+            value.strip() for value in tier_plans.split(";") if value.strip()
+        )
+        configured_endpoints = tuple(
+            value.strip() for value in tier_endpoints.split(";") if value.strip()
+        )
+        if not remote_plan_paths or len(remote_plan_paths) != len(configured_endpoints):
+            raise ValueError(
+                "Plural KTransformers remote plans and endpoints must have equal lengths"
+            )
+    else:
+        remote_plan_paths = ()
+        configured_endpoints = ()
 
-    # Get mask for this specific layer
-    gpu_experts_mask = masks[layer_idx]
+    shard_plan = os.environ.get("SGLANG_KT_CPU_EXPERT_SHARD_PLAN")
+    if remote_plan_paths and shard_plan:
+        raise ValueError(
+            "KTransformers remote and CPU-shard plans are mutually exclusive"
+        )
+    if remote_plan_paths and weight_key_prefix is None:
+        selected_tiers = []
+        selected_endpoints = []
+        for plan_path, endpoint in zip(
+            remote_plan_paths, configured_endpoints, strict=True
+        ):
+            ids_by_layer = load_remote_expert_plan(
+                plan_path, num_experts=global_num_experts
+            )
+            if layer_idx < ids_by_layer.shape[0]:
+                selected_tiers.append(ids_by_layer[layer_idx].clone())
+                selected_endpoints.append(endpoint)
+        if selected_tiers:
+            remote_expert_id_tiers = tuple(selected_tiers)
+            remote_expert_endpoints = tuple(selected_endpoints)
+            combined_remote_ids = combine_remote_expert_tiers(
+                remote_expert_id_tiers, num_experts=global_num_experts
+            )
+            gpu_experts_mask, cpu_expert_ids = partition_remote_local_gpu_experts(
+                gpu_experts_mask, combined_remote_ids
+            )
+    elif shard_plan:
+        if getattr(server_args, "kt_num_gpu_experts", None) != 0:
+            raise ValueError(
+                "SGLANG_KT_CPU_EXPERT_SHARD_PLAN requires --kt-num-gpu-experts 0"
+            )
+        parallel = get_parallel()
+        shards = load_cpu_expert_shard_plan(
+            shard_plan,
+            num_layers=int(num_layers),
+            num_experts=global_num_experts,
+            ep_size=parallel.moe_ep_size,
+            ep_rank=parallel.moe_ep_rank,
+        )
+        cpu_expert_ids = shards[layer_idx].clone()
+        gpu_experts_mask = torch.zeros(global_num_experts, dtype=torch.bool)
+
+    # Compact native CPU storage whenever another tier owns experts.
+    if cpu_expert_ids is None and bool(gpu_experts_mask.any().item()):
+        cpu_expert_ids = torch.arange(
+            global_num_experts, dtype=torch.int64, device="cpu"
+        )[~gpu_experts_mask.to(device="cpu")]
 
     return KTConfig(
         layer_idx=layer_idx,
@@ -2157,7 +2676,18 @@ def create_kt_config_from_server_args(
             server_args, "kt_enable_dynamic_expert_update", False
         ),
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
+        weight_key_prefix=weight_key_prefix,
+        cpu_expert_ids=cpu_expert_ids,
+        global_num_experts=global_num_experts,
+        remote_expert_id_tiers=remote_expert_id_tiers,
+        remote_expert_endpoints=remote_expert_endpoints,
     )
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def mask_cpu_expert_ids(topk_ids: torch.Tensor, num_gpu_experts: int) -> torch.Tensor:
+    """Mask a contiguous GPU prefix without mutating the CPU routing input."""
+    return torch.where(topk_ids < num_gpu_experts, topk_ids, -1)
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -2180,10 +2710,30 @@ def mask_and_remap_expert_ids(
     Returns:
         Remapped topk_ids tensor with GPU indices for GPU experts, -1 for CPU experts
     """
-    is_gpu_expert = gpu_experts_mask[topk_ids]
-    # For GPU experts: remap to GPU weight index; for CPU experts: set to -1
-    remapped_ids = torch.where(is_gpu_expert, logical_to_gpu_index[topk_ids], -1)
-    return remapped_ids
+    valid = (topk_ids >= 0) & (topk_ids < gpu_experts_mask.numel())
+    safe_ids = torch.where(valid, topk_ids, 0)
+    is_gpu_expert = valid & gpu_experts_mask[safe_ids]
+    return torch.where(is_gpu_expert, logical_to_gpu_index[safe_ids], -1)
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def remap_global_expert_ids(
+    topk_ids: torch.Tensor, global_to_local: torch.Tensor
+) -> torch.Tensor:
+    """Map global route IDs to a compact native-CPU expert shard."""
+    valid = (topk_ids >= 0) & (topk_ids < global_to_local.numel())
+    safe_ids = torch.where(valid, topk_ids, 0)
+    return torch.where(valid, global_to_local[safe_ids], -1)
+
+
+def select_remote_token_rows(
+    topk_ids: torch.Tensor, remote_expert_mask: torch.Tensor
+) -> torch.Tensor:
+    """Return one bool per token indicating ownership by a remote tier."""
+    flat_ids = topk_ids.reshape(-1, topk_ids.shape[-1])
+    valid = (flat_ids >= 0) & (flat_ids < remote_expert_mask.numel())
+    safe_ids = torch.where(valid, flat_ids, 0)
+    return (valid & remote_expert_mask[safe_ids]).any(dim=-1)
 
 
 def select_top_experts_from_batch(
@@ -2216,7 +2766,9 @@ def select_top_experts_from_batch(
     valid_ids = flat_ids[valid_mask]
 
     if valid_ids.numel() > 0:
-        expert_counts.index_add_(0, valid_ids, torch.ones_like(valid_ids, dtype=torch.int64))
+        expert_counts.index_add_(
+            0, valid_ids, torch.ones_like(valid_ids, dtype=torch.int64)
+        )
 
     # Select top num_gpu_experts by frequency
     # For ties, torch.topk with sorted=True will prefer earlier indices (deterministic)
@@ -2224,7 +2776,7 @@ def select_top_experts_from_batch(
         expert_counts,
         k=min(num_gpu_experts, num_experts),
         largest=True,
-        sorted=True  # Ensures deterministic tie-breaking
+        sorted=True,  # Ensures deterministic tie-breaking
     )
 
     # Sort selected indices for easier debugging and consistent ordering
@@ -2251,12 +2803,16 @@ def copy_experts_weights_int4(
         - w2_weight_packed: Packed INT4 weights for down projection
         - w2_weight_scale: FP16 scales for w2
     """
-    weight_names = ["w13_weight_packed", "w13_weight_scale", "w2_weight_packed", "w2_weight_scale"]
+    weight_names = [
+        "w13_weight_packed",
+        "w13_weight_scale",
+        "w2_weight_packed",
+        "w2_weight_scale",
+    ]
 
     # Build mapping: selected logical ID -> dst GPU index
     logical_to_dst_index = {
-        int(selected_experts[i].item()): i
-        for i in range(len(selected_experts))
+        int(selected_experts[i].item()): i for i in range(len(selected_experts))
     }
 
     for weight_name in weight_names:
@@ -2288,12 +2844,16 @@ def copy_experts_weights_fp8(
         - w2_weight: FP8 weights for down projection
         - w2_weight_scale_inv: FP32 inverse scales for w2
     """
-    weight_names = ["w13_weight", "w13_weight_scale_inv", "w2_weight", "w2_weight_scale_inv"]
+    weight_names = [
+        "w13_weight",
+        "w13_weight_scale_inv",
+        "w2_weight",
+        "w2_weight_scale_inv",
+    ]
 
     # Build mapping: selected logical ID -> dst GPU index
     logical_to_dst_index = {
-        int(selected_experts[i].item()): i
-        for i in range(len(selected_experts))
+        int(selected_experts[i].item()): i for i in range(len(selected_experts))
     }
 
     for weight_name in weight_names:
@@ -2327,8 +2887,7 @@ def copy_experts_weights_fp8_channel(
 
     # Build mapping: selected logical ID -> dst GPU index
     logical_to_dst_index = {
-        int(selected_experts[i].item()): i
-        for i in range(len(selected_experts))
+        int(selected_experts[i].item()): i for i in range(len(selected_experts))
     }
 
     for weight_name in weight_names:
@@ -2360,8 +2919,7 @@ def copy_experts_weights_bf16(
 
     # Build mapping: selected logical ID -> dst GPU index
     logical_to_dst_index = {
-        int(selected_experts[i].item()): i
-        for i in range(len(selected_experts))
+        int(selected_experts[i].item()): i for i in range(len(selected_experts))
     }
 
     for weight_name in weight_names:
@@ -2391,10 +2949,8 @@ def update_gpu_expert_mappings(
             - logical_to_gpu_index: CUDA int32 tensor [num_experts], maps logical -> GPU index
             - gpu_index_to_logical: CPU int32 tensor [num_gpu_experts], reverse mapping
     """
-    num_gpu_experts = len(selected_experts)
-
     # Create new mask (CPU tensor)
-    gpu_experts_mask_cpu = torch.zeros(num_experts, dtype=torch.bool, device='cpu')
+    gpu_experts_mask_cpu = torch.zeros(num_experts, dtype=torch.bool, device="cpu")
     gpu_experts_mask_cpu[selected_experts.cpu()] = True
 
     # Create logical_to_gpu_index (CUDA tensor)
@@ -2486,7 +3042,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         self.gpu_method = gpu_method
         self.kt_config = kt_config
-        self.gpu_experts_mask = kt_config.gpu_experts_mask  # bool tensor [num_experts], on CPU
+        self.gpu_experts_mask = (
+            kt_config.gpu_experts_mask
+        )  # bool tensor [num_experts], on CPU
         self.num_gpu_experts = int(self.gpu_experts_mask.sum().item())
         self.kt_expert_lora_path = kt_config.expert_lora_path
         self.kt_expert_lora_enabled = bool(self.kt_expert_lora_path)
@@ -2494,6 +3052,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_tensor_model_parallel_rank()
+        self.cpu_expert_ids = kt_config.cpu_expert_ids
+        self.remote_expert_id_tiers = kt_config.remote_expert_id_tiers
+        self.remote_expert_endpoints = kt_config.remote_expert_endpoints
+        self.global_num_experts = (
+            kt_config.global_num_experts
+            if kt_config.global_num_experts is not None
+            else int(kt_config.gpu_experts_mask.numel())
+        )
+        self.global_to_local_expert_mapping_cuda: Optional[torch.Tensor] = None
+        self.remote_expert_masks_cuda: tuple[torch.Tensor, ...] = ()
+        self.remote_clients = ()
+        self._remote_pending_output: Optional[_KTRemotePending] = None
         if self.kt_expert_lora_enabled:
             if self.num_gpu_experts != 0:
                 raise ValueError(
@@ -2573,6 +3143,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             **extra_weight_attrs: Additional weight attributes
         """
         self.global_num_experts = num_experts
+        native_num_experts = num_experts
+        native_gpu_experts_mask = self.gpu_experts_mask
+        if self.cpu_expert_ids is not None:
+            native_num_experts = int(self.cpu_expert_ids.numel())
+            native_gpu_experts_mask = torch.zeros(
+                native_num_experts, dtype=torch.bool, device="cpu"
+            )
         self._full_init_args = (
             hidden_size,
             intermediate_size_per_partition,
@@ -2611,7 +3188,45 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Move mask and mapping tables to GPU for inference
         target_device = next(layer.parameters()).device
         self.gpu_experts_mask_cuda = self.gpu_experts_mask.to(device=target_device)
-        self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device=target_device)
+        self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(
+            device=target_device
+        )
+        if self.cpu_expert_ids is not None:
+            global_to_local = torch.full(
+                (self.global_num_experts,), -1, dtype=torch.int32, device="cpu"
+            )
+            global_to_local[self.cpu_expert_ids] = torch.arange(
+                self.cpu_expert_ids.numel(), dtype=torch.int32, device="cpu"
+            )
+            self.global_to_local_expert_mapping_cuda = global_to_local.to(
+                device=target_device, non_blocking=True
+            )
+        if self.remote_expert_id_tiers is not None:
+            if (
+                self.cpu_expert_ids is None
+                or self.remote_expert_endpoints is None
+                or len(self.remote_expert_id_tiers) != len(self.remote_expert_endpoints)
+            ):
+                raise ValueError(
+                    "Remote KTransformers tiers require a local complement and "
+                    "one endpoint per tier"
+                )
+            self.remote_expert_masks_cuda = tuple(
+                torch.zeros(self.global_num_experts, dtype=torch.bool)
+                .scatter_(
+                    0,
+                    expert_ids,
+                    torch.ones_like(expert_ids, dtype=torch.bool),
+                )
+                .to(device=target_device, non_blocking=True)
+                for expert_ids in self.remote_expert_id_tiers
+            )
+            from sglang.srt.layers.moe.kt_remote_sidecar import KTExpertSidecarClient
+
+            self.remote_clients = tuple(
+                KTExpertSidecarClient.get(endpoint)
+                for endpoint in self.remote_expert_endpoints
+            )
 
         # Initialize dual-stream for CPU-GPU parallelism (rank 0 only)
         if self.tp_rank == 0:
@@ -2638,9 +3253,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # kt-kernel C++ accepts a single (alpha, limit) pair and
             # disambiguates by alpha != 0 (swiglu_oai vs plain silu).
             _mrc = getattr(layer, "moe_runner_config", None)
-            _cfg_alpha = getattr(_mrc, "gemm1_alpha", None) if _mrc is not None else None
-            _cfg_clamp = getattr(_mrc, "gemm1_clamp_limit", None) if _mrc is not None else None
-            _cfg_swglim = getattr(_mrc, "swiglu_limit", None) if _mrc is not None else None
+            _cfg_alpha = (
+                getattr(_mrc, "gemm1_alpha", None) if _mrc is not None else None
+            )
+            _cfg_clamp = (
+                getattr(_mrc, "gemm1_clamp_limit", None) if _mrc is not None else None
+            )
+            _cfg_swglim = (
+                getattr(_mrc, "swiglu_limit", None) if _mrc is not None else None
+            )
             _kt_swiglu_alpha = float(_cfg_alpha) if _cfg_alpha is not None else 0.0
             _kt_swiglu_limit = float(
                 _cfg_clamp if _cfg_clamp is not None else (_cfg_swglim or 0.0)
@@ -2653,11 +3274,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 _kt_swiglu_alpha = 0.0
             common_wrapper_kwargs = dict(
                 layer_idx=self.kt_config.layer_idx,
-                num_experts=num_experts,
+                num_experts=native_num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                gpu_experts_mask=self.gpu_experts_mask,
+                gpu_experts_mask=native_gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 numa_nodes=self.kt_config.numa_nodes,
@@ -2694,6 +3315,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     method=self.kt_config.method,
                     max_deferred_experts_per_token=layer_max_deferred,
                 )
+            if self.cpu_expert_ids is not None:
+                self.wrapper.weight_expert_ids = self.cpu_expert_ids
+            if self.kt_config.weight_key_prefix is not None:
+                self.wrapper.weight_key_prefix = self.kt_config.weight_key_prefix
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Process weights after loading from checkpoint.
@@ -2715,14 +3340,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             )
 
             metadata = get_global_expert_location_metadata()
-            if (
+            if self.cpu_expert_ids is not None:
+                physical_to_logical_map_cpu = torch.arange(
+                    self.cpu_expert_ids.numel(), dtype=torch.int64, device="cpu"
+                )
+            elif (
                 metadata is not None
                 and getattr(metadata, "physical_to_logical_map_cpu", None) is not None
             ):
-                physical_to_logical_map_cpu = (
-                    metadata.physical_to_logical_map_cpu[self.kt_config.layer_idx]
-                    .contiguous()
-                )
+                physical_to_logical_map_cpu = metadata.physical_to_logical_map_cpu[
+                    self.kt_config.layer_idx
+                ].contiguous()
             else:
                 # Fallback for setups without EPLB metadata: identity mapping.
                 physical_to_logical_map_cpu = torch.arange(
@@ -2809,6 +3437,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> None:
+        if self.global_to_local_expert_mapping_cuda is not None:
+            topk_ids = remap_global_expert_ids(
+                topk_ids, self.global_to_local_expert_mapping_cuda
+            )
         if self.kt_expert_lora_enabled:
             self.wrapper.submit_forward_inference(
                 hidden_states,
@@ -2857,6 +3489,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # Submit forward task to CPU (non-blocking)
         self._submit_cpu_forward(x, topk_ids, topk_weights)
+        self._remote_pending_output = self._submit_remote_if_selected(
+            x=x,
+            global_topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
 
     def sync(self, x: torch.Tensor) -> torch.Tensor:
         """Synchronize and retrieve CPU expert computation results.
@@ -2872,8 +3509,153 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank != 0 or self.wrapper is None:
             return torch.zeros_like(x)
 
-        # Wait for CPU computation and retrieve results
-        return self._sync_cpu_forward(x)
+        output = self._sync_cpu_forward(x)
+        if self._remote_pending_output is not None:
+            output = output + self._finish_remote(self._remote_pending_output, x=x)
+            self._remote_pending_output = None
+        return output
+
+    def _submit_remote_if_selected(
+        self,
+        *,
+        x: torch.Tensor,
+        global_topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> Optional[_KTRemotePending]:
+        """Submit each selected sidecar tier without blocking local MoE work."""
+        if not self.remote_clients:
+            return None
+        flat_x = x.reshape(-1, x.shape[-1])
+        flat_ids = global_topk_ids.reshape(-1, global_topk_ids.shape[-1])
+        flat_weights = topk_weights.reshape_as(flat_ids)
+        prepared_tiers = []
+        for remote_client, remote_mask in zip(
+            self.remote_clients, self.remote_expert_masks_cuda, strict=True
+        ):
+            selected_indices = torch.where(
+                select_remote_token_rows(flat_ids, remote_mask)
+            )[0]
+            if selected_indices.numel() == 0:
+                continue
+            prepared_tiers.append(
+                (
+                    remote_client,
+                    selected_indices,
+                    flat_x[selected_indices],
+                    flat_ids[selected_indices],
+                    flat_weights[selected_indices],
+                )
+            )
+        if not prepared_tiers:
+            return None
+
+        compact_ready_event = None
+        if flat_x.is_cuda:
+            compact_ready_event = torch.cuda.Event()
+            compact_ready_event.record(torch.cuda.current_stream(flat_x.device))
+
+        def run_prepared_tier(prepared_tier):
+            if compact_ready_event is not None:
+                compact_ready_event.synchronize()
+            remote_client, _, compact_x, compact_ids, compact_weights = prepared_tier
+            return remote_client.forward(
+                layer_idx=self.kt_config.layer_idx,
+                hidden_states=compact_x,
+                topk_ids=compact_ids,
+                topk_weights=compact_weights,
+                return_cpu=True,
+            )
+
+        futures = tuple(
+            _KT_REMOTE_EXECUTOR.submit(run_prepared_tier, tier)
+            for tier in prepared_tiers
+        )
+        return _KTRemotePending(
+            prepared_tiers=tuple(prepared_tiers),
+            futures=futures,
+            token_count=flat_x.shape[0],
+        )
+
+    def _finish_remote(
+        self, pending: _KTRemotePending, *, x: torch.Tensor
+    ) -> torch.Tensor:
+        """Join sidecar tiers and scatter their compact rows to token order."""
+        combined_output = None
+        for prepared_tier, future in zip(
+            pending.prepared_tiers, pending.futures, strict=True
+        ):
+            compact_output = future.result()
+            _, selected_indices, _, _, _ = prepared_tier
+            compact_output = compact_output.to(device=x.device, dtype=x.dtype)
+            if selected_indices.numel() == pending.token_count:
+                tier_output = compact_output.view_as(x)
+            else:
+                tier_output = (
+                    torch.zeros(
+                        (pending.token_count, x.shape[-1]),
+                        dtype=x.dtype,
+                        device=x.device,
+                    )
+                    .index_copy(
+                        0,
+                        selected_indices,
+                        compact_output.reshape(-1, compact_output.shape[-1]),
+                    )
+                    .view_as(x)
+                )
+            combined_output = (
+                tier_output
+                if combined_output is None
+                else combined_output + tier_output
+            )
+        if combined_output is None:
+            return torch.zeros_like(x)
+        return combined_output
+
+    def _accumulate_remote(
+        self,
+        pending: _KTRemotePending,
+        *,
+        output: torch.Tensor,
+        staging_buffer: torch.Tensor,
+    ) -> torch.Tensor:
+        """Stream pinned sidecar rows through dead staging into output."""
+        flat_output = output.reshape(-1, output.shape[-1])
+        flat_staging = staging_buffer.reshape(-1, staging_buffer.shape[-1])
+        transfer_rows = int(os.environ.get("SGLANG_KT_REMOTE_MERGE_CHUNK_TOKENS", "64"))
+        if transfer_rows <= 0:
+            raise ValueError("SGLANG_KT_REMOTE_MERGE_CHUNK_TOKENS must be positive")
+        for prepared_tier, future in zip(
+            pending.prepared_tiers, pending.futures, strict=True
+        ):
+            compact_output = future.result().reshape(-1, output.shape[-1])
+            _, selected_indices, _, _, _ = prepared_tier
+            if compact_output.device.type != "cpu":
+                compact_output = compact_output.to(device="cpu")
+            for token_start in range(0, compact_output.shape[0], transfer_rows):
+                token_end = min(token_start + transfer_rows, compact_output.shape[0])
+                row_count = token_end - token_start
+                transfer = flat_staging[:row_count]
+                transfer.copy_(compact_output[token_start:token_end], non_blocking=True)
+                flat_output.index_add_(
+                    0, selected_indices[token_start:token_end], transfer
+                )
+        return output
+
+    def _run_remote_if_selected(
+        self,
+        *,
+        x: torch.Tensor,
+        global_topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Compatibility helper that submits and immediately joins sidecars."""
+        pending = self._submit_remote_if_selected(
+            x=x,
+            global_topk_ids=global_topk_ids,
+            topk_weights=topk_weights,
+        )
+        return None if pending is None else self._finish_remote(pending, x=x)
 
     def _submit_with_staged_input(
         self,
@@ -2888,9 +3670,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             dispatch_output: Dispatched tokens and routing information
             staged_hidden_states: Pre-copied hidden states in staging buffer
         """
-        assert (
-            self.moe_runner_config.activation == "silu"
-        ), "Only SiLU activation is supported."
+        assert self.moe_runner_config.activation == "silu", (
+            "Only SiLU activation is supported."
+        )
 
         if self.tp_rank != 0 or self.wrapper is None:
             return
@@ -3014,8 +3796,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # so the dynamic-promote optimization is a no-op for MXFP4. Origin:
             # sglang 本身 (V4-Flash full-GPU prefill fallback compat).
             _mxfp4_skip_dyn_update = getattr(ctx, "_is_mxfp4_quant", False)
-            if (self.kt_config.kt_enable_dynamic_expert_update
-                    and not _mxfp4_skip_dyn_update):
+            if (
+                self.kt_config.kt_enable_dynamic_expert_update
+                and not _mxfp4_skip_dyn_update
+            ):
                 t_update = time.perf_counter()
                 self._update_gpu_experts_from_batch(
                     layer=layer,
@@ -3051,9 +3835,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 1: Copy hidden_states to staging buffer and submit CPU computation
         # Staging buffer allows GPU computation to proceed without waiting for D2H copy
         staging_buffer = None
+        remote_pending = None
         if self.tp_rank == 0 and self._cpu_stream is not None:
             # Use shared staging buffer (shared across all MoE layers to save GPU memory)
-            assert self._shared_staging_buffer is not None, "Shared staging buffer not initialized"
+            assert self._shared_staging_buffer is not None, (
+                "Shared staging buffer not initialized"
+            )
             staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
 
             # Copy to staging buffer on main stream
@@ -3065,12 +3852,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 # Fork to cpu_stream (waits for staging copy to complete)
                 self._cpu_stream.wait_stream(torch.cuda.current_stream(x.device))
             from contextlib import nullcontext as _ctx_null
-            _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
+
+            _stream_ctx = (
+                _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
+            )
             with _stream_ctx:
                 # Submit uses staging_buffer, so GPU can modify original x freely
-                self._submit_with_staged_input(
-                    layer, dispatch_output, staging_buffer
-                )
+                self._submit_with_staged_input(layer, dispatch_output, staging_buffer)
+            remote_pending = self._submit_remote_if_selected(
+                x=x,
+                global_topk_ids=topk_output.topk_ids,
+                topk_weights=topk_output.topk_weights,
+            )
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -3103,7 +3896,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Skip the GPU GEMM entirely and start from zeros; the CPU path then
         # provides 100% of the routed-expert contribution.
         # Origin: kt-sglang 耦合 (sglang/kt_ep_wrapper.py).
-        if not getattr(self, "_diag_logged", False) and logger.isEnabledFor(logging.DEBUG):
+        if not getattr(self, "_diag_logged", False) and logger.isEnabledFor(
+            logging.DEBUG
+        ):
             self._diag_logged = True
             try:
                 _mask_sum = int(self.gpu_experts_mask.sum().item())
@@ -3112,7 +3907,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             logger.debug(
                 "[kt-ep-diag] layer=%s num_gpu_experts=%d mask_sum=%s "
                 "mask_shape=%s gpu_method=%s",
-                getattr(self.kt_config, 'layer_idx', '?'),
+                getattr(self.kt_config, "layer_idx", "?"),
                 self.num_gpu_experts,
                 _mask_sum,
                 tuple(self.gpu_experts_mask.shape),
@@ -3124,7 +3919,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Flash + --kt-num-gpu-experts=0), which defeats the
         # num_gpu_experts==0 short-circuit. The env var lets the operator
         # force the bypass without untangling the mask generator.
-        if self.num_gpu_experts == 0 or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1":
+        if (
+            self.num_gpu_experts == 0
+            or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1"
+        ):
             gpu_combine_input = None
             output = torch.zeros_like(x)
             # 2604B sub-mode adds a runtime path-checker assertion in the
@@ -3133,6 +3931,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # bypass path mirrors that here so the assertion still passes
             # when GPU MoE is short-circuited in favour of CPU experts.
             from sglang.srt.environ import envs as _envs
+
             submode_env = getattr(_envs, "SGLANG_DSV4_2604_SUBMODE", None)
             submode = (
                 submode_env.get()
@@ -3143,6 +3942,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 from sglang.srt.layers.quantization.mxfp4_deepseek import (
                     deepseek_v4_moe_code_path_checker,
                 )
+
                 deepseek_v4_moe_code_path_checker.observed += 1
         else:
             gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
@@ -3156,10 +3956,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0 and self._cpu_stream is not None:
             _no_cpu_stream = os.environ.get("SGLANG_KT_HYBRID_NO_CPU_STREAM") == "1"
             from contextlib import nullcontext as _ctx_null
-            _stream_ctx = _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
+
+            _stream_ctx = (
+                _ctx_null() if _no_cpu_stream else torch.cuda.stream(self._cpu_stream)
+            )
             with _stream_ctx:
                 # Use staging_buffer for sync to get correct buffer reference
-                _kt_t_sync_pre = time.perf_counter() if _kt_t_apply_start is not None else None
+                _kt_t_sync_pre = (
+                    time.perf_counter() if _kt_t_apply_start is not None else None
+                )
                 cpu_output = self._sync_with_staged_input(staging_buffer)
                 if _kt_t_sync_pre is not None:
                     _kt_t_cpu_wait_ms = (time.perf_counter() - _kt_t_sync_pre) * 1000.0
@@ -3172,6 +3977,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if not _no_cpu_stream:
                 torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
             output = output + cpu_output
+        if remote_pending is not None:
+            assert staging_buffer is not None
+            self._accumulate_remote(
+                remote_pending,
+                output=output,
+                staging_buffer=staging_buffer,
+            )
         if _kt_timing:
             _kt_t_after_merge = time.perf_counter()
             # Optional: synchronize GPU at end of apply() to capture true GPU
@@ -3190,7 +4002,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _stage_gpu_ms = (_kt_t_after_gpu - _kt_t_after_mask) * 1000.0
             _stage_sync_ms = (
                 (_kt_t_after_sync - _kt_t_after_gpu) * 1000.0
-                if _kt_t_after_sync is not None else 0.0
+                if _kt_t_after_sync is not None
+                else 0.0
             )
             _stage_merge_ms = (
                 (_kt_t_after_merge - _kt_t_after_sync) * 1000.0
@@ -3198,9 +4011,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 else (_kt_t_after_merge - _kt_t_after_gpu) * 1000.0
             )
             _cls = type(self)
-            if not hasattr(_cls, '_kt_layer_step'):
+            if not hasattr(_cls, "_kt_layer_step"):
                 _cls._kt_layer_step = {}
-            _li = getattr(self.kt_config, 'layer_idx', -1)
+            _li = getattr(self.kt_config, "layer_idx", -1)
             _cls._kt_layer_step[_li] = _cls._kt_layer_step.get(_li, 0) + 1
             _step = _cls._kt_layer_step[_li]
             if _step <= 16 or _step % 16 == 0:
@@ -3208,9 +4021,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     "[kt-time] layer=%s step=%d total=%.2fms submit=%.2f "
                     "mask=%.2f gpu=%.2f sync=%.2f merge=%.2f "
                     "cpu_wait=%.2fms num_tokens=%d",
-                    _li, _step, _kt_total_ms, _stage_submit_ms,
-                    _stage_mask_ms, _stage_gpu_ms, _stage_sync_ms,
-                    _stage_merge_ms, _kt_t_cpu_wait_ms, num_tokens,
+                    _li,
+                    _step,
+                    _kt_total_ms,
+                    _stage_submit_ms,
+                    _stage_mask_ms,
+                    _stage_gpu_ms,
+                    _stage_sync_ms,
+                    _stage_merge_ms,
+                    _kt_t_cpu_wait_ms,
+                    num_tokens,
                 )
         return StandardCombineInput(hidden_states=output)
 
@@ -3263,12 +4083,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # the right attribute-name list.
             if ctx.gpu_method.__class__.__name__.endswith("MarlinMoEMethod"):
                 copy_experts_weights_fp8_channel(
-                    src_layer=ctx.gpu_layer, dst_layer=layer,
+                    src_layer=ctx.gpu_layer,
+                    dst_layer=layer,
                     selected_experts=selected_experts,
                 )
             else:
                 copy_experts_weights_fp8(
-                    src_layer=ctx.gpu_layer, dst_layer=layer,
+                    src_layer=ctx.gpu_layer,
+                    dst_layer=layer,
                     selected_experts=selected_experts,
                 )
         elif ctx._is_fp8_channel_quant:
@@ -3304,10 +4126,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # CUDA graph captures tensor memory addresses during decode phase, so we must update
         # in-place rather than replacing the tensor reference
         self.gpu_experts_mask = gpu_experts_mask_cpu  # CPU tensor, safe to replace
-        self.gpu_experts_mask_cuda.copy_(gpu_experts_mask_cpu)  # In-place update for CUDA graph
-        self.logical_to_gpu_index = logical_to_gpu_index_cuda.cpu()  # CPU version for weight loading
-        self.logical_to_gpu_index_cuda.copy_(logical_to_gpu_index_cuda)  # In-place update for CUDA graph
-        self.gpu_index_to_logical = gpu_index_to_logical_cpu  # CPU tensor, safe to replace
+        self.gpu_experts_mask_cuda.copy_(
+            gpu_experts_mask_cpu
+        )  # In-place update for CUDA graph
+        self.logical_to_gpu_index = (
+            logical_to_gpu_index_cuda.cpu()
+        )  # CPU version for weight loading
+        self.logical_to_gpu_index_cuda.copy_(
+            logical_to_gpu_index_cuda
+        )  # In-place update for CUDA graph
+        self.gpu_index_to_logical = (
+            gpu_index_to_logical_cpu  # CPU tensor, safe to replace
+        )
 
         # Step 4: Update KT wrapper (rank 0 only)
         if self.tp_rank == 0:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -252,16 +253,27 @@ class DSV4AttnMetadata:
             "c4_topk_lengths_clamp1",
             "c4_sparse_topk_lengths",
         ]
-        reference_assign_fields = [
+        captured_attention_tensor_fields = [
             "page_table",
             "swa_page_indices",
             "swa_topk_lengths",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
-            "c1_flashmla_metadata",
-            "c4_flashmla_metadata",
-            "c128_flashmla_metadata",
         ]
+        if os.environ.get("SGLANG_DSV4_CAPTURE_ATTN_IN_BCG") == "1":
+            tensor_copy_fields.extend(captured_attention_tensor_fields)
+            reference_assign_fields = [
+                "c1_flashmla_metadata",
+                "c4_flashmla_metadata",
+                "c128_flashmla_metadata",
+            ]
+        else:
+            reference_assign_fields = [
+                *captured_attention_tensor_fields,
+                "c1_flashmla_metadata",
+                "c4_flashmla_metadata",
+                "c128_flashmla_metadata",
+            ]
         # Keep graph-captured tensor objects alive for fields that captured
         # kernels read by address; overwrite only their contents.
         for field_name in tensor_copy_fields:
@@ -280,9 +292,9 @@ class DSV4AttnMetadata:
 
     def init_compression_metadata(self):
         assert self.page_table.dim() == 2
-        assert (
-            self.raw_out_loc.shape == self.seq_lens_casual.shape
-        ), f"{self.raw_out_loc.shape=}, {self.seq_lens_casual.shape=}"
+        assert self.raw_out_loc.shape == self.seq_lens_casual.shape, (
+            f"{self.raw_out_loc.shape=}, {self.seq_lens_casual.shape=}"
+        )
 
         (
             self.c4_out_loc,
@@ -336,9 +348,9 @@ class DSV4AttnMetadata:
         expected_local_len = pre_global_len // cp_size
         for field_name in self._CP_REINDEX_FIELDS:
             val = getattr(self, field_name, None)
-            assert isinstance(
-                val, torch.Tensor
-            ), f"CP reindex: {field_name} is {type(val)}, expected Tensor"
+            assert isinstance(val, torch.Tensor), (
+                f"CP reindex: {field_name} is {type(val)}, expected Tensor"
+            )
             setattr(self, field_name, val[idx].contiguous())
 
         for field_name in self._CP_REINDEX_FIELDS:
@@ -412,6 +424,15 @@ class DSV4Metadata:
             static_metadata.core_attn_metadata
         )
         maybe_copy_inplace(self.indexer_metadata, src=static_metadata.indexer_metadata)
+        if self.indexer_metadata is not None:
+            # Indexer and attention metadata intentionally share the live page
+            # map. The indexer copy preserves its captured tensor object while
+            # the core may replace its reference, so re-link them for replay.
+            self.indexer_metadata.page_table = self.core_attn_metadata.page_table
+            assert self.core_attn_metadata.c4_topk_lengths_raw is not None
+            self.indexer_metadata.c4_seq_lens = (
+                self.core_attn_metadata.c4_topk_lengths_raw
+            )
         maybe_copy_inplace(
             self.c4_compress_metadata, src=static_metadata.c4_compress_metadata
         )
@@ -505,9 +526,9 @@ class DeepseekV4AttnBackend(
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
         head_dim = model_runner.model_config.head_dim
-        assert (
-            head_dim == 512
-        ), "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
+        assert head_dim == 512, (
+            "DSV4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
+        )
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
@@ -1188,14 +1209,12 @@ class DeepseekV4AttnBackend(
             else:
                 out_cache_loc = None
             actual_forward_mode = forward_batch.forward_mode
-            seq_lens_sum = int(seq_lens.sum().item())
             seq_lens_cpu = seq_lens.cpu() if uses_cpu_seq_lens else None
         else:
             out_cache_loc = forward_batch.out_cache_loc
             actual_forward_mode = getattr(
                 forward_batch, "actual_forward_mode", forward_batch.forward_mode
             )
-            seq_lens_sum = forward_batch.seq_lens_sum
             seq_lens_cpu = forward_batch.seq_lens_cpu if uses_cpu_seq_lens else None
 
         if actual_forward_mode == ForwardMode.IDLE:
@@ -1208,7 +1227,6 @@ class DeepseekV4AttnBackend(
             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
             if uses_cpu_seq_lens:
                 seq_lens_cpu = torch.ones(bs, dtype=torch.int64)
-            seq_lens_sum = bs
             req_pool_indices = torch.zeros(
                 bs, dtype=req_pool_indices.dtype, device=device
             )
@@ -1698,13 +1716,13 @@ class DeepseekV4AttnBackend(
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
 
-            assert (
-                swa_page_indices.shape[-1] % 64 == 0
-            ), f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
+            assert swa_page_indices.shape[-1] % 64 == 0, (
+                f"{swa_page_indices.shape=}'s last dimension is not aligned to 64"
+            )
             if extra_indices is not None:
-                assert (
-                    extra_indices.shape[-1] % 64 == 0
-                ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
+                assert extra_indices.shape[-1] % 64 == 0, (
+                    f"{extra_indices.shape=}'s last dimension is not aligned to 64"
+                )
 
             # sparse_prefill_fwd does not support SM120.
             if (

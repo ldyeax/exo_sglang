@@ -70,6 +70,7 @@ def build_draft_tp_worker(
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
+    standalone_pipeline: bool = False,
 ) -> DraftWorkerBundle:
     draft_server_args = deepcopy(server_args)
     # An override names a draft-specific backend the caller has already
@@ -87,8 +88,7 @@ def build_draft_tp_worker(
     # fa4-draft KV dtype override in configure_kv_cache_dtype), so nulling it
     # would silently skip those paths. context_length keeps the draft aligned
     # with the target.
-    draft_server_args.override(
-        "draft_worker.build",
+    draft_overrides = dict(
         skip_tokenizer_init=True,
         speculative_draft_attention_backend=draft_backend,
         prefill_attention_backend=None,
@@ -96,6 +96,12 @@ def build_draft_tp_worker(
         attention_backend=draft_backend,
         context_length=target_model_config.context_len,
     )
+    if standalone_pipeline:
+        # A PP-aware spec worker places the complete draft on the last target
+        # stage.  The draft is not itself pipeline-parallel: proposals return
+        # to PP0 through the target output ring.
+        draft_overrides.update(pp_size=1, nnodes=1, node_rank=0)
+    draft_server_args.override("draft_worker.build", **draft_overrides)
 
     # The draft's layers must resolve config from the draft's own bags.
     with get_context().preserve_config():

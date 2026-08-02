@@ -68,9 +68,9 @@ class ExpertDistributionRecorder(ABC):
         rank: int,
     ):
         if server_args.expert_distribution_recorder_mode is not None:
-            assert (
-                expert_location_metadata is not None
-            ), "ExpertLocationMetadata is required for expert distribution recording. One possible"
+            assert expert_location_metadata is not None, (
+                "ExpertLocationMetadata is required for expert distribution recording. One possible"
+            )
             "reason is that you are using a model that does not support expert distribution"
             "recording. Try setting `get_model_config_for_expert_location` in your model."
             return _ExpertDistributionRecorderReal(
@@ -81,6 +81,10 @@ class ExpertDistributionRecorder(ABC):
 
     @contextmanager
     def with_current_layer(self, layer_idx):
+        yield
+
+    @contextmanager
+    def with_current_layer_if_absent(self, layer_idx):
         yield
 
     @contextmanager
@@ -166,6 +170,21 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def with_current_layer(self, layer_idx):
         return self._current_layer_idx.with_value(layer_idx)
+
+    @contextmanager
+    def with_current_layer_if_absent(self, layer_idx):
+        """Restore a layer scope during BCG replay without double nesting."""
+        current_layer_idx = self._current_layer_idx.value
+        if current_layer_idx is not None:
+            if current_layer_idx != layer_idx:
+                raise RuntimeError(
+                    "Nested expert-recorder layer mismatch: "
+                    f"current={current_layer_idx}, requested={layer_idx}"
+                )
+            yield
+            return
+        with self._current_layer_idx.with_value(layer_idx):
+            yield
 
     def with_debug_name(self, debug_name):
         return self._current_debug_name.with_value(debug_name)
@@ -256,9 +275,9 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _reset(self):
         """Reset the expert distribution recorder."""
         logger.info("Resetting ExpertDistributionRecorder...")
-        assert (
-            self._current_layer_idx.value is None
-        ), f"{self._current_layer_idx.value=}"
+        assert self._current_layer_idx.value is None, (
+            f"{self._current_layer_idx.value=}"
+        )
         for gatherer in self._single_pass_gatherers.values():
             gatherer.reset()
         self._accumulator.reset()
@@ -404,9 +423,9 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             device=server_args.device,
         )
         self._misc_objects: List[Dict[str, Any]] = []
-        assert (
-            not server_args.enable_two_batch_overlap
-        ), "DetailSinglePassGatherer does not support TBO yet"
+        assert not server_args.enable_two_batch_overlap, (
+            "DetailSinglePassGatherer does not support TBO yet"
+        )
         # TODO assert shared experts fusion is disabled, o/w data is wrong
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
@@ -800,7 +819,9 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
                 assert (
                     self._expert_location_metadata.ep_size
                     == len(count_of_layer._buckets) - 1
-                ), f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
+                ), (
+                    f"{self._expert_location_metadata.ep_size=}, {len(count_of_layer._buckets)=}"
+                )
                 for gpu_rank in range(self._expert_location_metadata.ep_size):
                     count = gpu_physical_count[layer_idx, gpu_rank]
                     if count > 0:
@@ -882,6 +903,9 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # The MoE/TP rank can be zero on every pipeline stage.  Preserve the
+        # world rank so independent PP-stage dumps never overwrite each other.
+        self._global_rank = torch.distributed.get_rank()
         self._global_physical_count_of_buffered_step = _Buffer.init_new(
             item_shape=(
                 self._expert_location_metadata.num_layers,
@@ -923,18 +947,31 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             self._first_dump = False
             torch.get_device_module().empty_cache()
 
-        torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
-        )
+        # Pipeline control visits stages sequentially, so a world collective
+        # here deadlocks before the dump command reaches later stages.  Each
+        # stage already writes the common global [layers, experts] shape; keep
+        # its disjoint rows local and merge the files offline.  Non-PP modes
+        # retain the established TP/EP reduction.
+        pipeline_parallel_dump = self._server_args.pp_size > 1
+        if not pipeline_parallel_dump:
+            torch.distributed.all_reduce(
+                logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            )
 
         output = dict(
-            rank=self._rank,
+            rank=self._global_rank,
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
 
         if output_mode == "file":
-            if self._rank == 0:
+            if pipeline_parallel_dump:
+                _dump_to_file(
+                    "expert_distribution_recorder_"
+                    f"{time.time()}_{self._global_rank}.pt",
+                    output,
+                )
+            elif self._rank == 0:
                 _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
         elif output_mode == "object":
             return output

@@ -302,11 +302,6 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(got {server_args.speculative_moe_a2a_backend!r})."
             )
 
-    if server_args.pp_size != 1:
-        raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
-        )
-
     if server_args.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):
             server_args.speculative_draft_model_path = server_args.model_path
@@ -411,6 +406,21 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     )
 
     ragged_mode = read_ragged_verify_mode()
+    if server_args.pp_size != 1:
+        if server_args.enable_dp_attention:
+            raise ValueError(
+                "PP DSpark currently requires DP attention to be disabled."
+            )
+        if ragged_mode is not RaggedVerifyMode.STATIC:
+            raise ValueError(
+                "PP DSpark currently requires "
+                "SGLANG_RAGGED_VERIFY_MODE=static while proposal-ring "
+                "correctness is established."
+            )
+        logger.info(
+            "PP DSpark enabled: the complete draft is placed on the last "
+            "pipeline rank and proposals return through the PP output ring."
+        )
     if (
         server_args.speculative_dspark_align_verify_tokens_to_graph_tier
         and ragged_mode is not RaggedVerifyMode.COMPACT

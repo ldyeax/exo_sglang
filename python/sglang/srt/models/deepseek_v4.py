@@ -370,9 +370,9 @@ def deepseek_v4_attention_with_output(
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
 
-    assert (
-        output[:real_num_tokens].numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
+    assert output[:real_num_tokens].numel() == ret.numel(), (
+        f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
+    )
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
     return
@@ -383,8 +383,31 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
-class MqaAttentionBase(nn.Module):
+def deepseek_v4_moe_ffn_bcg(
+    decoder_layer: nn.Module,
+    hidden_states: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    input_ids: torch.Tensor,
+    input_ids_global: torch.Tensor,
+) -> torch.Tensor:
+    """Run MoE dispatch, experts, combine, and collectives at one BCG break."""
+    # Replay happens after the per-layer Python context has exited.  Restore
+    # that scope so route recording indexes the correct layer.
+    with get_global_expert_distribution_recorder().with_current_layer_if_absent(
+        decoder_layer.layer_id
+    ):
+        return decoder_layer._run_moe_ffn_dp_sync(
+            hidden_states,
+            forward_batch,
+            input_ids=input_ids,
+            input_ids_global=input_ids_global,
+        )
 
+
+bcg_deepseek_v4_moe_ffn = eager_on_graph(True)(deepseek_v4_moe_ffn_bcg)
+
+
+class MqaAttentionBase(nn.Module):
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -511,9 +534,9 @@ class MqaAttentionBase(nn.Module):
         if fp8:
             from sglang.srt.layers import deep_gemm_wrapper
 
-            assert hasattr(
-                self.wo_a, "weight_scale_inv"
-            ), "FP8 quant_config must create weight_scale_inv"
+            assert hasattr(self.wo_a, "weight_scale_inv"), (
+                "FP8 quant_config must create weight_scale_inv"
+            )
             self.wo_a.weight_scale_inv.format_ue8m0 = (
                 deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             )
@@ -1598,7 +1621,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
-
         if x.shape[0] == 0:
             return torch.empty(
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
@@ -1757,12 +1779,21 @@ class DeepseekV4DecoderLayer(nn.Module):
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
-        hidden_states = self._run_moe_ffn_dp_sync(
-            hidden_states,
-            forward_batch,
-            input_ids=input_ids,
-            input_ids_global=input_ids_global,
-        )
+        if is_in_breakable_cuda_graph():
+            hidden_states = bcg_deepseek_v4_moe_ffn(
+                self,
+                hidden_states,
+                forward_batch,
+                input_ids,
+                input_ids_global,
+            )
+        else:
+            hidden_states = self._run_moe_ffn_dp_sync(
+                hidden_states,
+                forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
+            )
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
@@ -3067,9 +3098,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 )
                                 bucket = cache_wqkv_a_weight.setdefault(param_name, {})
                                 shard_key = "q" if is_q else "kv"
-                                assert (
-                                    shard_key not in bucket
-                                ), f"duplicate shard {shard_key} for {param_name}"
+                                assert shard_key not in bucket, (
+                                    f"duplicate shard {shard_key} for {param_name}"
+                                )
                                 bucket[shard_key] = _clone_if_runai_streamed_tensor(
                                     loaded_weight
                                 )
@@ -3184,9 +3215,9 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     from einops import rearrange
 
-    assert (
-        weight.dtype == torch.float8_e4m3fn
-    ), f"expected fp8_e4m3fn, got {weight.dtype}"
+    assert weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8_e4m3fn, got {weight.dtype}"
+    )
     assert scale.dtype in (
         torch.float8_e8m0fnu,
         torch.float32,

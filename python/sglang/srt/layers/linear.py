@@ -466,12 +466,17 @@ class ColumnParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_column_parallel_weight(loaded_weight)
 
-    def forward(self, input_):
+    def forward(self, input_, output=None):
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
         assert self.quant_method is not None
-        output_parallel = self.quant_method.apply(self, input_, bias)
+        if output is None:
+            output_parallel = self.quant_method.apply(self, input_, bias)
+        else:
+            output_parallel = self.quant_method.apply(
+                self, input_, bias, output=output
+            )
         if self.gather_output:
             # All-gather across the partitions.
             output = tensor_model_parallel_all_gather(output_parallel)
@@ -1560,7 +1565,9 @@ class RowParallelLinear(LinearBase):
                 # Fallback for parameters that don't accept additional args
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
+    def forward(
+        self, input_, skip_all_reduce=False, forward_batch=None, output=None
+    ):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1581,7 +1588,14 @@ class RowParallelLinear(LinearBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            if output is None:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_
+                )
+            else:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_, output=output
+                )
 
         # skip_all_reduce: explicit call-site override. Also honor
         # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by

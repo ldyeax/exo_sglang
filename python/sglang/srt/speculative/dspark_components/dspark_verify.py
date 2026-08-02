@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import msgspec
@@ -64,6 +65,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    pp_hidden_states_proxy_tensors: object = None
 
 
 class TargetVerifyExecutor:
@@ -74,7 +76,7 @@ class TargetVerifyExecutor:
         gamma: int,
         verify_num_draft_tokens: int,
         model_runner,
-        kv_injector: TargetHiddenKvInjector,
+        kv_injector: Optional[TargetHiddenKvInjector],
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
     ) -> None:
@@ -220,6 +222,7 @@ class TargetVerifyExecutor:
         verify_ids_2d: torch.Tensor,
         verify_window: VerifyWindow,
         sampling_info,
+        pp_proxy_tensors=None,
     ) -> TargetVerifyResult:
         verify_w = self.verify_num_draft_tokens
         positions_2d = verify_window.positions_2d
@@ -248,9 +251,10 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
-        if sampling_info is not None:
+        if sampling_info is not None and result.logits_output is not None:
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=result.logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -266,22 +270,41 @@ class TargetVerifyExecutor:
         verify_input: DFlashVerifyInput,
         seq_lens_cpu_backup,
         seq_lens_sum_backup,
+        pp_proxy_tensors=None,
     ) -> TargetVerifyResult:
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch, self.target_worker
+        model_runner = self.target_worker.model_runner
+        graph_runner = model_runner.decode_cuda_graph_runner
+        force_eager_target = (
+            os.environ.get("SGLANG_DSV4_TARGET_VERIFY_EAGER") == "1"
         )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
-
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-        )
+        if force_eager_target:
+            model_runner.decode_cuda_graph_runner = model_runner.eager_runner
+        try:
+            # Select eager execution before prepare_for_verify decides whether
+            # to load graph metadata or initialize the live attention backend.
+            # Swapping only around forward_batch_generation executes eagerly
+            # with graph-shaped metadata and corrupts target verification.
+            verify_forward_batch, _ = verify_input.prepare_for_verify(
+                batch, self.target_worker
+            )
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+                is_verify=True,
+                skip_attn_backend_init=True,
+            )
+        finally:
+            if force_eager_target:
+                model_runner.decode_cuda_graph_runner = graph_runner
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
+            pp_hidden_states_proxy_tensors=(
+                target_out.pp_hidden_states_proxy_tensors
+            ),
         )
 
     def commit_hidden(
@@ -296,6 +319,11 @@ class TargetVerifyExecutor:
         bs: int,
         run_compact: bool,
     ) -> None:
+        if self.kv_injector is None:
+            raise RuntimeError(
+                "Only the last pipeline stage can commit target hidden states "
+                "into the DSpark draft KV cache."
+            )
         if run_compact:
             self.kv_injector.inject_ragged(
                 batch=batch,
@@ -324,6 +352,7 @@ class TargetVerifyExecutor:
         layout: RaggedVerifyLayout,
         ragged_window: RaggedVerifyWindow,
         sampling_info,
+        pp_proxy_tensors=None,
     ) -> TargetVerifyResult:
         verify_input = DFlashVerifyInput(
             draft_token=ragged_window.verify_ids,
@@ -352,6 +381,7 @@ class TargetVerifyExecutor:
             verify_input=verify_input,
             seq_lens_cpu_backup=seq_lens_cpu_backup,
             seq_lens_sum_backup=seq_lens_sum_backup,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
     def run_compact(
@@ -365,6 +395,7 @@ class TargetVerifyExecutor:
         device: str,
         sampling_info,
         inject_gate: bool = False,
+        pp_proxy_tensors=None,
     ) -> tuple[TargetVerifyResult, torch.Tensor]:
         ragged_window = BuildRaggedVerifyWindow.execute(
             batch=batch,
@@ -383,8 +414,12 @@ class TargetVerifyExecutor:
             layout=layout,
             ragged_window=ragged_window,
             sampling_info=sampling_info,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         logits_output = target_verify.logits_output
+
+        if logits_output is None:
+            return target_verify, None
 
         stride = self.verify_num_draft_tokens
         if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:

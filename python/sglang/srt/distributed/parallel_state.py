@@ -2625,6 +2625,7 @@ def model_parallel_is_initialized():
 
 
 _TP_STATE_PATCHED = False
+_PP_STATE_PATCHED = False
 
 
 @contextmanager
@@ -2650,6 +2651,23 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
         # restore the original state
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
+
+
+@contextmanager
+def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
+    """Temporarily replace the pipeline group for a local-only draft model."""
+    global _PP_STATE_PATCHED
+    assert not _PP_STATE_PATCHED, "Should not call when PP state is already patched"
+
+    _PP_STATE_PATCHED = True
+    old_pp_group = get_pp_group()
+    global _PP
+    _PP = pp_group
+    try:
+        yield
+    finally:
+        _PP_STATE_PATCHED = False
+        _PP = old_pp_group
 
 
 def get_world_size():

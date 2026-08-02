@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import torch
@@ -67,7 +68,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     requant_block_scale_ue8m0_for_deepgemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
-from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+    apply_fp8_marlin_linear_into,
+    prepare_fp8_layer_for_marlin,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -261,7 +265,7 @@ class Fp8Config(QuantizationConfig):
         if weight_block_size is not None:
             if not is_checkpoint_fp8_serialized:
                 raise ValueError(
-                    f"The block-wise quantization only supports fp8-serialized checkpoint for now."
+                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
             if len(weight_block_size) != 2:
                 raise ValueError(
@@ -375,10 +379,24 @@ class Fp8Config(QuantizationConfig):
 
             fp8_method = Fp8MoEMethod(self)
 
+            portable_mxfp4_override = os.environ.get("SGLANG_V4_USE_TRITON_KERNELS")
+            if self.is_fp4_experts and (
+                portable_mxfp4_override == "1"
+                or (
+                    portable_mxfp4_override is None
+                    and get_moe_runner_backend().is_triton()
+                )
+            ):
+                from sglang.srt.layers.quantization.mxfp4_triton_kernels_moe import (
+                    Mxfp4TritonKernelsMoEMethod,
+                )
+
+                return Mxfp4TritonKernelsMoEMethod(fp8_method, prefix=prefix)
+
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
-                assert (
-                    get_moe_runner_backend().is_auto()
-                ), f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
+                assert get_moe_runner_backend().is_auto(), (
+                    f"{get_moe_runner_backend()} is not compatible with SGLANG_DSV4_FP4_DEQUANT=1"
+                )
                 return fp8_method
 
             if self.is_fp4_experts and get_moe_runner_backend().is_marlin():
@@ -681,9 +699,9 @@ class Fp8LinearMethod(LinearMethodBase):
             )
             layer.input_scale = None
         elif _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "Fp8LinearMethod on CPU requires that CPU has AMX support"
+            assert _is_cpu_amx_available, (
+                "Fp8LinearMethod on CPU requires that CPU has AMX support"
+            )
             _amx_process_weight_after_loading(layer, ["weight"])
             layer.weight_scale_inv = torch.nn.Parameter(
                 layer.weight_scale_inv.data, requires_grad=False
@@ -940,8 +958,20 @@ class Fp8LinearMethod(LinearMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_marlin:
+            if output is not None:
+                return apply_fp8_marlin_linear_into(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    workspace=layer.workspace,
+                    size_n=layer.output_size_per_partition,
+                    size_k=layer.input_size_per_partition,
+                    bias=bias,
+                    output=output,
+                )
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
@@ -951,6 +981,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+
+        if output is not None:
+            raise ValueError("caller-owned FP8 linear output requires Marlin")
 
         if self.use_mxfp8:
             backend = get_fp8_gemm_runner_backend()
@@ -1064,9 +1097,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.dequant_fp4_to_fp8 = self.quant_config.dequant_fp4_to_fp8
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
-            assert (
-                cutlass_fp8_supported()
-            ), "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            assert cutlass_fp8_supported(), (
+                "cutlass_fp8 MoE requires CUDA 12.0+ with SM90 or CUDA 12.4+ with SM89"
+            )
             assert self.block_quant, "cutlass_fp8 MoE requires block quantization"
             assert (
                 is_sm100_supported() or is_sm90_supported() or is_sm120_supported()
@@ -1421,7 +1454,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.intermediate_pad = padded_inter - inter_per_part
             layer.hidden_pad = 0
             if padded_inter != inter_per_part:
-                pad_amount = padded_inter - inter_per_part
                 fp4_block_k = 32
 
                 # Pad w13_weight: (E, 2*inter, K_packed) → (E, 2*padded, K_packed)
@@ -1595,9 +1627,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.copy_(t)
             del t
         elif _is_cpu:
-            assert (
-                _is_cpu_amx_available
-            ), "Fp8MoEMethod on CPU requires that CPU has AMX support"
+            assert _is_cpu_amx_available, (
+                "Fp8MoEMethod on CPU requires that CPU has AMX support"
+            )
             _amx_process_weight_after_loading(layer, ["w13_weight", "w2_weight"])
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
@@ -1682,9 +1714,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     weight_block_size,
                     use_deepgemm_runner=will_use_deepgemm,
                 ):
-                    assert isinstance(
-                        layer, DeepEPMoE
-                    ), "DeepGemm MoE is only supported with DeepEPMoE"
+                    assert isinstance(layer, DeepEPMoE), (
+                        "DeepGemm MoE is only supported with DeepEPMoE"
+                    )
                     requant_block_scale_ue8m0_for_deepgemm(
                         layer.w2_weight,
                         layer.w2_weight_scale_inv,
@@ -1719,7 +1751,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer.w2_input_scale = None
 
     def _process_mxfp8_moe_weights(self, layer: Module, quantize: bool = True) -> None:
-
         if not (
             (_is_cuda and is_sm100_supported()) or (_is_hip and _is_gfx95_supported)
         ):
@@ -1801,7 +1832,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return scale.data
 
         def _quantize_and_swizzle_with_triton_kernel(weight: torch.Tensor):
-
             weight = weight.contiguous()
             _, _, k = weight.shape
             assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
@@ -2222,9 +2252,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     int4_rescale = (
                         layer.w13_weight_scale[expert_id][shard_id] / max_w13_scale_fp8
                     )
-                    layer.w13_weight_scale1[expert_id][
-                        start : start + shard_size
-                    ] *= int4_rescale
+                    layer.w13_weight_scale1[expert_id][start : start + shard_size] *= (
+                        int4_rescale
+                    )
                 start += shard_size
 
         layer.w13_weight_scale = torch.nn.Parameter(max_w13_scales, requires_grad=False)
@@ -2323,7 +2353,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         x = dispatch_output.hidden_states
@@ -2446,7 +2475,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return StandardCombineInput(hidden_states=output)
 
         if self.runner.runner_backend.is_deep_gemm():
-
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
 

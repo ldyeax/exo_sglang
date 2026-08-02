@@ -27,6 +27,7 @@ from contextlib import contextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     Generator,
     Iterable,
@@ -382,6 +383,9 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
 
+        weight_name_filter: Optional[Callable[[str], bool]] = None
+        """Optional predicate applied before a safetensors value is materialized."""
+
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
             return cls(
@@ -390,6 +394,9 @@ class DefaultModelLoader(BaseModelLoader):
                 prefix="",
                 fall_back_to_pt=getattr(model, "fall_back_to_pt_during_load", True),
                 model_config=model_config,
+                weight_name_filter=getattr(
+                    model, "checkpoint_weight_name_filter", None
+                ),
             )
 
     counter_before_loading_weights: float = 0.0
@@ -475,7 +482,7 @@ class DefaultModelLoader(BaseModelLoader):
             allow_patterns = ["*.bin"]
         elif load_format == LoadFormat.DUMMY:
             raise ValueError(
-                f"DUMMY load_format should use DummyModelLoader and not call _prepare_weights"
+                "DUMMY load_format should use DummyModelLoader and not call _prepare_weights"
             )
         else:
             raise ValueError(f"Unknown load_format: {load_format}")
@@ -558,6 +565,7 @@ class DefaultModelLoader(BaseModelLoader):
         """Get an iterator for the model weights based on the load format."""
         extra_config = self.load_config.model_loader_extra_config
         use_multithread = extra_config.get("enable_multithread_load", True)
+        weight_name_filter = getattr(source, "weight_name_filter", None)
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
@@ -580,7 +588,6 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            server_args = get_server_args()
             weight_loader_disable_mmap = get_model().weight_loader_disable_mmap
             weight_loader_prefetch = get_model().weight_loader_prefetch_checkpoints
             prefetch_num_threads = get_model().weight_loader_prefetch_num_threads
@@ -633,6 +640,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    tensor_name_filter=weight_name_filter,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -641,6 +649,7 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    tensor_name_filter=weight_name_filter,
                 )
 
         else:
@@ -689,7 +698,6 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
         yield from self._get_weights_iterator(primary_weights)
 
@@ -789,7 +797,6 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
             # Load base model using shared method
             model = self._load_modelopt_base_model(model_config)
@@ -1429,7 +1436,6 @@ class DummyModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         if get_bool_env_var("SGL_CPU_QUANTIZATION"):
             return load_model_with_cpu_quantization(
                 self, model_config=model_config, device_config=device_config
@@ -2739,7 +2745,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if self._is_4bit_weight_name(weight_name):
                 continue
 
@@ -2763,7 +2768,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         for weight_name, weight_tensor in self._hf_weight_iter(
             hf_weights_files, use_safetensors
         ):
-
             if any(
                 target_module in weight_name for target_module in self.target_modules
             ) and weight_name.endswith(".weight"):
@@ -2773,7 +2777,6 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                     module in weight_name
                     for module in self.column_parallel_weights_modules
                 ):
-
                     total_size = weight_tensor.size(-1)
                     start_index = total_size // tp_size * tp_rank
                     end_index = total_size // tp_size * (tp_rank + 1)
@@ -2834,7 +2837,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
         self.model_type = type(model).__name__
 
         logger.info(
-            "Loading weights with BitsAndBytes quantization. " " May take a while ..."
+            "Loading weights with BitsAndBytes quantization.  May take a while ..."
         )
 
         quant_config = getattr(model_config.hf_config, "quantization_config", None)
@@ -2846,8 +2849,7 @@ class BitsAndBytesModelLoader(BaseModelLoader):
                 pre_quant = True
             else:
                 raise ValueError(
-                    f"BitsAndBytes loader does not support {quant_method} "
-                    "quantization"
+                    f"BitsAndBytes loader does not support {quant_method} quantization"
                 )
 
         # The quant_states in pre_quantized models cannot work with a split
@@ -3044,7 +3046,6 @@ class GGUFModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         local_model_path = self._prepare_weights(model_config.model_path)
         gguf_weights_map = self._get_gguf_weights_map(model_config)
         # we can only know if tie word embeddings after mapping weights
@@ -3355,7 +3356,7 @@ class RemoteModelLoader(BaseModelLoader):
                     param_data = param_data.narrow(dim, 0, size)
             if tensor.shape != param_shape:
                 logger.warning(
-                    "loading tensor of shape %s into " "parameter '%s' of shape %s",
+                    "loading tensor of shape %s into parameter '%s' of shape %s",
                     tensor.shape,
                     key,
                     param_shape,
@@ -3370,7 +3371,6 @@ class RemoteModelLoader(BaseModelLoader):
     def _load_model_from_remote_fs(
         self, model, client, model_config: ModelConfig, device_config: DeviceConfig
     ) -> nn.Module:
-
         target_device = torch.device(device_config.device)
         with set_default_torch_dtype(model_config.dtype):
             model.load_weights(self._get_weights_iterator_fs(client))
@@ -3475,7 +3475,6 @@ class IncModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         logger.info("IncModelLoader: Loading model...")
 
         # Check if model is already quantized
@@ -3741,7 +3740,6 @@ class ModelOptModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         logger.info("ModelOptModelLoader: Loading base model...")
 
         # Store the original model path for tokenizer export
@@ -4019,7 +4017,6 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-
         primary_weights = RunaiModelStreamerLoader.Source.init_new(model_config, model)
         yield from self._get_weights_iterator(primary_weights)
 
@@ -4039,7 +4036,6 @@ class RunaiModelStreamerLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
             # Load base model using shared method
             raise NotImplementedError(
