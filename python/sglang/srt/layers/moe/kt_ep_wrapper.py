@@ -508,7 +508,7 @@ def resolve_gpu_experts_mask(
                 f"[0, {num_experts}], got {draft_gpu_experts}"
             )
         return (
-            torch.arange(num_experts, dtype=torch.int64)
+            torch.arange(num_experts, dtype=torch.int64, device="cpu")
             < draft_gpu_experts
         )
 
@@ -556,7 +556,10 @@ def resolve_gpu_experts_mask(
             )
         return masks[layer_idx].clone()
 
-    return torch.arange(num_experts, dtype=torch.int64) < requested_gpu_experts
+    return (
+        torch.arange(num_experts, dtype=torch.int64, device="cpu")
+        < requested_gpu_experts
+    )
 
 
 def create_kt_config_from_server_args(
@@ -737,9 +740,10 @@ def create_kt_config_from_server_args(
     # experts at execution time reserves their AMX/AVX weight buffers anyway
     # and prevents GPU placement from freeing host capacity.
     if cpu_expert_ids is None and bool(gpu_experts_mask.any().item()):
+        cpu_gpu_experts_mask = gpu_experts_mask.to(device="cpu")
         cpu_expert_ids = torch.arange(
             global_num_experts, dtype=torch.int64, device="cpu"
-        )[~gpu_experts_mask]
+        )[~cpu_gpu_experts_mask]
 
     return KTConfig(
         layer_idx=layer_idx,

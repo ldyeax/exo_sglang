@@ -312,6 +312,34 @@ def test_gpu_only_tier_compacts_native_cpu_storage() -> None:
     )
 
 
+def test_gpu_only_tier_stays_on_cpu_under_accelerator_default_device() -> None:
+    server_args = SimpleNamespace(
+        get_model_config=lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(num_hidden_layers=2, n_routed_experts=8)
+        ),
+        kt_weight_path="/model",
+        kt_num_gpu_experts=2,
+        kt_cpuinfer=4,
+        kt_threadpool_count=1,
+        kt_numa_nodes=[0],
+        chunked_prefill_size=32,
+        kt_method="MXFP4",
+        kt_max_deferred_experts_per_token=None,
+    )
+
+    with torch.device("meta"):
+        config = create_kt_config_from_server_args(server_args, layer_idx=0)
+
+    assert config is not None
+    assert config.gpu_experts_mask.device.type == "cpu"
+    assert config.cpu_expert_ids is not None
+    assert config.cpu_expert_ids.device.type == "cpu"
+    torch.testing.assert_close(
+        config.cpu_expert_ids,
+        torch.tensor([2, 3, 4, 5, 6, 7], dtype=torch.int64),
+    )
+
+
 def test_profile_selects_global_hottest_expert_slots(tmp_path) -> None:
     counts = torch.tensor(
         [[[1, 9, 2, 3], [8, 7, 6, 5]]],

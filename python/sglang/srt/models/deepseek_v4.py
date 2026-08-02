@@ -165,6 +165,9 @@ _MHC_POST_MULT_VALUE = 2.0
 _CAPTURE_DSV4_ATTENTION_IN_BCG = (
     os.environ.get("SGLANG_DSV4_CAPTURE_ATTN_IN_BCG") == "1"
 )
+_EAGER_DSV4_ATTENTION_MODULE_IN_BCG = (
+    os.environ.get("SGLANG_DSV4_EAGER_ATTN_MODULE_IN_BCG") == "1"
+)
 _WO_PROJECTION_CHUNK_SIZE = int(
     os.environ.get("SGLANG_DSV4_WO_PROJECTION_CHUNK_SIZE", "0")
 )
@@ -2039,6 +2042,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         if (
             is_in_breakable_cuda_graph()
+            and _EAGER_DSV4_ATTENTION_MODULE_IN_BCG
             and not _CAPTURE_DSV4_ATTENTION_IN_BCG
         ):
             hidden_states = bcg_deepseek_v4_attention_module(

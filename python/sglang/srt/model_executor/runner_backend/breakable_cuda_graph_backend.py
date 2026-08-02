@@ -77,9 +77,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._debug_eager = debug_eager
         self._shared_output_buffer: Optional[Any] = None
         capture_shapes = (
-            cuda_graph_runner.capture_num_tokens
-            if cuda_graph_runner.ragged_verify_mode
-            else cuda_graph_runner.capture_bs
+            cuda_graph_runner.capture_bs
+            if hasattr(cuda_graph_runner, "capture_bs")
+            and not getattr(cuda_graph_runner, "ragged_verify_mode", False)
+            else cuda_graph_runner.capture_num_tokens
         )
         self._single_capture_shape = len(capture_shapes) == 1
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(

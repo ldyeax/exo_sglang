@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import enum
 import functools
+import inspect
 import logging
 import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     List,
     Literal,
@@ -46,6 +48,7 @@ from sglang.srt.layers.attention.dsv4.metadata_kernel import (
     init_compression_metadata as _init_compression_metadata_triton,
 )
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+    quant_to_nope_bf16_rope_bf16_pack,
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
@@ -87,6 +90,13 @@ _is_sm120 = is_sm120_supported()
 _is_xpu = is_xpu()
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _flash_mla_sparse_parameter_names(
+    function: Callable[..., object],
+) -> frozenset[str]:
+    return frozenset(inspect.signature(function).parameters)
 
 SWA_WINDOW = 128
 C4_TOPK = 512
@@ -1600,12 +1610,19 @@ class DeepseekV4AttnBackend(
                 cache_k=swa_k,
             )
         else:
-            swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
-            self.token_to_kv_pool.set_swa_key_buffer_radix(
-                layer_id=layer_id,
-                swa_loc=swa_loc,
-                cache_nope_fp8_rope_bf16_pack=swa_k_pack,
-            )
+            if self.token_to_kv_pool.swa_kv_pool.use_bf16_cache:
+                self.token_to_kv_pool.set_swa_key_buffer_radix(
+                    layer_id=layer_id,
+                    swa_loc=swa_loc,
+                    cache_bf16_pack=quant_to_nope_bf16_rope_bf16_pack(swa_k),
+                )
+            else:
+                swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
+                self.token_to_kv_pool.set_swa_key_buffer_radix(
+                    layer_id=layer_id,
+                    swa_loc=swa_loc,
+                    cache_nope_fp8_rope_bf16_pack=swa_k_pack,
+                )
 
     def forward(
         self,
@@ -1873,15 +1890,38 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_flat,
-            kv=kv,
-            indices=combined_indices.unsqueeze(1),
-            sm_scale=self.softmax_scale,
-            d_v=self.head_dim_v,
-            attn_sink=attn_sink,
-            topk_length=combined_lens,
+        if token_to_kv_pool.use_bf16_cache:
+            from sglang.srt.layers.attention.dsv4.unified_kv_kernels.paged_prefill import (
+                sparse_attn_v4_flat_prefill,
+            )
+
+            return sparse_attn_v4_flat_prefill(
+                query=q_flat,
+                key_value=kv,
+                indices=combined_indices,
+                lengths=combined_lens,
+                attention_sink=attn_sink,
+                softmax_scale=self.softmax_scale,
+            )
+
+        flash_mla_parameters = _flash_mla_sparse_parameter_names(
+            flash_mla_sparse_fwd
         )
+        flash_mla_kwargs = {
+            "q": q_flat,
+            "kv": kv,
+            "indices": combined_indices.unsqueeze(1),
+            "sm_scale": self.softmax_scale,
+            "d_v": self.head_dim_v,
+        }
+        # sgl-kernel 0.4.5 adds variable-length sparse rows and attention
+        # sinks.  The CUDA 12 runtime retained on dwagon carries 0.3.21; its
+        # kernel consumes the same -1-padded indices but has neither keyword.
+        if "attn_sink" in flash_mla_parameters:
+            flash_mla_kwargs["attn_sink"] = attn_sink
+        if "topk_length" in flash_mla_parameters:
+            flash_mla_kwargs["topk_length"] = combined_lens
+        o, _, _ = flash_mla_sparse_fwd(**flash_mla_kwargs)
         return o
 
     def expand_prefill_casually(

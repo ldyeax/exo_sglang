@@ -31,6 +31,123 @@ class NopeFp8RopeBf16Pack:
         )
 
 
+@dataclass
+class NopeBf16RopeBf16Pack:
+    """Unquantized Ampere KV-cache payload."""
+
+    k_nope_bf16: torch.Tensor
+    k_rope_bf16: torch.Tensor
+
+    def __post_init__(self):
+        assert self.k_nope_bf16.shape[-1] == 448
+        assert self.k_rope_bf16.shape[-1] == 64
+
+    def slice_pack(self, _slice: Any) -> NopeBf16RopeBf16Pack:
+        return NopeBf16RopeBf16Pack(
+            k_nope_bf16=self.k_nope_bf16[_slice],
+            k_rope_bf16=self.k_rope_bf16[_slice],
+        )
+
+
+class SetBf16KAndS:
+    """Scatter all-BF16 NoPE and RoPE vectors into a paged byte buffer."""
+
+    @classmethod
+    def execute(cls, pool, buf, loc, pack: NopeBf16RopeBf16Pack):
+        _set_bf16_k_and_s_triton(buf, loc, pack, pool.page_size)
+
+    @classmethod
+    def torch(cls, pool, buf, loc, pack: NopeBf16RopeBf16Pack):
+        _set_bf16_k_and_s_torch(buf, loc, pack, pool.page_size)
+
+
+@triton.jit
+def _set_bf16_k_and_s_kernel(
+    buf_bf16_ptr,
+    loc_ptr,
+    nope_ptr,
+    rope_ptr,
+    nope_stride_0,
+    rope_stride_0,
+    PAGE_SIZE: tl.constexpr,
+    BF16_PER_PAGE: tl.constexpr,
+    NOPE_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    TOKEN_BF16: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    loc = tl.load(loc_ptr + token_id)
+    page = loc // PAGE_SIZE
+    offset = loc % PAGE_SIZE
+    base = page * BF16_PER_PAGE + offset * TOKEN_BF16
+
+    nope_offsets = tl.arange(0, BLOCK_NOPE)
+    nope_mask = nope_offsets < NOPE_DIM
+    nope = tl.load(
+        nope_ptr + token_id * nope_stride_0 + nope_offsets,
+        mask=nope_mask,
+        other=0.0,
+    )
+    tl.store(buf_bf16_ptr + base + nope_offsets, nope, mask=nope_mask)
+
+    rope_offsets = tl.arange(0, BLOCK_ROPE)
+    rope = tl.load(rope_ptr + token_id * rope_stride_0 + rope_offsets)
+    tl.store(buf_bf16_ptr + base + NOPE_DIM + rope_offsets, rope)
+
+
+def _set_bf16_k_and_s_triton(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    pack: NopeBf16RopeBf16Pack,
+    page_size: int,
+):
+    (num_tokens,) = loc.shape
+    nope_dim, rope_dim = 448, 64
+    buf_bf16 = buf.view(torch.bfloat16)
+    _set_bf16_k_and_s_kernel[(num_tokens,)](
+        buf_bf16,
+        loc,
+        pack.k_nope_bf16,
+        pack.k_rope_bf16,
+        pack.k_nope_bf16.stride(0),
+        pack.k_rope_bf16.stride(0),
+        PAGE_SIZE=page_size,
+        BF16_PER_PAGE=buf_bf16.shape[1],
+        NOPE_DIM=nope_dim,
+        ROPE_DIM=rope_dim,
+        TOKEN_BF16=nope_dim + rope_dim,
+        BLOCK_NOPE=512,
+        BLOCK_ROPE=64,
+        num_warps=4,
+    )
+
+
+def _set_bf16_k_and_s_torch(
+    buf: torch.Tensor,
+    loc: torch.Tensor,
+    pack: NopeBf16RopeBf16Pack,
+    page_size: int,
+):
+    loc = loc.to(torch.int64)
+    nope_dim, rope_dim = 448, 64
+    token_bf16 = nope_dim + rope_dim
+    flat = buf.view(torch.bfloat16).flatten()
+    bf16_per_page = buf.shape[1] // 2
+    bases = (loc // page_size) * bf16_per_page + (loc % page_size) * token_bf16
+
+    nope_indices = bases[:, None] + torch.arange(
+        nope_dim, device=buf.device, dtype=torch.int64
+    )
+    flat[nope_indices] = pack.k_nope_bf16
+
+    rope_indices = bases[:, None] + nope_dim + torch.arange(
+        rope_dim, device=buf.device, dtype=torch.int64
+    )
+    flat[rope_indices] = pack.k_rope_bf16
+
+
 class SetKAndS:
     @classmethod
     def execute(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):

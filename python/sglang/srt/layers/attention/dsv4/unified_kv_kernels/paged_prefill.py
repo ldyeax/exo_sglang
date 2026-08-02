@@ -357,3 +357,148 @@ def sparse_attn_v4_paged_prefill(
         attn_sink,
         softmax_scale,
     )
+
+
+@triton.jit
+def _sparse_attn_v4_flat_prefill_kernel(
+    q_ptr,
+    kv_ptr,
+    indices_ptr,
+    lengths_ptr,
+    sink_ptr,
+    out_ptr,
+    q_stride_t: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    kv_stride_n: tl.constexpr,
+    kv_stride_d: tl.constexpr,
+    indices_stride_t: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    out_stride_d: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    softmax_scale: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """SM86-capable sparse prefill over a gathered native-BF16 KV workspace."""
+    token_index = tl.program_id(0)
+    head_program_index = tl.program_id(1)
+    head_offsets = head_program_index * BLOCK_H + tl.arange(0, BLOCK_H)
+    dimension_offsets = tl.arange(0, BLOCK_D)
+    head_mask = head_offsets < H
+    dimension_mask = dimension_offsets < D
+    query = tl.load(
+        q_ptr
+        + token_index * q_stride_t
+        + head_offsets[:, None] * q_stride_h
+        + dimension_offsets[None, :] * q_stride_d,
+        mask=head_mask[:, None] & dimension_mask[None, :],
+        other=0.0,
+    )
+
+    negative_large = -3.4028234663852886e38
+    running_maximum = tl.full((BLOCK_H,), negative_large, dtype=tl.float32)
+    running_sum = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+    row_length = tl.load(lengths_ptr + token_index)
+    key_offsets = tl.arange(0, BLOCK_K)
+
+    for key_start in tl.range(0, row_length, BLOCK_K):
+        positions = key_start + key_offsets
+        in_range = positions < row_length
+        slot = tl.load(
+            indices_ptr + token_index * indices_stride_t + positions,
+            mask=in_range,
+            other=-1,
+        )
+        valid = in_range & (slot >= 0)
+        slot = tl.maximum(slot, 0)
+        key_value = tl.load(
+            kv_ptr
+            + slot[:, None] * kv_stride_n
+            + dimension_offsets[None, :] * kv_stride_d,
+            mask=valid[:, None] & dimension_mask[None, :],
+            other=0.0,
+        )
+        scores = tl.dot(query, tl.trans(key_value)) * softmax_scale
+        scores = tl.where(
+            head_mask[:, None] & valid[None, :], scores, negative_large
+        )
+        block_maximum = tl.max(scores, axis=1)
+        new_maximum = tl.maximum(running_maximum, block_maximum)
+        alpha = tl.exp(running_maximum - new_maximum)
+        probabilities = tl.exp(scores - new_maximum[:, None])
+        probabilities = tl.where(
+            head_mask[:, None] & valid[None, :], probabilities, 0.0
+        )
+        accumulator = accumulator * alpha[:, None] + tl.dot(
+            probabilities.to(key_value.dtype), key_value
+        )
+        running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
+        running_maximum = new_maximum
+
+    sink = tl.load(
+        sink_ptr + head_offsets, mask=head_mask, other=negative_large
+    ).to(tl.float32)
+    final_maximum = tl.maximum(running_maximum, sink)
+    alpha = tl.exp(running_maximum - final_maximum)
+    final_sum = running_sum * alpha + tl.exp(sink - final_maximum)
+    result = (accumulator * alpha[:, None]) / tl.maximum(
+        final_sum, 1.0e-30
+    )[:, None]
+    tl.store(
+        out_ptr
+        + token_index * out_stride_t
+        + head_offsets[:, None] * out_stride_h
+        + dimension_offsets[None, :] * out_stride_d,
+        result,
+        mask=head_mask[:, None] & dimension_mask[None, :],
+    )
+
+
+def sparse_attn_v4_flat_prefill(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    attention_sink: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Run sparse native-BF16 prefill over a gathered key/value workspace."""
+    if key_value.ndim == 3:
+        key_value = key_value.squeeze(1)
+    if indices.ndim == 3:
+        indices = indices.squeeze(1)
+    token_count, head_count, head_dimension = query.shape
+    output = torch.empty_like(query)
+    block_head_count = 8
+    _sparse_attn_v4_flat_prefill_kernel[
+        (token_count, triton.cdiv(head_count, block_head_count))
+    ](
+        query,
+        key_value,
+        indices,
+        lengths,
+        attention_sink,
+        output,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        key_value.stride(0),
+        key_value.stride(1),
+        indices.stride(0),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        head_count,
+        head_dimension,
+        float(softmax_scale),
+        BLOCK_H=block_head_count,
+        BLOCK_D=triton.next_power_of_2(head_dimension),
+        BLOCK_K=16,
+        num_warps=8,
+    )
+    return output

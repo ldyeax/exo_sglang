@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -230,6 +231,9 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+_REUSE_DSV4_MAIN_Q_FOR_SHARED_MLP = (
+    os.environ.get("SGLANG_DSV4_REUSE_MAIN_Q_FOR_SHARED_MLP", "1") == "1"
+)
 
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
@@ -297,6 +301,8 @@ class DeepseekV2MLP(nn.Module):
         M = x.shape[0]
         quant_method = getattr(self.gate_up_proj, "quant_method", None)
         if (
+            not _REUSE_DSV4_MAIN_Q_FOR_SHARED_MLP
+            or
             not self._is_shared_expert
             or M < 512
             or not isinstance(quant_method, Fp8LinearMethod)
@@ -336,7 +342,11 @@ class DeepseekV2MLP(nn.Module):
         # Small batches (including decode/graph capture), dense MLPs, and
         # models/backends without this explicitly named workspace retain the
         # ordinary allocation path.
-        if self._is_shared_expert and M >= 512:
+        if (
+            _REUSE_DSV4_MAIN_Q_FOR_SHARED_MLP
+            and self._is_shared_expert
+            and M >= 512
+        ):
             attn_backend = get_attn_backend()
             workspace = getattr(attn_backend, "_dsv4_main_q_workspace", None)
             needed_elements = M * (N // 2)
@@ -376,6 +386,8 @@ class DeepseekV2MLP(nn.Module):
         M = x.shape[0]
         quant_method = getattr(self.down_proj, "quant_method", None)
         if (
+            not _REUSE_DSV4_MAIN_Q_FOR_SHARED_MLP
+            or
             not self._is_shared_expert
             or M < 512
             or not isinstance(quant_method, Fp8LinearMethod)

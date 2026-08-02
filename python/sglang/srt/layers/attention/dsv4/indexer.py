@@ -462,6 +462,8 @@ class C4IndexerBackendMixin:
         forward_batch: ForwardBatch,
         indexer_metadata: PagedIndexerMetadata,
     ) -> bool:
+        if self.token_to_kv_pool.c4_indexer_kv_pool.use_bf16_cache:
+            return False
         if not envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get():
             return False
         # This path calls CUDA DeepGEMM and assumes the CUDA FP8+FP32 packed
@@ -693,6 +695,12 @@ class C4IndexerBackendMixin:
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
             from deep_gemm import fp8_fp4_paged_mqa_logits as fn
+        elif token_to_kv_pool.c4_indexer_kv_pool.use_bf16_cache:
+            from sglang.srt.layers.attention.dsv4.tilelang_kernel import (
+                tilelang_bf16_paged_mqa_logits,
+            )
+
+            fn = tilelang_bf16_paged_mqa_logits
         elif envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
             from sglang.srt.layers.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
@@ -737,11 +745,13 @@ class C4IndexerBackendMixin:
         _use_torch = (
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get() and not use_fp4_indexer
         )
+        _use_bf16 = token_to_kv_pool.c4_indexer_kv_pool.use_bf16_cache
         if (
             _c4sl.dim() == 1
             and not _use_tilelang
             and not _use_aiter
             and not _use_torch
+            and not _use_bf16
         ):
             _c4sl = _c4sl.unsqueeze(-1)
 
@@ -817,14 +827,22 @@ class C4IndexerBackendMixin:
                 plan=nonpaged_plan,
             )
         else:
-            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=c4_indexer.layer_id,
-            )
-            assert c4_indexer_kv_cache.dim() == 2
-            head_dim_with_sf = 68 if use_fp4_indexer else 132
-            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
-            )
+            if _use_bf16:
+                c4_indexer_kv_cache = token_to_kv_pool.get_index_k_bf16_buffer(
+                    layer_id=c4_indexer.layer_id,
+                )
+                assert c4_indexer_kv_cache.shape[1:] == (64, 128)
+            else:
+                c4_indexer_kv_cache = (
+                    token_to_kv_pool.get_index_k_with_scale_buffer(
+                        layer_id=c4_indexer.layer_id,
+                    )
+                )
+                assert c4_indexer_kv_cache.dim() == 2
+                head_dim_with_sf = 68 if use_fp4_indexer else 132
+                c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                    c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
+                )
             # On SM86 the FP8 query already lives in the shared main-Q
             # workspace. Put logits in its disjoint suffix and immediately
             # consume each row tile into the persistent top-k page output.
@@ -972,7 +990,9 @@ class C4Indexer(nn.Module):
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
         from sglang.srt.runtime_context import get_server_args
 
-        self.use_fp4_indexer = get_server_args().enable_deepseek_v4_fp4_indexer
+        server_args = get_server_args()
+        self.use_fp4_indexer = server_args.enable_deepseek_v4_fp4_indexer
+        self.use_bf16_indexer = server_args.kv_cache_dtype in ("bf16", "bfloat16")
         self.alt_streams = alt_streams
 
     def compute_q(
@@ -1002,6 +1022,18 @@ class C4Indexer(nn.Module):
                 output=projection_output,
             )
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if self.use_bf16_indexer:
+            from sglang.jit_kernel.dsv4.elementwise import fused_rope_inplace
+            from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
+
+            fused_rope_inplace(
+                q[..., -self.rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions=positions,
+            )
+            q = rotate_activation(q)
+            return q, (weight * self.weight_scale).unsqueeze(-1)
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions

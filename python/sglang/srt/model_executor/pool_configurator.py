@@ -532,6 +532,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
         self.indexer_head_dim = cfg.index_head_dim
+        self.use_bf16_cache = mr.kv_cache_dtype == torch.bfloat16
         self.context_len = mr.model_config.context_len
         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
         self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]
@@ -616,12 +617,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
-
-        quant_block_size = 128
-        indexer_bytes = (
-            self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
-        )
+        if self.use_bf16_cache:
+            kv_bytes = (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
+            indexer_bytes = self.indexer_head_dim * 2
+        else:
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+            quant_block_size = 128
+            indexer_bytes = (
+                self.indexer_head_dim
+                + self.indexer_head_dim // quant_block_size * 4
+            )
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         c4_state_dtype_size, c128_state_dtype_size = (

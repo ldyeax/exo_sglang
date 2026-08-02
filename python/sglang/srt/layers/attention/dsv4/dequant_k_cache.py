@@ -50,6 +50,30 @@ def dequantize_k_cache_paged(
     bytes_per_page = quant_k_cache_u8.shape[-1]
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
+    if out is None:
+        out = torch.empty(
+            (num_tokens, 1, DIM_NOPE + DIM_ROPE),
+            dtype=torch.bfloat16,
+            device=quant_k_cache.device,
+        )
+    else:
+        assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
+        assert out.dtype == torch.bfloat16
+
+    bf16_bytes_per_token = (DIM_NOPE + DIM_ROPE) * 2
+    if bytes_per_page >= page_size * bf16_bytes_per_token:
+        _gather_bf16_k_cache_paged_kernel[(num_tokens,)](
+            out,
+            quant_k_cache_u8.view(torch.bfloat16).reshape(-1),
+            page_table_1_flattened,
+            out.stride(0),
+            BF16_PER_PAGE=bytes_per_page // 2,
+            PAGE_SIZE=page_size,
+            HEAD_DIM=DIM_NOPE + DIM_ROPE,
+            BLOCK_D=512,
+        )
+        return out
+
     # Typed views over the same underlying bytes.  SM86 cannot lower Triton's
     # fp8e4nv type, so the kernel decodes raw uint8 values through an exact
     # E4M3 lookup table instead of receiving an FP8-typed pointer.
@@ -60,16 +84,6 @@ def dequantize_k_cache_paged(
     )
 
     fp8_lut = _get_fp8_e4m3_lut(quant_k_cache.device)
-
-    if out is None:
-        out = torch.empty(
-            (num_tokens, 1, DIM_NOPE + DIM_ROPE),
-            dtype=torch.bfloat16,
-            device=quant_k_cache.device,
-        )
-    else:
-        assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
-        assert out.dtype == torch.bfloat16
 
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
@@ -89,6 +103,31 @@ def dequantize_k_cache_paged(
         S_OFFSET_BYTES=s_offset_bytes,
     )
     return out
+
+
+@triton.jit
+def _gather_bf16_k_cache_paged_kernel(
+    output_ptr,
+    cache_ptr,
+    token_ids_ptr,
+    output_stride_0,
+    BF16_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    loc = tl.load(token_ids_ptr + token_id).to(tl.int64)
+    page = loc // PAGE_SIZE
+    offset = loc % PAGE_SIZE
+    dims = tl.arange(0, BLOCK_D)
+    mask = dims < HEAD_DIM
+    values = tl.load(
+        cache_ptr + page * BF16_PER_PAGE + offset * HEAD_DIM + dims,
+        mask=mask,
+        other=0.0,
+    )
+    tl.store(output_ptr + token_id * output_stride_0 + dims, values, mask=mask)
 
 
 @triton.jit

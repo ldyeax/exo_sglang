@@ -17,6 +17,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
+    quant_to_nope_bf16_rope_bf16_pack,
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -191,8 +192,18 @@ class CompressorBackendMixin:
                 cache_k=new_compressed_kv,
             )
         else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
-            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+            _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
+            assert compress_kv_pool is not None
+            kv_bf16 = new_compressed_kv.bfloat16()
+            if compress_kv_pool.use_bf16_cache:
+                token_to_kv_pool.set_extra_key_buffer(
+                    layer_id,
+                    out_loc,
+                    cache_bf16_pack=quant_to_nope_bf16_rope_bf16_pack(kv_bf16),
+                )
+            else:
+                pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_bf16)
+                token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
     def forward_indexer_compressor(
         self,

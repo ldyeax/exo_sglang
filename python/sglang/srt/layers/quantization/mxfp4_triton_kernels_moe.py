@@ -10,6 +10,7 @@ Ampere MXFP4 path.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import logging
 import os
@@ -29,38 +30,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_KERNEL_RELATIVE_PATH = Path(
-    "third_party/sglang/python/sglang/srt/layers/quantization/"
-    "v4_triton_kernels_moe.py"
-)
-
-
-def _resolve_portable_kernel_path() -> Path:
-    """Find the KTransformers kernel from the active Python source roots."""
-    configured_path = os.environ.get("SGLANG_V4_TRITON_KERNEL_PATH")
-    if configured_path:
-        return Path(configured_path)
-
-    searched_paths = []
-    for source_root_text in sys.path:
-        if not source_root_text:
-            continue
-        candidate_path = Path(source_root_text) / _KERNEL_RELATIVE_PATH
-        searched_paths.append(candidate_path)
-        if candidate_path.is_file():
-            return candidate_path
-
-    searched = ", ".join(str(path) for path in searched_paths)
-    raise FileNotFoundError(
-        "DeepSeek V4 portable MXFP4 kernel was not found below any active "
-        f"Python source root; searched: {searched}"
-    )
-
-
 @lru_cache(maxsize=1)
 def _portable_kernel_module() -> ModuleType:
-    """Load the proven KTransformers portable kernel against this SGLang API."""
-    kernel_path = _resolve_portable_kernel_path()
+    """Load the current SGLang kernel, with an explicit file override for tests."""
+    configured_path = os.environ.get("SGLANG_V4_TRITON_KERNEL_PATH")
+    if not configured_path:
+        return importlib.import_module(
+            "sglang.srt.layers.quantization.v4_triton_kernels_moe"
+        )
+
+    kernel_path = Path(configured_path)
     if not kernel_path.is_file():
         raise FileNotFoundError(
             f"DeepSeek V4 portable MXFP4 kernel is missing: {kernel_path}"

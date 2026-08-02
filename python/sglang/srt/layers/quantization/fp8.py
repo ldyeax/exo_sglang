@@ -366,9 +366,15 @@ class Fp8Config(QuantizationConfig):
 
             fp8_method = Fp8MoEMethod(self)
 
-            if (
-                self.is_fp4_experts
-                and os.environ.get("SGLANG_V4_USE_TRITON_KERNELS") == "1"
+            portable_mxfp4_override = os.environ.get(
+                "SGLANG_V4_USE_TRITON_KERNELS"
+            )
+            if self.is_fp4_experts and (
+                portable_mxfp4_override == "1"
+                or (
+                    portable_mxfp4_override is None
+                    and get_moe_runner_backend().is_triton()
+                )
             ):
                 from sglang.srt.layers.quantization.mxfp4_triton_kernels_moe import (
                     Mxfp4TritonKernelsMoEMethod,
