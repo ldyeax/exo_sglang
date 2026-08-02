@@ -2903,6 +2903,11 @@ class ServerArgs:
         "[ktransformers parameter] One-to-one with the number of NUMA nodes (one thread pool per NUMA).",
         NS("exec.moe"),
     ] = 2
+    kt_numa_nodes: A[
+        Optional[List[int]],
+        "[ktransformers parameter] Explicit physical NUMA node for each KT thread pool.",
+        NS("exec.moe"),
+    ] = None
     kt_num_gpu_experts: A[
         Optional[int],
         "[ktransformers parameter] The number of GPU experts.",
