@@ -64,7 +64,13 @@ enum class ForwardMode : bool {
 // Each warp's 32 lanes cover the full 128-elem head_dim (kVecSize = 4 each).
 // Cache layout: 132 bytes/token (128 fp8 nope + 4 fp32 scale).
 // ----------------------------------------------------------------------------
-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL, int32_t kPreshuffleSize = 0>
+template <
+    typename DType,
+    ForwardMode kMode,
+    int32_t kPageBits,
+    bool kUsePDL,
+    int32_t kPreshuffleSize = 0,
+    bool kBf16Store = false>
 INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
@@ -73,7 +79,7 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
   constexpr int64_t kRopeDim = 64;
   constexpr int64_t kVecSize = 4;
   constexpr uint32_t kRopeSize = kRopeDim / kVecSize;
-  constexpr int64_t kPageBytes = 132ll << kPageBits;
+  constexpr int64_t kPageBytes = (kBf16Store ? 256ll : 132ll) << kPageBits;
   static_assert(kHeadDim == kWarpThreads * kVecSize);
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
@@ -191,10 +197,18 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
       data[i] *= kHadamardScale;
   }
 
-  // part 4: per-warp UE8M0 quant + store. The whole warp emits one fp8 group
-  // (= 128 elements) plus a single fp32 scale, matching the indexer cache
-  // layout (`fused_store_indexer_cache`).
-  {
+  // part 4: native BF16 on pre-SM90, otherwise FP8 plus one fp32 scale.
+  if constexpr (kBf16Store) {
+    using OutStorage = AlignedVector<bf16_t, kVecSize>;
+    const int64_t page = out_loc >> kPageBits;
+    const int64_t offset = out_loc & ((1 << kPageBits) - 1);
+    auto value_ptr = reinterpret_cast<bf16_t*>(params.kvcache + page * kPageBytes) + offset * kHeadDim;
+    OutStorage result;
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i) result[i] = cast<bf16_t>(data[i]);
+    PDLTriggerSecondary<kUsePDL>();
+    result.store(value_ptr, lane_id);
+  } else {
     using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
     float local_max = math::abs(data[0]);
 #pragma unroll
@@ -394,7 +408,9 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   // kBf16Store: write the whole head_dim as plain BF16 (no fp8 / no scale) into a
   // [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc
   constexpr int64_t kPageBytes =
-      kBf16Store ? ((kHeadDim * 2ll) << kPageBits) : host::div_ceil(584ll << kPageBits, 576) * 576;
+      kBf16Store
+          ? host::div_ceil((kHeadDim * 2ll) << kPageBits, 576) * 576
+          : host::div_ceil(584ll << kPageBits, 576) * 576;
   static_assert(kHeadDim == kBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -522,10 +538,11 @@ template <
 struct FusedNormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
-  static_assert(!(kIsIndexer && kBf16Store), "bf16 store only for flashmla head_dim=512");
   static constexpr int64_t kIndexerBytes = 132 * kPageSize;
   static constexpr int64_t kFlashMLABytes = host::div_ceil(584 * kPageSize, 576) * 576;
-  static constexpr int64_t kBf16Bytes = kHeadDim * 2 * kPageSize;  // plain bf16 cache
+  static constexpr int64_t kBf16Bytes =
+      kIsIndexer ? kHeadDim * 2 * kPageSize
+                 : host::div_ceil(kHeadDim * 2 * kPageSize, 576) * 576;
   static constexpr int64_t kPageBytes = kBf16Store ? kBf16Bytes : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
 
   /// TODO: Let's fix the config for now.
@@ -535,7 +552,7 @@ struct FusedNormRopeKernel {
   template <ForwardMode kMode>
   static constexpr auto select_kernel() {
     if constexpr (kIsIndexer) {
-      return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize>;
+      return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize, kBf16Store>;
     } else {
       return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store>;
     }

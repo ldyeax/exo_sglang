@@ -310,7 +310,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         capture_decode_cuda_graph = not get_exec().graph.disable_cuda_graph
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            if available_mem < 1.0:
+            # The V4 DSpark verify graph at batch size 1 uses about 70 MiB on
+            # SM86. Keep a conservative margin, but do not discard the draft
+            # graph solely because routed experts leave less than 1 GiB free.
+            if available_mem < 0.25:
                 capture_decode_cuda_graph = False
                 logger.warning(
                     "Disable DSpark draft cuda graph because only %.2f GB GPU "

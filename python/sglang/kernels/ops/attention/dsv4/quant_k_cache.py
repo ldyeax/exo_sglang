@@ -2,10 +2,24 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
+from sglang.kernels.ops.attention.dsv4.index_buf_accessor import (
+    NopeBf16RopeBf16Pack,
+    NopeFp8RopeBf16Pack,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+
+
+def _is_sm_lt_90() -> bool:
+    """Return True if GPU CC < (8, 9), i.e. Ampere and older without native FP8."""
+    return torch.cuda.get_device_capability() < (8, 9)
+
+
+def _is_sm_lt_100() -> bool:
+    """Return True if GPU SM version < 100 (Blackwell)."""
+    major, _ = torch.cuda.get_device_capability()
+    return major < 10
 
 
 @triton.jit
@@ -117,4 +131,18 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
         k_nope_fp8=k_nope_fp8,
         k_rope_bf16=k_rope_bf16,
         scale_k_nope_ue8m0=scale_k_nope_ue8m0,
+    )
+
+
+def quant_to_nope_bf16_rope_bf16_pack(
+    k_bf16: torch.Tensor,
+) -> NopeBf16RopeBf16Pack:
+    """Split a native BF16 key without applying cache quantization."""
+    assert k_bf16.dtype == torch.bfloat16
+    _num_tokens, hidden_dim = k_bf16.shape
+    assert hidden_dim == 512
+    k_nope_bf16, k_rope_bf16 = k_bf16.split([448, 64], dim=-1)
+    return NopeBf16RopeBf16Pack(
+        k_nope_bf16=k_nope_bf16.contiguous(),
+        k_rope_bf16=k_rope_bf16.contiguous(),
     )

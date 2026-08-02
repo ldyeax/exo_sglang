@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.dsv4.metadata_kernel import (
 )
 from sglang.kernels.ops.attention.dsv4.online_c128_mtp import OnlineC128MTPController
 from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
+    quant_to_nope_bf16_rope_bf16_pack,
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.kernels.ops.attention.dsv4_attn_metadata_kernels import (
@@ -1591,7 +1592,14 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if self.token_to_kv_pool.swa_kv_pool.use_bf16_cache:
+            swa_k_pack = quant_to_nope_bf16_rope_bf16_pack(swa_k.bfloat16())
+            self.token_to_kv_pool.set_swa_key_buffer_radix(
+                layer_id=layer_id,
+                swa_loc=swa_loc,
+                cache_bf16_pack=swa_k_pack,
+            )
+        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
                 swa_loc=swa_loc,
@@ -1702,6 +1710,7 @@ class DeepseekV4AttnBackend(
             if (
                 forward_batch.forward_mode.is_extend_without_speculative()
                 and not _is_sm120
+                and torch.cuda.get_device_capability() >= (8, 9)
                 and (
                     q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
                     or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
@@ -1717,7 +1726,30 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if _is_sm120:
+            if torch.cuda.get_device_capability() < (8, 9):
+                from sglang.kernels.ops.attention.dsv4.bf16_decode import (
+                    decode_sparse_attention_bf16,
+                )
+
+                q_bf16 = q.squeeze(1).to(torch.bfloat16)
+                o_bf16 = torch.empty_like(q_bf16)
+                _, _, extra_pool = token_to_kv_pool.layer_mapping[layer_id]
+                decode_sparse_attention_bf16(
+                    q=q_bf16,
+                    swa_cache=swa_k_cache,
+                    swa_indices=swa_page_indices,
+                    swa_lens=swa_topk_lengths,
+                    scale=self.softmax_scale,
+                    attn_sink=attn_sink,
+                    out=o_bf16,
+                    swa_block_size=token_to_kv_pool.swa_kv_pool.page_size,
+                    extra_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_lens=extra_topk_lengths,
+                    extra_block_size=(extra_pool.page_size if extra_pool else None),
+                )
+                o = o_bf16.unsqueeze(1)
+            elif _is_sm120:
                 from sglang.kernels.ops.attention.flash_mla_sm120 import (
                     flash_mla_with_kvcache_sm120,
                 )
@@ -1849,25 +1881,41 @@ class DeepseekV4AttnBackend(
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
+                is_bf16=token_to_kv_pool.swa_kv_pool.use_bf16_cache,
             )
         dequantize_k_cache_paged(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,
             out=swa_slice,
+            is_bf16=token_to_kv_pool.swa_kv_pool.use_bf16_cache,
         )
         kv = workspace
 
-        o, _, _ = flash_mla_sparse_fwd(
-            q=q_flat,
-            kv=kv,
-            indices=combined_indices.unsqueeze(1),
-            sm_scale=self.softmax_scale,
-            d_v=self.head_dim_v,
-            attn_sink=attn_sink,
-            topk_length=combined_lens,
-        )
-        return o
+        if token_to_kv_pool.swa_kv_pool.use_bf16_cache:
+            from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_prefill import (
+                sparse_attn_v4_flat_prefill,
+            )
+
+            return sparse_attn_v4_flat_prefill(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices,
+                lengths=combined_lens,
+                attn_sink=attn_sink,
+                softmax_scale=self.softmax_scale,
+            )
+        else:
+            o, _, _ = flash_mla_sparse_fwd(
+                q=q_flat,
+                kv=kv,
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.softmax_scale,
+                d_v=self.head_dim_v,
+                attn_sink=attn_sink,
+                topk_length=combined_lens,
+            )
+            return o
 
     def expand_prefill_casually(
         self,

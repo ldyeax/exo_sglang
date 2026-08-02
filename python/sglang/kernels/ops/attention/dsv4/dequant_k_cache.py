@@ -26,6 +26,7 @@ def dequantize_k_cache_paged(
     page_table_1_flattened: torch.Tensor,
     page_size: int,
     out: Optional[torch.Tensor] = None,
+    is_bf16: bool = False,
 ) -> torch.Tensor:
     """Dequantize the DeepSeek v4 paged KV cache for a list of token IDs.
 
@@ -50,11 +51,6 @@ def dequantize_k_cache_paged(
     bytes_per_page = quant_k_cache_u8.shape[-1]
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
-    # Three typed views over the same underlying bytes.
-    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
-    buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
-    buf_uint8 = quant_k_cache_u8.reshape(-1)
-
     if out is None:
         out = torch.empty(
             (num_tokens, 1, DIM_NOPE + DIM_ROPE),
@@ -64,6 +60,24 @@ def dequantize_k_cache_paged(
     else:
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
         assert out.dtype == torch.bfloat16
+
+    if is_bf16:
+        _gather_bf16_k_cache_paged_kernel[(num_tokens,)](
+            out,
+            quant_k_cache_u8.view(torch.bfloat16).reshape(-1),
+            page_table_1_flattened,
+            out.stride(0),
+            BF16_PER_PAGE=bytes_per_page // 2,
+            PAGE_SIZE=page_size,
+            TOKEN_ELEMS=DIM_NOPE + DIM_ROPE,
+            BLOCK_SIZE=512,
+        )
+        return out
+
+    # Three typed views over the same underlying bytes.
+    buf_fp8 = quant_k_cache_u8.view(fp8_dtype).reshape(-1)
+    buf_bf16 = quant_k_cache_u8.view(torch.bfloat16).reshape(-1)
+    buf_uint8 = quant_k_cache_u8.reshape(-1)
 
     _dequantize_k_cache_paged_kernel[(num_tokens,)](
         out,
@@ -83,6 +97,29 @@ def dequantize_k_cache_paged(
         S_OFFSET_BYTES=s_offset_bytes,
     )
     return out
+
+
+@triton.jit
+def _gather_bf16_k_cache_paged_kernel(
+    output_ptr,
+    buf_bf16_ptr,
+    page_table_ptr,
+    output_stride_0,
+    BF16_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    TOKEN_ELEMS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Gather unquantized BF16 cache rows without introducing FP8 IR types."""
+    token_id = tl.program_id(0)
+    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    page_idx = loc // PAGE_SIZE
+    in_page = loc % PAGE_SIZE
+    src_base = page_idx * BF16_PER_PAGE + in_page * TOKEN_ELEMS
+    dst_base = token_id * output_stride_0
+    offsets = tl.arange(0, BLOCK_SIZE)
+    values = tl.load(buf_bf16_ptr + src_base + offsets)
+    tl.store(output_ptr + dst_base + offsets, values)
 
 
 @triton.jit

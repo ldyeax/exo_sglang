@@ -279,7 +279,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             model_runner, self.captured_req_width
         )
         if KTRANSFORMERS_AVAILABLE:
-            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
+            KTMoEWrapper.set_capture_batch_sizes(
+                [bs * self.captured_req_width for bs in self.capture_bs]
+            )
 
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)

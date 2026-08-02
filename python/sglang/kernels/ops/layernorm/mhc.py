@@ -14,6 +14,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_round_robin_split
+from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 
@@ -833,7 +834,7 @@ def mhc_pre(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
         )
 
-    if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+    if ENABLE_JIT_DEEPGEMM and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
         n_splits = _compute_num_split_for_mhc_pre(num_tokens, hc_hidden_size)
 
         gemm_out_mul = torch.empty(
@@ -1445,7 +1446,7 @@ def mhc_fused_post_pre(
             hidden_size,
         )
 
-        if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
+        if ENABLE_JIT_DEEPGEMM and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             import deep_gemm
 
             deep_gemm.tf32_hc_prenorm_gemm(

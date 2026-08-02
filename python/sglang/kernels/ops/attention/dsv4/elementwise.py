@@ -51,9 +51,12 @@ def _jit_main_k_norm_rope_flashmla_module(
     head_dim: int,
     rope_dim: int,
     page_size: int,
+    bf16_store: bool,
 ):
     """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
-    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
+    args = make_cpp_args(
+        dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
+    )
     return load_jit(
         make_name("main_k_norm_rope_flashmla"),
         *args,
@@ -122,6 +125,12 @@ def fused_rope_inplace(
         positions: [batch_size] int32 or int64, indices into freqs_cis
         inverse: if True, apply inverse rotation (conjugate freqs)
     """
+    if q.ndim == 4:
+        assert q.shape[1] == 1
+        q = q.squeeze(1)
+    if k is not None and k.ndim == 4:
+        assert k.shape[1] == 1
+        k = k.squeeze(1)
     if _is_hip or _is_xpu:
         from sglang.kernels.ops.attention.deepseek_v4_rope import (
             apply_rotary_emb_triton,
@@ -271,6 +280,10 @@ def fused_k_norm_rope_flashmla(
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]
     module = _jit_main_k_norm_rope_flashmla_module(
-        kv.dtype, head_dim, rope_dim, page_size
+        kv.dtype,
+        head_dim,
+        rope_dim,
+        page_size,
+        torch.cuda.get_device_capability() < (8, 9),
     )
     module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)

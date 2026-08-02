@@ -257,13 +257,15 @@ struct FusedKNormRopeFlashMLAParams {
   float eps;
 };
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, int32_t kPageBits, bool kUsePDL>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, typename PosT, int32_t kPageBits, bool kUsePDL, bool kBf16Store>
 K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeFlashMLAParams params) {
   using namespace device;
 
   constexpr int64_t kVecSize = 2;
   constexpr uint32_t kRopeWarp = kFusedKNumWarps - 1;
-  constexpr int64_t kPageBytes = host::div_ceil(584ll << kPageBits, 576) * 576;
+  constexpr int64_t kPageBytes =
+      kBf16Store ? host::div_ceil(1024ll << kPageBits, 576) * 576
+                 : host::div_ceil(584ll << kPageBits, 576) * 576;
   static_assert(kHeadDim == kFusedKBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -326,11 +328,11 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   const int32_t page = out_loc >> kPageBits;
   const int32_t offset = out_loc & ((1 << kPageBits) - 1);
   const auto page_ptr = params.kvcache + page * kPageBytes;
-  const auto value_ptr = page_ptr + offset * 576;
+  const auto value_ptr = page_ptr + offset * (kBf16Store ? 1024 : 576);
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // part 2: rope on warp 7 (BF16 store), per-warp UE8M0 quant + store on warps 0..6.
+  // part 2: rotate the rope tail, then store either native BF16 or FP8/BF16.
   if (warp_id == kRopeWarp) {
     const auto x_real = data[0];
     const auto x_imag = data[1];
@@ -338,6 +340,11 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
     const auto freq_imag = freq[1];
     data[0] = x_real * freq_real - x_imag * freq_imag;
     data[1] = x_real * freq_imag + x_imag * freq_real;
+  }
+  if constexpr (kBf16Store) {
+    const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
+    reinterpret_cast<bf16x2_t*>(value_ptr)[tx] = result;
+  } else if (warp_id == kRopeWarp) {
     const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
     const auto rope_ptr = value_ptr + 448;
     reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
@@ -355,16 +362,18 @@ K_KERNEL void fused_k_norm_rope_flashmla(const __grid_constant__ FusedKNormRopeF
   }
 }
 
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, bool kUsePDL, bool kBf16Store>
 struct FusedKNormRopeFlashMLAKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
-  static constexpr int64_t kPageBytes = host::div_ceil(584 * kPageSize, 576) * 576;
+  static constexpr int64_t kPageBytes =
+      kBf16Store ? host::div_ceil(1024 * kPageSize, 576) * 576
+                 : host::div_ceil(584 * kPageSize, 576) * 576;
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogPageSize == kPageSize);
   static_assert(kHeadDim == 512 && kRopeDim == 64, "FlashMLA layout requires (512, 64)");
 
   template <typename PosT>
-  static constexpr auto kernel = fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kUsePDL>;
+  static constexpr auto kernel = fused_k_norm_rope_flashmla<DType, kHeadDim, kRopeDim, PosT, kLogPageSize, kUsePDL, kBf16Store>;
 
   static void forward(
       const tvm::ffi::TensorView kv,

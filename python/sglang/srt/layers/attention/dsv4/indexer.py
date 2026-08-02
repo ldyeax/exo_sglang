@@ -401,6 +401,126 @@ def topk_transform_512_flashinfer_unfused(
     )
 
 
+_bf16_direct_indexer_module: Any = None
+
+
+def _build_bf16_direct_paged_mqa_logits_kernel(
+    head_dim: int = 128,
+    num_heads: int = 64,
+    block_size: int = 64,
+) -> Any:
+    import tilelang as _tl
+    import tilelang.language as T
+
+    _tl.set_log_level("ERROR")
+    pass_configs = {
+        _tl.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        _tl.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+    }
+    batch_size = T.symbolic("batch_size")
+    max_table_length = T.symbolic("max_table_length")
+    max_seq_len = T.symbolic("max_seq_len")
+    num_blocks = T.symbolic("num_blocks")
+    block = block_size
+    dim = head_dim
+    heads = num_heads
+    block_stride = T.dynamic("block_stride")
+
+    @_tl.jit(pass_configs=pass_configs)
+    def bf16_direct_paged_mqa_logits(
+        q: T.Tensor[(batch_size, heads, dim), "bfloat16"],
+        kvcache: T.StridedTensor[
+            (num_blocks, block, dim), (block_stride, dim, 1), "bfloat16"
+        ],
+        weight: T.Tensor[(batch_size, heads), "float32"],
+        seq_lens: T.Tensor[(batch_size,), "int32"],
+        page_table: T.Tensor[(batch_size, max_table_length), "int32"],
+        output: T.Tensor[(batch_size, max_seq_len), "float32"],
+    ) -> None:
+        _ = (
+            batch_size,
+            max_table_length,
+            max_seq_len,
+            num_blocks,
+            block,
+            dim,
+            heads,
+            block_stride,
+        )
+        with T.Kernel(batch_size) as bx:
+            seq_len = seq_lens[bx]
+            q_shared = T.alloc_shared((heads, dim), "bfloat16")
+            q_scale = T.alloc_fragment((heads,), "float32")
+            T.copy(q[bx, 0, 0], q_shared)
+            T.copy(weight[bx, 0], q_scale)
+            for page_idx in T.Pipelined(T.ceildiv(seq_len, block), num_stages=2):
+                page = page_table[bx, page_idx]
+                k_shared = T.alloc_shared((block, dim), "bfloat16")
+                T.copy(kvcache[page, 0, 0], k_shared)
+                logits = T.alloc_fragment((block, heads), "float32")
+                T.gemm(
+                    k_shared,
+                    q_shared,
+                    logits,
+                    transpose_A=False,
+                    transpose_B=True,
+                    clear_accum=True,
+                )
+                for head, token in T.Parallel(heads, block):
+                    logits[token, head] = (
+                        T.max(logits[token, head], 0.0) * q_scale[head]
+                    )
+                logits_sum = T.alloc_fragment((block,), "float32")
+                T.reduce_sum(logits, logits_sum, dim=1)
+                T.copy(logits_sum, output[bx, page_idx * block])
+
+    return bf16_direct_paged_mqa_logits
+
+
+def _get_bf16_direct_indexer_module(
+    head_dim: int, num_heads: int, block_size: int
+) -> Any:
+    global _bf16_direct_indexer_module
+    if _bf16_direct_indexer_module is None:
+        _bf16_direct_indexer_module = _build_bf16_direct_paged_mqa_logits_kernel(
+            head_dim, num_heads, block_size
+        )
+    return _bf16_direct_indexer_module
+
+
+def bf16_direct_paged_mqa_logits_tilelang(
+    q_bf16: torch.Tensor,
+    kvcache_bf16: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = True,
+) -> torch.Tensor:
+    """SM86 BF16-direct scorer with graph-capturable native BF16 MMA."""
+    _ = deep_gemm_metadata
+    batch_size, _, num_heads, head_dim = q_bf16.shape
+    block_size = kvcache_bf16.shape[1]
+    assert head_dim == 128
+    assert block_size == 64
+    assert clean_logits is False
+    q_bf16 = q_bf16.squeeze(1).to(torch.bfloat16).view(
+        batch_size, num_heads, head_dim
+    )
+    logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
+    kernel = _get_bf16_direct_indexer_module(head_dim, num_heads, block_size)
+    kernel(
+        q_bf16,
+        kvcache_bf16,
+        weight.float(),
+        seq_lens.int(),
+        page_table.int(),
+        logits,
+    )
+    return logits
+
+
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
@@ -687,6 +807,7 @@ class C4IndexerBackendMixin:
 
         use_fp4_indexer = c4_indexer.use_fp4_indexer
 
+        device_capability = torch.cuda.get_device_capability()
         if use_fp4_indexer:
             q_fp4, q_sf = q_indexer
             assert len(q_fp4.shape) == 3
@@ -698,7 +819,9 @@ class C4IndexerBackendMixin:
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        if use_fp4_indexer:
+        if device_capability < (8, 9):
+            fn = bf16_direct_paged_mqa_logits_tilelang
+        elif use_fp4_indexer:
             weights = weights.float()
             if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
                 raise RuntimeError("DeepSeek V4 FP4 indexer requires DeepGEMM indexer.")
@@ -740,8 +863,9 @@ class C4IndexerBackendMixin:
             core_metadata.c4_sparse_page_indices, value=-1
         )
         _use_tilelang = (
-            envs.SGLANG_OPT_USE_TILELANG_INDEXER.get() and not use_fp4_indexer
-        )
+            envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
+            or device_capability < (8, 9)
+        ) and not use_fp4_indexer
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
             _c4sl = _c4sl.unsqueeze(-1)
@@ -766,11 +890,14 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=c4_indexer.layer_id,
             )
-            assert c4_indexer_kv_cache.dim() == 2
-            head_dim_with_sf = 68 if use_fp4_indexer else 132
-            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
-                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
-            )
+            if device_capability < (8, 9):
+                assert c4_indexer_kv_cache.shape[1:] == (64, 128)
+            else:
+                assert c4_indexer_kv_cache.dim() == 2
+                head_dim_with_sf = 68 if use_fp4_indexer else 132
+                c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+                    c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
+                )
             logits = fn(
                 q,
                 c4_indexer_kv_cache,
