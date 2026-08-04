@@ -14,6 +14,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     DsparkInfoDumper,
     InfoComponent,
     _PendingStep,
+    compact_greedy_logit_evidence,
     logger,
     resolve_components,
     resolve_enabled_components,
@@ -100,6 +101,12 @@ class TestResolveComponents(CustomTestCase):
     def test_unknown_component_raises(self):
         with self.assertRaises(ValueError):
             resolve_components(("core", "bogus"))
+
+    def test_verify_logits_is_an_explicit_component(self):
+        self.assertEqual(
+            resolve_components(("verify_logits",)),
+            {InfoComponent.VERIFY_LOGITS},
+        )
 
     def test_sps_record_env_enables_core_and_cpu_timing(self):
         """SGLANG_DSPARK_ENABLE_SPS_RECORD=1 is the published SPS-profiling
@@ -229,6 +236,71 @@ class TestCoreAndCpuTiming(CustomTestCase):
         clock.advance(0.01)
         dumper.observe_decode_step(make_obs(forward_ct=10))
         self.assertEqual([r["forward_ct"] for r in dumper.dump()["records"]], [9, 10])
+
+
+class TestCompactGreedyLogitEvidence(CustomTestCase):
+    def test_aligns_each_draft_with_the_preceding_target_row(self):
+        # Two six-token verify chains, vocabulary size seven.  Row five in each
+        # chain is the bonus prediction and must not appear in the evidence.
+        logits = torch.full((12, 7), -8.0)
+        draft_tokens = torch.tensor(
+            [[1, 2, 3, 4, 5], [5, 4, 3, 2, 1]], dtype=torch.int64
+        )
+        winners = torch.tensor(
+            [[1, 0, 3, 6, 5, 4], [5, 4, 0, 2, 6, 3]], dtype=torch.int64
+        )
+        for row, token in enumerate(winners.reshape(-1).tolist()):
+            logits[row, token] = 4.0 + row
+        compared_rows = logits.reshape(2, 6, 7)[:, :5, :]
+        compared_rows.scatter_(
+            -1,
+            draft_tokens.unsqueeze(-1),
+            torch.full((2, 5, 1), 2.0),
+        )
+
+        target_tokens, top1_logits, draft_logits = compact_greedy_logit_evidence(
+            target_logits=logits,
+            draft_tokens=draft_tokens,
+            bs=2,
+            verify_num_draft_tokens=6,
+        )
+
+        self.assertEqual(target_tokens.tolist(), [row[:5] for row in winners.tolist()])
+        self.assertEqual(draft_logits.tolist(), [[2.0] * 5, [2.0] * 5])
+        self.assertEqual(tuple(top1_logits.shape), (2, 5))
+
+    def test_rejects_shape_drift_before_host_staging(self):
+        with self.assertRaisesRegex(ValueError, "draft token shape"):
+            compact_greedy_logit_evidence(
+                target_logits=torch.zeros((6, 8)),
+                draft_tokens=torch.zeros((1, 4), dtype=torch.int64),
+                bs=1,
+                verify_num_draft_tokens=6,
+            )
+
+    def test_request_receipt_trims_padded_positions_and_reports_margins(self):
+        dumper, _ = make_dumper({"core"})
+        host = {
+            "req_pool_indices": torch.tensor([4]),
+            "prefix_lens": torch.tensor([128]),
+            "draft_tokens": torch.tensor([[1, 2, 3, 4, 5]]),
+            "bonus_tokens": torch.tensor([6]),
+            "correct_len": torch.tensor([1]),
+            "cap_trim_lens": torch.tensor([0]),
+            "commit_lens": torch.tensor([2]),
+            "verify_lens": torch.tensor([3]),
+            "greedy_target_tokens": torch.tensor([[1, 0, 3, 0, 0]]),
+            "greedy_target_top1_logits": torch.tensor([[9.0, 8.0, 7.0, 6.0, 5.0]]),
+            "greedy_target_proposed_token_logits": torch.tensor(
+                [[9.0, 6.5, 7.0, 4.0, 3.0]]
+            ),
+        }
+
+        req = dumper._build_reqs(host=host, bs=1, rids=["r4"])[0]
+
+        self.assertEqual(req.greedy_target_tokens, [1, 0])
+        self.assertEqual(req.greedy_step_matches, [True, False])
+        self.assertEqual(req.greedy_target_logit_margins, [0.0, 1.5])
 
 
 class TestPredictedStepFields(CustomTestCase):

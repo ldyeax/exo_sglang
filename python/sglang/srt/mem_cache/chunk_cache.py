@@ -1,12 +1,11 @@
-from __future__ import annotations
-
 """Cache for chunked prefill, used when RadixCache is disabled."""
+
+from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -23,6 +22,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -86,7 +86,7 @@ class ChunkCache(BasePrefixCache):
         ]
         self.token_to_kv_pool_allocator.free(kv_indices)
 
-    def cache_unfinished_req(self, req: Req, chunked=False):
+    def cache_unfinished_req(self, req: Req, chunked: bool = False) -> None:
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : req.extend_range.end
         ]
@@ -134,6 +134,32 @@ class SWAChunkCache(ChunkCache):
             self.sliding_window_size is not None
         ), "sliding_window_size must be set for SWAChunkCache"
         return True
+
+    def cache_unfinished_req(self, req: Req, chunked=False):
+        super().cache_unfinished_req(req, chunked=chunked)
+
+        if not chunked:
+            return
+
+        # The overlap scheduler stashes chunk N while its forward may still be
+        # running, immediately before trying to admit chunk N+1.  Tokens older
+        # than the window needed by chunk N's first query are already dead, so
+        # return those pages before the next PrefillAdder snapshots SWA
+        # availability.  Deferring this to alloc_for_extend creates a circular
+        # dependency when the pool lacks enough headroom to admit N+1 at all.
+        #
+        # Use the actual chunk start rather than configured chunked_prefill_size:
+        # memory-pressure chunk caps can make the live chunk much smaller than
+        # the configured size (for example, 512 then 256 with a 1024-token pool).
+        free_swa_out_of_window_slots(
+            req,
+            req.extend_range.start,
+            sliding_window_size=self.sliding_window_size,
+            page_size=self.page_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            is_chunk_cache=True,
+        )
 
     def evict(self, params: EvictParams) -> EvictResult:
         return EvictResult()

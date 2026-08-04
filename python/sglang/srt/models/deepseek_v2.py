@@ -243,6 +243,19 @@ from sglang.kernels.ops.gemm.fused_a_gemm import (
 
 logger = logging.getLogger(__name__)
 
+
+def _join_cuda_side_stream_tensor(
+    tensor: Optional[torch.Tensor],
+    *,
+    producer_stream: torch.cuda.Stream,
+    consumer_stream: torch.cuda.Stream,
+) -> None:
+    """Order a side-stream result and retain it through consumer-stream use."""
+    consumer_stream.wait_stream(producer_stream)
+    if tensor is not None:
+        tensor.record_stream(consumer_stream)
+
+
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
 _moe_quant_once_logged = False
 
@@ -834,6 +847,18 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
         )
+        # ``forward_normal_dual_stream`` launches the shared expert on
+        # ``alt_stream`` after the routed expert has started.  Mark the routed
+        # layer so methods that can overwrite ``hidden_states`` for their
+        # output do not do so while that alternate-stream consumer can still
+        # be reading it.
+        setattr(  # noqa: B010 - capability marker shared across MoE implementations
+            self.experts,
+            "_has_alt_stream_shared_expert_input_consumer",
+            self.alt_stream is not None
+            and self.num_fused_shared_experts == 0
+            and hasattr(self, "shared_experts"),
+        )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
@@ -905,7 +930,8 @@ class DeepseekV2MoE(nn.Module):
                     fwd.mlp_reduce_scatter,
                 )
             elif (
-                self.alt_stream is not None
+                envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+                and self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
@@ -1020,7 +1046,15 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        current_stream.wait_stream(self.alt_stream)
+        # ``shared_output`` was allocated on ``alt_stream`` but is consumed
+        # asynchronously by the add/finalize below on ``current_stream``.
+        # The wait orders the kernels, while record_stream extends the caching
+        # allocator lifetime through that cross-stream consumer.
+        _join_cuda_side_stream_tensor(
+            shared_output,
+            producer_stream=self.alt_stream,
+            consumer_stream=current_stream,
+        )
 
         if deferred_finalize:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
@@ -1268,15 +1302,16 @@ class DeepseekV2MoE(nn.Module):
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
                         shared_output = self._forward_shared_experts(hidden_states)
-                        shared_output.record_stream(self.alt_stream)
-                        shared_event = self.alt_stream.record_event()
                     if is_in_breakable_cuda_graph():
-                        # The MoE call below is an eager break, so record
-                        # and wait must share one capture; joining here means
-                        # the shared experts overlap nothing. The alt stream
-                        # is kept for record_stream: without that marking the
-                        # allocator recycles shared_output across the break.
-                        torch.cuda.current_stream().wait_event(shared_event)
+                        # The MoE call below is an eager break, so the side
+                        # stream must join this capture. The consumer-stream
+                        # record keeps shared_output alive until its later add
+                        # on the main stream has completed.
+                        _join_cuda_side_stream_tensor(
+                            shared_output,
+                            producer_stream=self.alt_stream,
+                            consumer_stream=torch.cuda.current_stream(),
+                        )
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
             topk_kwargs = (
@@ -1462,7 +1497,11 @@ class DeepseekV2MoE(nn.Module):
             and self.alt_stream is not None
             and not is_in_breakable_cuda_graph()
         ):
-            torch.cuda.current_stream().wait_event(shared_event)
+            _join_cuda_side_stream_tensor(
+                shared_output,
+                producer_stream=self.alt_stream,
+                consumer_stream=torch.cuda.current_stream(),
+            )
 
         if shared_output is not None:
             x = shared_output

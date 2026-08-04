@@ -11,9 +11,11 @@ import types
 import unittest
 
 import torch
-
 from sglang.kernels.ops.attention import (
     dsv4_attn_metadata_kernels as attn_metadata_kernels,
+)
+from sglang.kernels.ops.attention.dsv4 import (
+    metadata_kernel as compression_metadata_kernel,
 )
 from sglang.kernels.ops.speculative import ragged_verify_kernels
 from sglang.kernels.ops.speculative.dspark import (
@@ -399,6 +401,250 @@ def _case_page_table_positions(tc):
         )
 
 
+def _case_page_table_active_prefix(tc):
+    num_pool, pool_len = 3, 524288
+    g = torch.Generator(device=DEVICE).manual_seed(16)
+    req_to_token = _ri(0, 1 << 20, (num_pool, pool_len), torch.int32, g)
+    seq_lens = torch.tensor(
+        [1, 127, 128, 255, 256, 257, 2694], device=DEVICE, dtype=torch.int64
+    )
+    req_pool_indices = _ri(0, num_pool, (seq_lens.numel(),), torch.int32, g)
+    kwargs = dict(
+        req_to_token=req_to_token,
+        req_pool_indices_repeated=req_pool_indices,
+        seq_lens_casual=seq_lens,
+        max_seq_len=pool_len,
+        page_size=256,
+        swa_window=128,
+        active_prefix_only=True,
+    )
+    cls = attn_metadata_kernels.BuildPageTablePositions
+    ref = cls.torch(**kwargs)
+    got = cls.triton(**kwargs)
+
+    tc._eq(got.seq_lens_casual, ref.seq_lens_casual)
+    tc._eq(got.positions_casual, ref.positions_casual)
+    tc._eq(got.swa_topk_lengths, ref.swa_topk_lengths)
+    tc.assertEqual(got.page_table.shape, ref.page_table.shape)
+    for row, seq_len in enumerate(seq_lens.tolist()):
+        live_pages = (seq_len + kwargs["page_size"] - 1) // kwargs["page_size"]
+        tc._eq(
+            got.page_table[row, :live_pages],
+            ref.page_table[row, :live_pages],
+        )
+
+    # Exercise the kernel with caller-owned graph-style storage.  The active
+    # prefix is refreshed, while the 524K-capacity tail and tensor address stay
+    # untouched for replay.
+    sentinel = -7654321
+    page_table_out = torch.full_like(ref.page_table, sentinel)
+    page_table_ptr = page_table_out.data_ptr()
+    seq_lens_out = torch.empty_like(ref.seq_lens_casual)
+    positions_out = torch.empty_like(ref.positions_casual)
+    topk_out = torch.empty_like(ref.swa_topk_lengths)
+    num_pages = page_table_out.shape[1]
+    attn_metadata_kernels._page_table_positions_kernel[(seq_lens.numel(),)](
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        seq_lens_out,
+        positions_out,
+        page_table_out,
+        topk_out,
+        req_to_token.stride(0),
+        num_pages,
+        kwargs["page_size"],
+        kwargs["swa_window"],
+        BLOCK_P=256,
+        ACTIVE_PREFIX_ONLY=True,
+    )
+    tc.assertEqual(page_table_out.data_ptr(), page_table_ptr)
+    tc._eq(seq_lens_out, ref.seq_lens_casual)
+    tc._eq(positions_out, ref.positions_casual)
+    tc._eq(topk_out, ref.swa_topk_lengths)
+    for row, seq_len in enumerate(seq_lens.tolist()):
+        live_pages = (seq_len + kwargs["page_size"] - 1) // kwargs["page_size"]
+        tc._eq(
+            page_table_out[row, :live_pages],
+            ref.page_table[row, :live_pages],
+        )
+        tc.assertTrue(bool((page_table_out[row, live_pages:] == sentinel).all()))
+
+    # Default/generic mode still materializes the whole static table for
+    # consumers that gather before applying their live-length mask.
+    page_table_out.fill_(sentinel)
+    attn_metadata_kernels._page_table_positions_kernel[(seq_lens.numel(),)](
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        seq_lens_out,
+        positions_out,
+        page_table_out,
+        topk_out,
+        req_to_token.stride(0),
+        num_pages,
+        kwargs["page_size"],
+        kwargs["swa_window"],
+        BLOCK_P=256,
+        ACTIVE_PREFIX_ONLY=False,
+    )
+    tc._eq(page_table_out, ref.page_table)
+
+
+def _case_compression_metadata_active_prefix(tc):
+    page_size, max_seq_len = 256, 524288
+    seq_lens = torch.tensor(
+        [1, 127, 128, 255, 256, 257, 2694], device=DEVICE, dtype=torch.int32
+    )
+    positions = seq_lens - 1
+    raw_out_loc = torch.arange(
+        100, 100 + seq_lens.numel(), device=DEVICE, dtype=torch.int64
+    )
+    max_pages = max_seq_len // page_size
+    page_table = torch.arange(
+        1000,
+        1000 + seq_lens.numel() * max_pages,
+        device=DEVICE,
+        dtype=torch.int32,
+    ).view(seq_lens.numel(), max_pages)
+
+    result = compression_metadata_kernel.init_compression_metadata(
+        seq_lens,
+        positions,
+        raw_out_loc,
+        page_table,
+        page_size,
+        compute_page_indices=True,
+        active_prefix_only=True,
+    )
+    (
+        c4_out_loc,
+        c4_positions,
+        c4_seq_lens_raw,
+        c4_seq_lens_clamp1,
+        c128_out_loc,
+        c128_positions,
+        c128_seq_lens_raw,
+        c128_seq_lens_clamp1,
+        c128_page_indices,
+    ) = result
+    assert c128_page_indices is not None
+    c128_page_size = page_size // 128
+    c128_capacity = max_pages * c128_page_size
+    tc.assertEqual(c128_page_indices.shape, (seq_lens.numel(), c128_capacity))
+    tc._eq(c4_seq_lens_raw, seq_lens // 4)
+    tc._eq(c4_seq_lens_clamp1, torch.clamp(seq_lens // 4, min=1))
+    tc._eq(c4_positions, positions & (~3))
+    tc._eq(
+        c4_out_loc,
+        torch.where((seq_lens % 4) == 0, raw_out_loc // 4, 0),
+    )
+    tc._eq(c128_seq_lens_raw, seq_lens // 128)
+    tc._eq(c128_seq_lens_clamp1, torch.clamp(seq_lens // 128, min=1))
+    tc._eq(c128_positions, positions & (~127))
+    tc._eq(
+        c128_out_loc,
+        torch.where((seq_lens % 128) == 0, raw_out_loc // 128, 0),
+    )
+
+    expected_prefixes = []
+    for row, raw_len in enumerate(c128_seq_lens_raw.tolist()):
+        live_len = max(raw_len, 1)
+        offsets = torch.arange(live_len, device=DEVICE, dtype=torch.int64)
+        expected = (
+            page_table[row, offsets // c128_page_size] * c128_page_size
+            + offsets % c128_page_size
+        ).to(torch.int32)
+        if raw_len == 0:
+            expected.fill_(-1)
+        expected_prefixes.append(expected)
+        tc._eq(c128_page_indices[row, :live_len], expected)
+
+    # As above, use persistent output storage to make the active-prefix
+    # contract observable: only max(floor(seq_len / 128), 1) entries are
+    # rewritten, including the mandatory -1 dummy for sub-128-token rows.
+    sentinel = -7654321
+    c4_out = torch.empty_like(c4_out_loc)
+    c4_pos = torch.empty_like(c4_positions)
+    c4_raw = torch.empty_like(c4_seq_lens_raw)
+    c4_clamp1 = torch.empty_like(c4_seq_lens_clamp1)
+    c128_out = torch.empty_like(c128_out_loc)
+    c128_pos = torch.empty_like(c128_positions)
+    c128_raw = torch.empty_like(c128_seq_lens_raw)
+    c128_clamp1 = torch.empty_like(c128_seq_lens_clamp1)
+    c128_indices_out = torch.full_like(c128_page_indices, sentinel)
+    c128_indices_ptr = c128_indices_out.data_ptr()
+    compression_metadata_kernel._init_compressed_attn_metadata_kernel[
+        (seq_lens.numel(),)
+    ](
+        seq_lens,
+        positions,
+        raw_out_loc,
+        page_table,
+        c4_out,
+        c4_pos,
+        c4_raw,
+        c4_clamp1,
+        c128_out,
+        c128_pos,
+        c128_raw,
+        c128_clamp1,
+        c128_indices_out,
+        seq_lens.numel(),
+        max_pages,
+        c128_capacity,
+        c128_page_size,
+        64,
+        True,
+        True,
+    )
+    tc.assertEqual(c128_indices_out.data_ptr(), c128_indices_ptr)
+    tc._eq(c4_out, c4_out_loc)
+    tc._eq(c4_pos, c4_positions)
+    tc._eq(c4_raw, c4_seq_lens_raw)
+    tc._eq(c4_clamp1, c4_seq_lens_clamp1)
+    tc._eq(c128_out, c128_out_loc)
+    tc._eq(c128_pos, c128_positions)
+    tc._eq(c128_raw, c128_seq_lens_raw)
+    tc._eq(c128_clamp1, c128_seq_lens_clamp1)
+    for row, raw_len in enumerate(c128_seq_lens_raw.tolist()):
+        live_len = max(raw_len, 1)
+        tc._eq(c128_indices_out[row, :live_len], expected_prefixes[row])
+        tc.assertTrue(bool((c128_indices_out[row, live_len:] == sentinel).all()))
+
+    # The shared HIP/default contract still clears the full tail to -1 because
+    # unified prefill scans it for nonnegative entries.
+    c128_indices_out.fill_(sentinel)
+    compression_metadata_kernel._init_compressed_attn_metadata_kernel[
+        (seq_lens.numel(),)
+    ](
+        seq_lens,
+        positions,
+        raw_out_loc,
+        page_table,
+        c4_out,
+        c4_pos,
+        c4_raw,
+        c4_clamp1,
+        c128_out,
+        c128_pos,
+        c128_raw,
+        c128_clamp1,
+        c128_indices_out,
+        seq_lens.numel(),
+        max_pages,
+        c128_capacity,
+        c128_page_size,
+        64,
+        True,
+        False,
+    )
+    for row, raw_len in enumerate(c128_seq_lens_raw.tolist()):
+        live_len = max(raw_len, 1)
+        tc._eq(c128_indices_out[row, :live_len], expected_prefixes[row])
+        tc.assertTrue(bool((c128_indices_out[row, live_len:] == -1).all()))
+
+
 def _case_qo_indptr(tc):
     torch.manual_seed(17)
     cls = ragged_verify_kernels.BuildQoIndptr
@@ -553,6 +799,10 @@ class TestDsparkKernelParity(CustomTestCase):
         got, ref = cls.triton(**kw), cls.torch(**kw)
         self._eq(got, ref)
         return got, ref
+
+    def test_capacity_active_prefix_metadata(self):
+        _case_page_table_active_prefix(self)
+        _case_compression_metadata_active_prefix(self)
 
     def test_all_kernels_triton_matches_torch(self):
         for name, case in _CASES:

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
-
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -28,6 +27,9 @@ from sglang.srt.model_executor.runner import (
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_speculative_draft,
 )
+from sglang.srt.model_executor.runner.kt_capture_buffers import (
+    register_kt_capture_batch_sizes,
+)
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -45,6 +47,14 @@ from sglang.srt.utils.device_timer import device_timer_ctx
 
 if TYPE_CHECKING:
     from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
+
+
+def _register_kt_capture_batch_sizes(
+    capture_batch_sizes: list[int], captured_request_width: int
+) -> None:
+    register_kt_capture_batch_sizes(
+        batch_size * captured_request_width for batch_size in capture_batch_sizes
+    )
 
 
 @dataclass
@@ -122,6 +132,10 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.capture_bs, _ = get_batch_sizes_to_capture(
             model_runner, self.captured_req_width
         )
+        # KT CUDA-graph host callbacks retain raw pointers into their pinned
+        # CPU staging buffers. Register every draft graph shape so a later
+        # non-captured request cannot replace and free its buffer.
+        _register_kt_capture_batch_sizes(self.capture_bs, self.captured_req_width)
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.captured_req_width
 

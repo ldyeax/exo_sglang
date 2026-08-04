@@ -6,8 +6,6 @@ from typing import Iterable, List, Optional, Tuple
 import msgspec
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     BuildStepLocal,
@@ -24,6 +22,9 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v4 import (
@@ -31,6 +32,7 @@ from sglang.srt.models.deepseek_v4 import (
     DeepseekV4DecoderLayer,
     MqaAttentionBase,
     _dequant_fp8_wo_a_streaming,
+    bcg_deepseek_v4_moe_ffn,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -50,6 +52,7 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.utils import add_prefix, is_blackwell_supported
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
+from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +81,6 @@ def apply_rotary_emb(
 
 
 class DSparkAttention(MqaAttentionBase):
-
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -101,9 +103,9 @@ class DSparkAttention(MqaAttentionBase):
             wo_b_reduce_results=True,
             rope_original_seq_len=0,
         )
-        assert (
-            self.compress_ratio == 0
-        ), "DSpark draft attention requires compress_ratio == 0."
+        assert self.compress_ratio == 0, (
+            "DSpark draft attention requires compress_ratio == 0."
+        )
         self.window_size = int(
             getattr(config, "sliding_window", None) or config.window_size
         )
@@ -270,7 +272,6 @@ def _resolve_dspark_pool() -> DeepSeekV4TokenToKVPool:
 
 
 class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
-
     tp_size: int
     org_vocab_start: int
     org_vocab_end: int
@@ -279,7 +280,6 @@ class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
 
 
 class DSparkV4MarkovHead(nn.Module):
-
     markov_head_type = "vanilla"
 
     def __init__(self, *, vocab_size: int, markov_rank: int) -> None:
@@ -436,7 +436,6 @@ def build_dspark_v4_confidence_head(
 
 
 class DSparkV4Stage(DeepseekV4DecoderLayer):
-
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -546,14 +545,25 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         shape = x.shape
         x = x.reshape(-1, self.dim)
-        y = self._run_moe_ffn_dp_sync(
-            x, forward_batch, input_ids=None, input_ids_global=None
-        )
+        if is_in_breakable_cuda_graph():
+            # Keep dispatch, experts, combine, and collectives on one eager
+            # bridge. Capturing combine against an expert output allocated by
+            # a nested eager bridge replays stale storage.
+            y = bcg_deepseek_v4_moe_ffn(
+                self,
+                x,
+                forward_batch,
+                None,
+                None,
+            )
+        else:
+            y = self._run_moe_ffn_dp_sync(
+                x, forward_batch, input_ids=None, input_ids_global=None
+            )
         return y.view(shape)
 
 
 class DeepseekV4ForCausalLMDSpark(nn.Module):
-
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -712,7 +722,6 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         )
 
     def compute_base_logits(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-
         x_post_hc = self.collapse_hc_head(x)
         return self._logits_from_x_post_hc(x_post_hc), x_post_hc
 
@@ -760,6 +769,9 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
         loaded_params = set()
+        loaded_shared_expert_sources: set[str] = set()
+
+        required_shared_expert_sources = self._required_shared_expert_source_names()
 
         weights = _dequant_fp8_wo_a_streaming(weights)
 
@@ -788,6 +800,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 loaded_params.add(candidate)
+                if name in required_shared_expert_sources:
+                    loaded_shared_expert_sources.add(name)
                 break
             else:
                 for (
@@ -811,23 +825,55 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                         expert_id=expert_id,
                     )
                     loaded_params.add(candidate)
+                    if name in required_shared_expert_sources:
+                        loaded_shared_expert_sources.add(name)
                     break
                 else:
                     if mapped not in params_dict:
-                        logger.warning(
-                            "DSpark V4 draft: unexpected weight %r -> %r", name, mapped
+                        raise ValueError(
+                            "DSpark V4 draft checkpoint tensor has no model "
+                            f"destination: {name!r} -> {mapped!r}. Refusing to "
+                            "serve with a partially initialized draft model."
                         )
-                        continue
                     param = params_dict[mapped]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
                     loaded_params.add(mapped)
+                    if name in required_shared_expert_sources:
+                        loaded_shared_expert_sources.add(name)
+
+        missing_shared_expert_sources = (
+            required_shared_expert_sources - loaded_shared_expert_sources
+        )
+        if missing_shared_expert_sources:
+            raise ValueError(
+                "DSpark V4 draft checkpoint is missing required shared-expert "
+                "tensors (or they were not loaded): "
+                f"{sorted(missing_shared_expert_sources)}. Refusing to serve "
+                "with a partially initialized draft model."
+            )
+        if required_shared_expert_sources:
+            logger.info(
+                "DSpark V4 draft shared-expert checkpoint coverage verified: %d/%d tensors.",
+                len(loaded_shared_expert_sources),
+                len(required_shared_expert_sources),
+            )
 
         self._assert_confidence_head_loaded(
             params_dict=params_dict, loaded_params=loaded_params
         )
+
+    def _required_shared_expert_source_names(self) -> set[str]:
+        if int(getattr(self.config, "n_shared_experts", 0) or 0) <= 0:
+            return set()
+        return {
+            f"mtp.{stage_id}.ffn.shared_experts.w{projection}.{suffix}"
+            for stage_id in range(self.num_stages)
+            for projection in (1, 2, 3)
+            for suffix in ("weight", "scale")
+        }
 
     def _assert_confidence_head_loaded(
         self, *, params_dict: dict, loaded_params: set
@@ -859,12 +905,12 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         stage_id, rest = parts[1], parts[2]
 
         if rest.startswith("markov_head."):
-            return f"markov_head.{rest[len('markov_head.'):]}"
+            return f"markov_head.{rest[len('markov_head.') :]}"
 
         if rest.startswith("confidence_head."):
             if self.confidence_head is None:
                 return None
-            return f"confidence_head.{rest[len('confidence_head.'):]}"
+            return f"confidence_head.{rest[len('confidence_head.') :]}"
 
         mapped_rest = rest
         mapped_rest = mapped_rest.replace("attn.", "self_attn.", 1)

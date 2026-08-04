@@ -77,7 +77,9 @@ from sglang.srt.utils.common import is_sm120_supported
 
 if TYPE_CHECKING:
     from sgl_kernel.flash_mla import FlashMLASchedMeta
-
+    from sglang.kernels.ops.attention.dsv4.oscar_int2_decode import (
+        OscarInt2SplitHistoryWorkspace,
+    )
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
@@ -91,6 +93,47 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+
+
+def _require_dsv4_oscar_wo_a_output_restore_absorbed(
+    *,
+    layer_id: int,
+    layer: RadixAttention,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    calibration,
+) -> None:
+    """Fail closed unless this exact layer can return rotated coordinates.
+
+    The setup-time fold marker is intentionally checked without tensor
+    operations or allocations.  In a CUDA graph, replay therefore contains
+    neither the old inverse-rotation kernel nor any mutation of ``wo_a``.
+    """
+
+    if token_to_kv_pool.oscar_consumer_role != "target_compressed":
+        raise RuntimeError(
+            "compressed OSCAR attention requires the target_compressed role"
+        )
+    binding = getattr(
+        layer, "_dsv4_oscar_wo_a_output_rotation_binding", None
+    )
+    if binding is None:
+        raise RuntimeError(
+            f"OSCAR layer {layer_id} reached attention before wo_a absorption"
+        )
+    if binding.layer_id != layer_id or calibration.layer_id != layer_id:
+        raise RuntimeError("OSCAR wo_a output-rotation layer binding mismatch")
+    if binding.rotation is not calibration.rotation:
+        raise RuntimeError("OSCAR wo_a output-rotation calibration changed")
+    if binding.consumer_role != "target_compressed":
+        raise RuntimeError("OSCAR wo_a output-rotation binding is not target-only")
+    if binding.artifact_sha256 != token_to_kv_pool.oscar_artifact_sha256:
+        raise RuntimeError("OSCAR wo_a output-rotation artifact binding changed")
+    if binding.admission_sha256 != token_to_kv_pool.oscar_admission_sha256:
+        raise RuntimeError("OSCAR wo_a output-rotation admission binding changed")
+    if binding.weight.dtype != torch.bfloat16:
+        raise RuntimeError("OSCAR folded wo_a is no longer BF16")
+    if binding.weight._version != binding.weight_version:
+        raise RuntimeError("OSCAR folded wo_a changed after CUDA-graph setup")
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -138,7 +181,17 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
 
 
 def _create_flashmla_metadata():
-    if _is_sm120 or _is_xpu:
+    # Ampere uses either the BF16 cache or the byte-packed software-decode
+    # sparse-attention kernel and never consumes FlashMLA scheduler state.
+    # Avoid importing/calling the runtime FlashMLA API there: older wheels
+    # require concrete shape inputs, while the source-tree compatibility
+    # wrapper supports this lazy factory.
+    if (
+        _is_sm120
+        or _is_xpu
+        or not _is_cuda
+        or torch.cuda.get_device_capability() < (8, 9)
+    ):
         return None
     import sgl_kernel.flash_mla as flash_mla
 
@@ -257,6 +310,7 @@ class DSV4AttnMetadata:
             "page_table",
             "swa_page_indices",
             "swa_topk_lengths",
+            "swa_out_cache_loc",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
         ]
@@ -290,7 +344,7 @@ class DSV4AttnMetadata:
         for field_name in reference_assign_fields:
             setattr(self, field_name, getattr(other, field_name))
 
-    def init_compression_metadata(self):
+    def init_compression_metadata(self, *, active_prefix_only: bool = False):
         assert self.page_table.dim() == 2
         assert self.raw_out_loc.shape == self.seq_lens_casual.shape, (
             f"{self.raw_out_loc.shape=}, {self.seq_lens_casual.shape=}"
@@ -313,6 +367,7 @@ class DSV4AttnMetadata:
             self.page_table,
             self.page_size,
             compute_page_indices=True,
+            active_prefix_only=active_prefix_only,
         )
 
         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
@@ -520,8 +575,18 @@ class DeepseekV4AttnBackend(
         speculative_step_id=0,
         topk=0,
         speculative_num_steps=0,
+        oscar_int2_split_history_workspace: Optional[
+            OscarInt2SplitHistoryWorkspace
+        ] = None,
     ):
         super().__init__()
+        # When the complete DSV4 attention module is an eager BCG bridge, no
+        # captured segment reads attention metadata. Build ordinary metadata
+        # from the live, unpadded ForwardBatch instead of refreshing the
+        # capture-sized metadata object used by the narrower attention break.
+        self.use_captured_forward_metadata_for_breakable_cuda_graph = (
+            os.environ.get("SGLANG_DSV4_EAGER_ATTN_MODULE_IN_BCG") != "1"
+        )
         self.model_runner = model_runner
         self.device = torch.device(model_runner.device)
         self.max_context_len = model_runner.model_config.context_len
@@ -548,12 +613,24 @@ class DeepseekV4AttnBackend(
         self.c4_topk = getattr(
             model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
         )
+        self.oscar_int2_split_history_workspace = (
+            self._init_oscar_int2_split_history_workspace(
+                oscar_int2_split_history_workspace
+            )
+        )
 
         self.enable_deepseek_v4_fp4_indexer: bool = (
             model_runner.server_args.enable_deepseek_v4_fp4_indexer
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
+        )
+        # SM86's BF16 indexer and attention kernels consume only live lengths;
+        # newer generic/SM120 indexers can still gather static page-table tails.
+        self.use_active_prefix_metadata = (
+            os.environ.get("SGLANG_DSV4_ACTIVE_PREFIX_METADATA", "0") == "1"
+            and _is_cuda
+            and torch.cuda.get_device_capability() < (8, 9)
         )
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
@@ -593,6 +670,140 @@ class DeepseekV4AttnBackend(
         self.is_dspark_draft = model_runner.is_draft_worker and spec_alg.is_dspark()
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
+
+    def _init_oscar_int2_split_history_workspace(
+        self,
+        existing_workspace: Optional[OscarInt2SplitHistoryWorkspace],
+    ) -> Optional[OscarInt2SplitHistoryWorkspace]:
+        """Allocate or share the one persistent target-only split arena."""
+
+        requested = envs.SGLANG_DSV4_OSCAR_INT2_SPLIT_HISTORY.get()
+        consumer_role = str(
+            getattr(self.token_to_kv_pool, "oscar_consumer_role", "")
+        )
+        if consumer_role != "target_compressed":
+            if existing_workspace is not None:
+                raise RuntimeError(
+                    "OSCAR split-history workspace cannot enter a non-target backend"
+                )
+            return None
+        if not requested:
+            if existing_workspace is not None:
+                raise RuntimeError(
+                    "OSCAR split-history workspace supplied while the opt-in is off"
+                )
+            return None
+        if self.device.type != "cuda" or torch.cuda.get_device_capability(
+            self.device
+        ) != (8, 6):
+            raise RuntimeError(
+                "OSCAR split-history decode is fail-closed to exact NVIDIA SM86"
+            )
+        if not bool(
+            getattr(self.token_to_kv_pool, "use_oscar_int2_storage", False)
+        ):
+            raise RuntimeError(
+                "OSCAR split-history decode requires admitted OSCAR INT2 KV storage"
+            )
+        conflicting_modes = {
+            "generic_int4": bool(
+                getattr(self.token_to_kv_pool, "use_int4_storage", False)
+            ),
+            "ampere_fp8": bool(
+                getattr(self.token_to_kv_pool, "use_ampere_fp8_storage", False)
+            ),
+            "selective_c128_bf16": bool(
+                getattr(
+                    self.token_to_kv_pool,
+                    "use_selective_c128_bf16_storage",
+                    False,
+                )
+            ),
+        }
+        active_conflicts = [
+            name for name, active in conflicting_modes.items() if active
+        ]
+        if active_conflicts:
+            raise RuntimeError(
+                "OSCAR split-history decode rejects non-OSCAR KV modes: "
+                f"{active_conflicts}"
+            )
+        c4_pool = getattr(self.token_to_kv_pool, "c4_kv_pool", None)
+        c128_pool = getattr(self.token_to_kv_pool, "c128_kv_pool", None)
+        swa_pool = getattr(self.token_to_kv_pool, "swa_kv_pool", None)
+        if (
+            c4_pool is None
+            or c128_pool is None
+            or not bool(getattr(c4_pool, "use_oscar_int2_cache", False))
+            or not bool(getattr(c128_pool, "use_oscar_int2_cache", False))
+            or swa_pool is None
+            or not bool(getattr(swa_pool, "use_bf16_cache", False))
+        ):
+            raise RuntimeError(
+                "OSCAR split-history decode requires OSCAR C4/C128 history and "
+                "the protected OSCAR BF16 SWA tier"
+            )
+
+        from sglang.kernels.ops.attention.dsv4.oscar_int2_decode import (
+            SPLIT_HISTORY_WORKSPACE_BYTES,
+            OscarInt2SplitHistoryWorkspace,
+        )
+
+        if existing_workspace is not None:
+            existing_workspace.validate(device=self.device)
+            return existing_workspace
+        storage = torch.empty(
+            SPLIT_HISTORY_WORKSPACE_BYTES // torch.float32.itemsize,
+            dtype=torch.float32,
+            device=self.device,
+        )
+        workspace = OscarInt2SplitHistoryWorkspace.from_backend_storage(storage)
+        logger.info(
+            "Allocated exact-SM86 OSCAR split-history workspace: bytes=%d "
+            "address=%d",
+            SPLIT_HISTORY_WORKSPACE_BYTES,
+            workspace.fixed_data_ptr,
+        )
+        return workspace
+
+    def get_dsv4_oscar_int2_split_history_telemetry(self) -> Dict[str, object]:
+        """Return an authoritative record bound to the live backend arena."""
+
+        from sglang.kernels.ops.attention.dsv4.oscar_int2_decode import (
+            SPLIT_HISTORY_EXECUTION,
+            SPLIT_HISTORY_MAX_PARTIAL_ROWS,
+            SPLIT_HISTORY_SPLIT_MAP,
+            SPLIT_HISTORY_WORKSPACE_BYTES,
+        )
+
+        workspace = self.oscar_int2_split_history_workspace
+        if workspace is None:
+            return {
+                "enabled": False,
+                "execution": "",
+                "split_map": {},
+                "workspace_bytes": 0,
+                "max_partial_rows": 0,
+                "sink_owner": "",
+                "prefill_enabled": False,
+                "fixed_address": False,
+                "workspace_address": 0,
+            }
+        workspace.validate(device=self.device)
+        return {
+            "enabled": True,
+            "execution": SPLIT_HISTORY_EXECUTION,
+            "split_map": {
+                str(num_tokens): split_count
+                for num_tokens, split_count in SPLIT_HISTORY_SPLIT_MAP.items()
+            },
+            "workspace_bytes": SPLIT_HISTORY_WORKSPACE_BYTES,
+            "max_partial_rows": SPLIT_HISTORY_MAX_PARTIAL_ROWS,
+            "sink_owner": "stage2-exactly-once",
+            "prefill_enabled": False,
+            "fixed_address": True,
+            "workspace_address": workspace.fixed_data_ptr,
+        }
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -1491,6 +1702,10 @@ class DeepseekV4AttnBackend(
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
+        # PREP_IN_CUDA_GRAPH leaves decode/verify metadata raw for a monolithic
+        # graph to materialize. BCG attention executes outside those segments,
+        # so retain the full object that replay refreshes in place.
+        self.init_forward_metadata_in_graph(forward_batch)
         return self.forward_metadata
 
     def prepare_forward_metadata_for_breakable_cuda_graph_replay(
@@ -1503,12 +1718,24 @@ class DeepseekV4AttnBackend(
         # Build graph-compatible metadata against the padded static batch. The
         # batch still carries live seq/extend lens, so the online c128 prefill
         # plan remains batch-specific without constructing a second metadata set.
+        replay_forward_batch = (
+            static_forward_batch if static_forward_batch is not None else forward_batch
+        )
         static_metadata = self._build_forward_metadata(
-            static_forward_batch if static_forward_batch is not None else forward_batch,
+            replay_forward_batch,
             max_seq_len_override=self.MAX_SEQ_LEN_FOR_CAPTURE,
             use_prefill_cuda_graph=True,
         )
+        # Re-run the in-graph preparation for both raw decode/verify metadata
+        # and already-materialized prefill metadata.  Besides upgrading raw
+        # metadata, this computes the live SWA KV-store destination from the
+        # replay batch's out_cache_loc.  Reusing the capture-time value writes
+        # prefill KV entries into stale SWA slots.
+        self.forward_metadata = static_metadata
+        self.init_forward_metadata_in_graph(replay_forward_batch)
+        static_metadata = self.forward_metadata
         assert isinstance(capture_metadata, DSV4Metadata)
+        assert isinstance(static_metadata, DSV4Metadata)
         capture_metadata.refresh_for_breakable_cuda_graph_replay_(static_metadata)
         self.forward_metadata = capture_metadata
 
@@ -1610,14 +1837,42 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
-        if self.token_to_kv_pool.swa_kv_pool.use_bf16_cache:
+        if (
+            self.token_to_kv_pool.use_oscar_int2_storage
+            and self.token_to_kv_pool.compression_ratios[layer_id] != 0
+        ):
+            from sglang.kernels.ops.attention.dsv4.oscar_int2_storage import (
+                rotate_dsv4_oscar_full_head_shared_latent,
+            )
+
+            swa_k_bf16 = swa_k.to(torch.bfloat16).contiguous()
+            rotated_swa_k = torch.empty_like(swa_k_bf16)
+            rotate_dsv4_oscar_full_head_shared_latent(
+                swa_k_bf16.view(-1, swa_k_bf16.shape[-1]),
+                self.token_to_kv_pool.get_oscar_calibration(layer_id),
+                rotated_swa_k.view(-1, rotated_swa_k.shape[-1]),
+            )
+            swa_k_pack = quant_to_nope_bf16_rope_bf16_pack(rotated_swa_k)
+            self.token_to_kv_pool.set_swa_key_buffer_radix(
+                layer_id=layer_id,
+                swa_loc=swa_loc,
+                cache_bf16_pack=swa_k_pack,
+            )
+        elif self.token_to_kv_pool.swa_kv_pool.use_bf16_cache:
             swa_k_pack = quant_to_nope_bf16_rope_bf16_pack(swa_k.bfloat16())
             self.token_to_kv_pool.set_swa_key_buffer_radix(
                 layer_id=layer_id,
                 swa_loc=swa_loc,
                 cache_bf16_pack=swa_k_pack,
             )
-        elif envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        elif (
+            self.token_to_kv_pool.use_int4_storage
+            or self.token_to_kv_pool.use_ampere_fp8_storage
+            or envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
+        ):
+            # Triton's native-float8 packer is not legal on SM86.  The CUDA
+            # JIT writer emits the same E4M3FN bytes through software
+            # conversion and is safe to capture.
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
                 swa_loc=swa_loc,
@@ -1678,17 +1933,20 @@ class DeepseekV4AttnBackend(
             )
 
             if extra_k_cache is not None:
+                _, _, extra_pool = token_to_kv_pool.layer_mapping[layer_id]
+                assert extra_pool is not None
                 page_sizes = {
                     4: token_to_kv_pool.page_size // 4,
                     128: token_to_kv_pool.page_size // 128,
                 }
+                extra_cache_total_dim = extra_pool.kv_cache_total_dim
                 extra_k_cache = extra_k_cache[
-                    :, : page_sizes[compress_ratio] * k_cache_total_dim
+                    :, : page_sizes[compress_ratio] * extra_cache_total_dim
                 ].view(
                     extra_k_cache.shape[0],
                     page_sizes[compress_ratio],
                     1,
-                    k_cache_total_dim,
+                    extra_cache_total_dim,
                 )
             swa_page_indices = core_attn_metadata.swa_page_indices
             swa_topk_lengths = core_attn_metadata.swa_topk_lengths
@@ -1744,7 +2002,142 @@ class DeepseekV4AttnBackend(
                     attn_sink=attn_sink,
                 )
 
-            if torch.cuda.get_device_capability() < (8, 9):
+            if (
+                token_to_kv_pool.use_oscar_int2_storage
+                and compress_ratio != 0
+            ):
+                from sglang.kernels.ops.attention.dsv4.oscar_int2_decode import (
+                    decode_sparse_attention_oscar_int2,
+                    oscar_int2_split_history_count,
+                )
+                from sglang.kernels.ops.attention.dsv4.oscar_int2_storage import (
+                    rotate_dsv4_oscar_full_head_shared_latent,
+                )
+
+                assert extra_k_cache is not None
+                assert extra_indices is not None
+                assert extra_topk_lengths is not None
+                _, _, extra_pool = token_to_kv_pool.layer_mapping[layer_id]
+                assert extra_pool is not None and extra_pool.use_oscar_int2_cache
+                calibration = token_to_kv_pool.get_oscar_calibration(layer_id)
+                _require_dsv4_oscar_wo_a_output_restore_absorbed(
+                    layer_id=layer_id,
+                    layer=layer,
+                    token_to_kv_pool=token_to_kv_pool,
+                    calibration=calibration,
+                )
+                q_bf16 = q.squeeze(1).to(torch.bfloat16).contiguous()
+                q_rotated = torch.empty_like(q_bf16)
+                rotate_dsv4_oscar_full_head_shared_latent(
+                    q_bf16.view(-1, q_bf16.shape[-1]),
+                    calibration,
+                    q_rotated.view(-1, q_rotated.shape[-1]),
+                )
+                o_rotated = torch.empty_like(q_rotated)
+                split_workspace = None
+                if self.oscar_int2_split_history_workspace is not None:
+                    logical_forward_mode = _get_logical_forward_mode(forward_batch)
+                    split_shape_supported = (
+                        oscar_int2_split_history_count(q_rotated.shape[0]) is not None
+                    )
+                    if split_shape_supported and (
+                        logical_forward_mode.is_decode_or_idle()
+                        or logical_forward_mode.is_target_verify()
+                    ):
+                        split_workspace = self.oscar_int2_split_history_workspace
+                decode_sparse_attention_oscar_int2(
+                    q=q_rotated,
+                    swa_cache=swa_k_cache,
+                    swa_indices=swa_page_indices,
+                    swa_lens=swa_topk_lengths,
+                    scale=self.softmax_scale,
+                    attn_sink=attn_sink,
+                    out=o_rotated,
+                    swa_block_size=token_to_kv_pool.swa_kv_pool.page_size,
+                    extra_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_lens=extra_topk_lengths,
+                    extra_block_size=extra_pool.page_size,
+                    split_workspace=split_workspace,
+                )
+                # ``wo_a`` owns blockdiag(R, I_rope) after setup.  Return the
+                # rotated no-PE coordinates directly; MQALayer still applies
+                # the ordinary inverse RoPE to the untouched final 64 columns.
+                # No output-restore allocation or kernel enters capture/replay.
+                o = o_rotated.unsqueeze(1)
+            elif token_to_kv_pool.use_int4_storage:
+                from sglang.kernels.ops.attention.dsv4.int4_decode import (
+                    decode_sparse_attention_int4,
+                )
+
+                q_bf16 = q.squeeze(1).to(torch.bfloat16)
+                o_bf16 = torch.empty_like(q_bf16)
+                _, _, extra_pool = token_to_kv_pool.layer_mapping[layer_id]
+                decode_sparse_attention_int4(
+                    q=q_bf16,
+                    swa_cache=swa_k_cache,
+                    swa_indices=swa_page_indices,
+                    swa_lens=swa_topk_lengths,
+                    scale=self.softmax_scale,
+                    attn_sink=attn_sink,
+                    out=o_bf16,
+                    extra_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_lens=extra_topk_lengths,
+                    swa_block_size=token_to_kv_pool.swa_kv_pool.page_size,
+                    extra_block_size=(extra_pool.page_size if extra_pool else None),
+                )
+                o = o_bf16.unsqueeze(1)
+            elif token_to_kv_pool.use_ampere_fp8_storage:
+                q_bf16 = q.squeeze(1).to(torch.bfloat16)
+                o_bf16 = torch.empty_like(q_bf16)
+                _, _, extra_pool = token_to_kv_pool.layer_mapping[layer_id]
+                if extra_pool is not None and extra_pool.use_bf16_cache:
+                    from sglang.srt.layers.attention.nsa.v4_mixed_c128_bf16_kernel import (
+                        decode_sparse_attention_fp8_swa_bf16_extra,
+                    )
+
+                    assert compress_ratio == 128
+                    assert extra_k_cache is not None
+                    assert extra_indices is not None
+                    assert extra_topk_lengths is not None
+                    decode_sparse_attention_fp8_swa_bf16_extra(
+                        q=q_bf16,
+                        swa_cache=swa_k_cache,
+                        swa_indices=swa_page_indices,
+                        swa_lens=swa_topk_lengths,
+                        scale=self.softmax_scale,
+                        attn_sink=attn_sink,
+                        out=o_bf16,
+                        extra_cache=extra_k_cache,
+                        extra_indices=extra_indices,
+                        extra_lens=extra_topk_lengths,
+                        swa_block_size=token_to_kv_pool.swa_kv_pool.page_size,
+                        extra_block_size=extra_pool.page_size,
+                    )
+                else:
+                    from sglang.srt.layers.attention.nsa.v4_triton_kernel import (
+                        decode_sparse_attention_triton,
+                    )
+
+                    decode_sparse_attention_triton(
+                        q=q_bf16,
+                        swa_cache=swa_k_cache,
+                        swa_indices=swa_page_indices,
+                        swa_lens=swa_topk_lengths,
+                        scale=self.softmax_scale,
+                        attn_sink=attn_sink,
+                        out=o_bf16,
+                        extra_cache=extra_k_cache,
+                        extra_indices=extra_indices,
+                        extra_lens=extra_topk_lengths,
+                        swa_block_size=token_to_kv_pool.swa_kv_pool.page_size,
+                        extra_block_size=(
+                            extra_pool.page_size if extra_pool else None
+                        ),
+                    )
+                o = o_bf16.unsqueeze(1)
+            elif torch.cuda.get_device_capability() < (8, 9):
                 from sglang.kernels.ops.attention.dsv4.bf16_decode import (
                     decode_sparse_attention_bf16,
                 )
@@ -1894,12 +2287,15 @@ class DeepseekV4AttnBackend(
             swa_slice = workspace[n_compressed:]
 
         if compressed_slice is not None:
+            _, _, extra_pool = token_to_kv_pool.layer_mapping[layer_id]
+            assert extra_pool is not None
             dequantize_k_cache_paged(
                 extra_k_cache,
                 flat_token_ids,
                 page_size=extra_page_size,
                 out=compressed_slice,
-                is_bf16=token_to_kv_pool.swa_kv_pool.use_bf16_cache,
+                is_bf16=extra_pool.use_bf16_cache,
+                is_int4=extra_pool.use_int4_cache,
             )
         dequantize_k_cache_paged(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
@@ -1907,10 +2303,14 @@ class DeepseekV4AttnBackend(
             page_size=cache.swa_page_size,
             out=swa_slice,
             is_bf16=token_to_kv_pool.swa_kv_pool.use_bf16_cache,
+            is_int4=token_to_kv_pool.swa_kv_pool.use_int4_cache,
         )
         kv = workspace
 
-        if token_to_kv_pool.swa_kv_pool.use_bf16_cache:
+        if (
+            token_to_kv_pool.swa_kv_pool.use_bf16_cache
+            or token_to_kv_pool.swa_kv_pool.use_int4_cache
+        ):
             from sglang.kernels.ops.attention.dsv4.unified_kv_kernels.paged_prefill import (
                 sparse_attn_v4_flat_prefill,
             )
@@ -2018,6 +2418,7 @@ class DeepseekV4AttnBackend(
             max_seq_len=max_seq_len,
             page_size=self.page_size,
             swa_window=SWA_WINDOW,
+            active_prefix_only=self.use_active_prefix_metadata and not is_prefill,
         )
         seq_lens_casual = prep.seq_lens_casual
 
@@ -2064,7 +2465,9 @@ class DeepseekV4AttnBackend(
         )
 
         if need_compress:
-            core_attn_metadata.init_compression_metadata()
+            core_attn_metadata.init_compression_metadata(
+                active_prefix_only=self.use_active_prefix_metadata and not is_prefill
+            )
             core_attn_metadata.init_flashmla_related(is_prefill=is_prefill)
         else:
             core_attn_metadata.c4_sparse_topk_lengths = None
@@ -2121,6 +2524,9 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                     speculative_step_id=i,
                     topk=self.topk,
                     speculative_num_steps=self.speculative_num_steps,
+                    oscar_int2_split_history_workspace=(
+                        self.oscar_int2_split_history_workspace
+                    ),
                 )
             )
 

@@ -49,6 +49,7 @@ def _jit_compress_norm_rope_module(
     rope_dim: int,
     page_size: int,
     bf16_store: bool = False,
+    int4_store: bool = False,
 ) -> Module:
     args = make_cpp_args(
         dtype,
@@ -58,6 +59,7 @@ def _jit_compress_norm_rope_module(
         is_arch_support_pdl(),
         INDEXER_K_CACHE_PRESHUFFLE_TILE if aiter_can_use_preshuffle_paged_mqa() else 0,
         bf16_store,
+        int4_store,
     )
     cuda_wrappers = [("forward", f"FusedNormRopeKernel<{args}>::forward")]
     if head_dim == 128:
@@ -425,11 +427,16 @@ def compress_norm_rope_store(
     page_size: int,
     use_fp4: bool = False,
     bf16_store: bool = False,
+    int4_store: bool = False,
 ) -> None:
+    if bf16_store and int4_store:
+        raise ValueError("BF16 and INT4 DSV4 cache stores are mutually exclusive")
     if use_fp4:
         assert kv.shape[-1] == 128
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     if _is_xpu:
+        if int4_store:
+            raise RuntimeError("DSV4 signed-INT4 cache storage is CUDA SM86 only")
         compress_norm_rope_store_xpu(
             kv,
             plan[1],
@@ -445,7 +452,12 @@ def compress_norm_rope_store(
         )
     else:
         module = _jit_compress_norm_rope_module(
-            kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size, bf16_store
+            kv.dtype,
+            kv.shape[-1],
+            freq_cis.shape[-1],
+            page_size,
+            bf16_store,
+            int4_store,
         )
         fn = module.forward_fp4 if use_fp4 else module.forward
         fn(

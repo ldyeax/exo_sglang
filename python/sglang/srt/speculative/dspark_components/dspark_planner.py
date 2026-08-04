@@ -131,6 +131,9 @@ class DSparkVerifyPlanner:
 
         self._ragged_verify_mode = read_ragged_verify_mode()
         self._schedule_cfg = DSparkScheduleConfig(gamma=self.gamma)
+        self._configured_forced_verify_len = (
+            server_args.speculative_dspark_fixed_verify_len
+        )
         self._budget_planner: Optional[HostConfidenceBudgetPlanner] = None
         self._dynamic_graph_tier = False
         self._dp_tier_gather_enabled = False
@@ -167,6 +170,8 @@ class DSparkVerifyPlanner:
                 model_runner=self.model_runner,
                 relay_lag_steps=relay_lag_steps,
             )
+            if self._configured_forced_verify_len is not None:
+                self.set_forced_verify_len(self._configured_forced_verify_len)
             self._dynamic_graph_tier = not is_dp_attention_enabled()
             self._dp_tier_gather_enabled = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
@@ -346,6 +351,45 @@ class DSparkVerifyPlanner:
     def set_forced_budget_frac(self, frac) -> None:
         if self._budget_planner is not None:
             self._budget_planner.forced_budget_frac = frac
+            if frac is not None:
+                self._budget_planner.forced_verify_len = None
+            else:
+                self._budget_planner.forced_verify_len = (
+                    self._configured_forced_verify_len
+                )
+
+    def set_forced_verify_len(self, verify_len: Optional[int]) -> None:
+        """Set a diagnostic uniform tier or restore the startup serving policy.
+
+        ``None`` restores ``--speculative-dspark-fixed-verify-len`` when it was
+        configured, otherwise confidence/SPS scheduling. Static mode has no
+        per-request layout scheduler, so accepting an override there would be
+        misleading and is rejected rather than silently changing nothing.
+        """
+        effective_verify_len = (
+            self._configured_forced_verify_len
+            if verify_len is None
+            else int(verify_len)
+        )
+        if effective_verify_len is None:
+            if self._budget_planner is not None:
+                self._budget_planner.forced_verify_len = None
+            return
+        if self._budget_planner is None:
+            raise ValueError(
+                "dspark_force_verify_len requires a non-static ragged verify mode"
+            )
+        maximum = min(
+            self.verify_num_draft_tokens,
+            self._schedule_cfg.resolved_max_verify_len(),
+        )
+        if not 2 <= effective_verify_len <= maximum:
+            raise ValueError(
+                f"dspark_force_verify_len must be in [2, {maximum}], got "
+                f"{effective_verify_len}."
+            )
+        self._budget_planner.forced_verify_len = effective_verify_len
+        self._budget_planner.forced_budget_frac = None
 
     def compute_budget_sync(
         self,
@@ -379,10 +423,20 @@ class DSparkVerifyPlanner:
     ) -> Optional[int]:
         """Per-step verify-token budget: under overlap it was precomputed into
         the draft input by prepare_verify_budget; otherwise compute it now."""
-        if not self.schedules_verify_budget or confidence is None:
+        if not self.schedules_verify_budget:
             return None
+        forced_budget = self._forced_verify_token_budget(
+            num_requests=int(req_pool_indices.shape[0])
+        )
         if not get_schedule().disable_overlap_schedule:
+            # The overlap scheduler normally relays a budget from the previous
+            # confidence record.  A fixed diagnostic tier must also work on the
+            # first decode cycle, before any confidence is available.
+            if draft_input.verify_token_budget is None and forced_budget is not None:
+                return forced_budget
             return draft_input.verify_token_budget
+        if confidence is None:
+            return forced_budget
         return self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,
@@ -401,6 +455,14 @@ class DSparkVerifyPlanner:
         req_pool_indices_cpu: torch.Tensor,
     ) -> Optional[int]:
         if resolved is None:
+            forced_budget = self._forced_verify_token_budget(
+                num_requests=int(req_pool_indices_cpu.numel())
+            )
+            if forced_budget is not None:
+                self._budget_planner.last_decision = VerifyBudgetDecision(
+                    budget=forced_budget
+                )
+                return forced_budget
             self._budget_planner.note_non_decode_step()
             return None
         current_generation = self.model_runner.req_to_token_pool.req_generation[
@@ -413,6 +475,18 @@ class DSparkVerifyPlanner:
                 current_generation=current_generation,
                 req_pool_indices_cpu=req_pool_indices_cpu,
             )
+        )
+
+    def _forced_verify_token_budget(self, *, num_requests: int) -> Optional[int]:
+        if self._budget_planner is None:
+            return None
+        forced_verify_len = self._budget_planner.forced_verify_len
+        if forced_verify_len is None:
+            return None
+        return uniform_verify_token_budget(
+            num_requests=num_requests,
+            verify_len=forced_verify_len,
+            min_verify_len=self._schedule_cfg.min_verify_len,
         )
 
     def schedule_layout(
@@ -428,7 +502,11 @@ class DSparkVerifyPlanner:
     ) -> Optional[RaggedVerifyLayout]:
         if self._ragged_verify_mode is RaggedVerifyMode.STATIC:
             return None
-        if self._is_verify_all and self._ragged_verify_mode is RaggedVerifyMode.COMPACT:
+        if (
+            self._is_verify_all
+            and self._ragged_verify_mode is RaggedVerifyMode.COMPACT
+            and self._budget_planner.forced_verify_len is None
+        ):
             # Verify-all: the uniform layout (or None, past the captured grid)
             # is constant per (bs, tier); serve it from cache instead of paying
             # the per-step schedule and its host<->device round-trips.
@@ -582,13 +660,34 @@ class DSparkVerifyPlanner:
         confidence: Optional[torch.Tensor],
         budget: Optional[int],
     ) -> Optional[torch.Tensor]:
-        if self._budget_planner is None or confidence is None or budget is None:
+        if self._budget_planner is None:
             return None
-        verify_lens = ScheduleVerifyLensTopk.execute(
-            confidence=confidence,
-            budget=budget,
-            cfg=self._schedule_cfg,
-        ).to(device=device, dtype=torch.int32)
+        forced_verify_len = self._budget_planner.forced_verify_len
+        if forced_verify_len is None:
+            if confidence is None or budget is None:
+                return None
+            verify_lens = ScheduleVerifyLensTopk.execute(
+                confidence=confidence,
+                budget=budget,
+                cfg=self._schedule_cfg,
+            ).to(device=device, dtype=torch.int32)
+        else:
+            # A fixed shape is useful for tier A/B tests and maps directly to
+            # an already captured ragged graph tier.  No host read is added to
+            # the decode path; changing the override remains a control-plane
+            # operation between requests.
+            verify_lens = torch.full(
+                (req_pool_indices.shape[0],),
+                forced_verify_len,
+                dtype=torch.int32,
+                device=device,
+            )
+            if budget is None:
+                budget = uniform_verify_token_budget(
+                    num_requests=int(req_pool_indices.shape[0]),
+                    verify_len=forced_verify_len,
+                    min_verify_len=self._schedule_cfg.min_verify_len,
+                )
 
         if resolve_level() >= InvariantCheckLevel.WARN:
             verify_lens_64 = verify_lens.to(torch.int64)
@@ -661,6 +760,20 @@ def local_verify_tier_num_tokens(
         return -1
     floor_tokens = bs * max(min_verify_len, 1)
     return min(floor_tokens + verify_token_budget, bs * verify_num_draft_tokens)
+
+
+def uniform_verify_token_budget(
+    *, num_requests: int, verify_len: int, min_verify_len: int
+) -> int:
+    """Budget above the scheduler floor for an exact uniform verify length."""
+    if num_requests < 0:
+        raise ValueError(f"num_requests must be non-negative, got {num_requests}")
+    effective_floor = max(min_verify_len, 1)
+    if verify_len < effective_floor:
+        raise ValueError(
+            f"verify_len {verify_len} is below scheduler floor {effective_floor}"
+        )
+    return num_requests * (verify_len - effective_floor)
 
 
 def graph_tier_fill_budget(
@@ -1034,6 +1147,7 @@ class HostConfidenceBudgetPlanner:
         self.cfg = cfg
         self._model_runner = model_runner
         self.forced_budget_frac: Optional[float] = None
+        self.forced_verify_len: Optional[int] = None
         self.last_decision: Optional[VerifyBudgetDecision] = None
         self.lag_steps = max(
             int(envs.SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS.get()), 1
@@ -1062,6 +1176,15 @@ class HostConfidenceBudgetPlanner:
             current_generation=current_generation,
         )
         forced_frac = self.forced_budget_frac
+        forced_verify_len = self.forced_verify_len
+        if forced_verify_len is not None:
+            forced_budget = uniform_verify_token_budget(
+                num_requests=int(survival.shape[0]),
+                verify_len=forced_verify_len,
+                min_verify_len=self.cfg.min_verify_len,
+            )
+            self.last_decision = VerifyBudgetDecision(budget=forced_budget)
+            return forced_budget
         if forced_frac is not None:
             full_budget = int(survival[:, : self.cfg.resolved_max_verify_len()].numel())
             forced_budget = max(0, int(float(forced_frac) * full_budget))

@@ -10,7 +10,20 @@ Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod):
 
     SGLANG_KT_HYBRID_TIMING=1
         Per-call wall-time breakdown of submit / mask / gpu / sync / merge
-        / cpu_wait stages. Logged at DEBUG for layers (0, 5, 20, 35) on TP0.
+        / cpu_wait stages for every layer and rank. The timing path performs no
+        CUDA synchronization unless DEEP mode is separately enabled.
+
+    SGLANG_KT_HYBRID_TIMING_SAMPLE_EVERY=N
+        Retain the first call and every Nth call per layer (default: 1).
+
+    SGLANG_KT_HYBRID_TIMING_RECEIPT=/path/to/timing.jsonl
+        Append structured timing, CPU-route, estimated weight-traffic, process
+        scheduling, TP/PP/EP rank, and optional NUMA residency evidence to a
+        JSONL receipt.
+
+    SGLANG_KT_HYBRID_NUMA_SAMPLE=1
+        Add process-wide /proc/self/numa_maps page counts to layer-zero timing
+        receipts. This is sampled only after the timed region completes.
 
     SGLANG_KT_HYBRID_TIMING_DEEP=1
         Insert torch.cuda.synchronize() at each timing stage so DEEP numbers
@@ -25,21 +38,49 @@ Diagnostic / escape-hatch environment variables (KT-DEBUG-ONLY; not for prod):
         Force GPU-experts apply() to a zero return; routed expert output
         comes purely from the CPU side. "Plan-C" fallback for diagnosing
         whether a regression sits in the GPU MoE path or the merge math.
+
+    SGLANG_DSV4_KT_INPLACE_MOE_OUTPUT=1
+        Default-off V4-Flash experiment.  On the rank-local compact MXFP4
+        hybrid path (and only with no remote expert sidecar), write GEMM2 and
+        the CPU merge into the now-dead MoE input.  This lets breakable CUDA
+        graph replay reuse the same bridge without a per-layer self-copy.
+
+    SGLANG_KT_DRAFT_HYBRID_EXPERT_SHARD_PLAN=/path/to/plan.pt
+        Optional DSpark/MTP-only hybrid placement.  The plan uses draft-stage
+        rows rather than borrowing target-layer rows.  Without it, a target
+        hybrid plan retains the existing all-CPU draft behavior.
+
+    SGLANG_KT_HOTSPOT_EXPERT_CACHE=1
+        Keep an immutable CPU shadow of every target expert owned by the local
+        EP rank.  This enables request-boundary MXFP4 slot replacement without
+        changing any CUDA-graph-captured tensor address.  Placements remain
+        frozen during requests and are changed only through the administrative
+        hotspot control endpoint while the scheduler is fully idle.
+
+    SGLANG_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU=1
+        Experimental, default-off DSV4 split format. Routed GPU experts keep
+        the checkpoint's native MXFP4 tensors while CPU experts use a separate
+        AMXINT4 artifact. DSpark must be pinned independently with
+        SGLANG_KT_DRAFT_METHOD=MXFP4 and SGLANG_KT_DRAFT_WEIGHT_PATH.
 """
 
 import copy
 import ctypes
+import hashlib
 import json
 import logging
 import os
 import re
+import resource
+import threading
 import time
 import uuid
+import weakref
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from multiprocessing import shared_memory
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -68,25 +109,997 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 try:
-    from kt_kernel import KTMoEWrapper, generate_gpu_experts_masks
+    from kt_kernel import KTMoEWrapper, generate_gpu_experts_masks, kt_kernel_ext
 
     KTRANSFORMERS_AVAILABLE = True
 except ImportError:
+    kt_kernel_ext = None
     KTRANSFORMERS_AVAILABLE = False
 
 
 logger = logging.getLogger(__name__)
+
+_DSV4_KT_INPLACE_MOE_OUTPUT_ENV = "SGLANG_DSV4_KT_INPLACE_MOE_OUTPUT"
+_KT_HOTSPOT_EXPERT_CACHE_ENV = "SGLANG_KT_HOTSPOT_EXPERT_CACHE"
+_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU_ENV = "SGLANG_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU"
 
 # Global cache for GPU experts masks (initialized once per session)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
 _KT_PROFILE_MASKS: dict[tuple[str, int, int, int], torch.Tensor] = {}
 _KT_GPU_EXPERT_MASK_PLANS: dict[str, torch.Tensor] = {}
 _KT_CPU_EXPERT_SHARD_PLANS: dict[str, tuple[torch.Tensor, ...]] = {}
+_KT_HYBRID_EXPERT_SHARD_PLANS: dict[
+    str, tuple[torch.Tensor, tuple[torch.Tensor, ...]]
+] = {}
 _KT_REMOTE_EXPERT_PLANS: dict[str, torch.Tensor] = {}
 _KT_REMOTE_EXECUTOR = ThreadPoolExecutor(
     max_workers=4,
     thread_name_prefix="kt-remote-tier",
 )
+_KT_HYBRID_TIMING_FORMAT = "sglang_kt_hybrid_timing_v1"
+_KT_HYBRID_TIMING_FILE_DESCRIPTORS: dict[str, int] = {}
+_KT_HYBRID_TIMING_FILE_LOCK = threading.Lock()
+_KT_ROUTE_STATS_ERROR_LAST_LOGGED: dict[tuple[int, int, str], float] = {}
+_KT_ROUTE_STATS_ERROR_LOG_LOCK = threading.Lock()
+_KT_ROUTE_STATS_ERROR_LOG_INTERVAL_SECONDS = 60.0
+_KT_NUMA_PAGE_PATTERN = re.compile(r"\bN(?P<node>\d+)=(?P<pages>\d+)\b")
+_KT_TASK_QUEUE_AFFINITY_ENV = "KT_TASK_QUEUE_PIN_FIRST_CORE"
+_KT_SINGLE_NUMA_INLINE_DISPATCH_ENV = "KT_SINGLE_NUMA_INLINE_DISPATCH"
+_KT_MXFP4_AVX_SCALE_FOLD_MODE_ENV = "KT_MXFP4_AVX_SCALE_FOLD_MODE"
+_KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT = 56
+_KT_MXFP4_AVX_SCALE_FOLD_NATIVE_KEYS = frozenset(
+    {
+        "schema_version",
+        "requested_mode",
+        "configuration_valid",
+        "architecture_supported",
+        "execution_mode",
+        "n_block",
+        "fold_safe_minimum",
+        "fold_safe_maximum",
+        "lut_identity",
+        "lut_hash_algorithm",
+        "lut_hash",
+        "lut_bytes",
+        "buffers_constructed",
+        "buffers_finalized",
+        "buffers_admitted",
+        "buffers_rejected",
+        "whole_buffer_domain_finalized",
+        "whole_buffer_domain_admitted",
+        "scale_bytes_audited",
+        "unsafe_scale_bytes",
+        "nan_scale_bytes",
+        "invalid_mode_requests",
+        "observed_scale_minimum",
+        "observed_scale_maximum",
+        "decode_dispatch_count",
+        "prefill_dispatch_count",
+        "real_dispatch_count",
+        "scale_fold_dispatch_count",
+        "lut_decode_dispatch_count",
+        "lut_prefill_dispatch_count",
+        "exponent_decode_dispatch_count",
+        "exponent_prefill_dispatch_count",
+        "fallback_dispatch_count",
+        "fallback_decode_dispatch_count",
+        "fallback_prefill_dispatch_count",
+        "zero_invalid_or_fallback_counts",
+    }
+)
+_KT_MXFP4_AVX_SCALE_FOLD_MODES = frozenset({"lut-v1", "exponent-v1"})
+_KT_MXFP4_AVX_SCALE_FOLD_N_BLOCK = 128
+_KT_MXFP4_AVX_SCALE_FOLD_OBSERVED_MINIMUM = 118
+_KT_MXFP4_AVX_SCALE_FOLD_OBSERVED_MAXIMUM = 126
+_KT_TASK_QUEUE_AFFINITY_NATIVE_KEYS = frozenset(
+    {
+        "environment_enabled",
+        "eligible_single_numa_subpool",
+        "requested",
+        "active",
+        "status",
+        "numa_id",
+        "cpu_id",
+        "native_thread_id",
+    }
+)
+_KT_SINGLE_NUMA_INLINE_NATIVE_KEYS = frozenset(
+    {
+        "environment_enabled",
+        "eligible_single_numa_subpool",
+        "requested",
+        "active",
+        "status",
+        "physical_numa_id",
+        "configured_worker_count",
+        "distributor_worker_count",
+        "distributor_thread_elided",
+        "dispatch_count",
+        "exception_count",
+        "last_native_thread_id",
+        "last_cpu_id",
+        "last_worker_pool_thread_id",
+        "task_queue_native_thread_id",
+        "task_queue_cpu_id",
+        "task_queue_affinity_active",
+        "last_dispatch_on_task_queue_thread",
+        "last_dispatch_on_task_queue_cpu",
+        "logical_worker_zero_proven",
+        "collision_free_worker_zero",
+    }
+)
+_KT_WORKER_POOL_AFFINITY_NATIVE_KEYS = frozenset(
+    {
+        "subpool_count",
+        "configured_worker_count",
+        "subpools",
+        "all_worker_bindings_active",
+        "all_worker_cpu_ids_unique",
+        "all_workers_on_expected_numa",
+    }
+)
+_KT_WORKER_POOL_SUBPOOL_NATIVE_KEYS = frozenset(
+    {
+        "logical_subpool_index",
+        "physical_numa_id",
+        "configured_worker_count",
+        "active_worker_count",
+        "worker_cpu_ids",
+        "worker_native_thread_ids",
+        "worker_affinity_statuses",
+        "worker_roles",
+        "last_caller_native_thread_id",
+        "last_caller_cpu_id",
+    }
+)
+_KT_SINGLE_NUMA_INLINE_PROBE_KEYS = frozenset(
+    {
+        "executed_task_count",
+        "worker_native_thread_ids",
+        "worker_cpu_ids",
+    }
+)
+
+
+@dataclass
+class _KTTaskQueueAffinityRegistration:
+    """Live CPUInfer plus every configuration that resolved to it."""
+
+    cpu_infer: Any
+    configurations: set[tuple[int, tuple[int, ...]]]
+
+
+_KT_TASK_QUEUE_AFFINITY_REGISTRATIONS: dict[int, _KTTaskQueueAffinityRegistration] = {}
+
+
+def _register_kt_task_queue_affinity_instance(
+    cpu_infer: Any,
+    *,
+    threadpool_count: int,
+    numa_nodes: Optional[List[int]],
+) -> None:
+    """Retain authoritative config provenance for the process-wide singleton.
+
+    The registration is deliberately passive while the feature is disabled.
+    When ``KT_TASK_QUEUE_PIN_FIRST_CORE=1`` is selected, the readback helper
+    below requires exactly one live CPUInfer and one single-NUMA-subpool
+    configuration.  Multiple model layers normally register the same pair.
+    """
+
+    normalized_threadpool_count = int(threadpool_count)
+    normalized_numa_nodes = tuple(
+        range(normalized_threadpool_count)
+        if numa_nodes is None
+        else (int(numa_id) for numa_id in numa_nodes)
+    )
+    registration = _KT_TASK_QUEUE_AFFINITY_REGISTRATIONS.setdefault(
+        id(cpu_infer),
+        _KTTaskQueueAffinityRegistration(
+            cpu_infer=cpu_infer,
+            configurations=set(),
+        ),
+    )
+    registration.configurations.add(
+        (normalized_threadpool_count, normalized_numa_nodes)
+    )
+
+
+def get_kt_mxfp4_avx_scale_fold_telemetry() -> dict[str, Any]:
+    """Return one worker's immutable MXFP4 scale-fold startup admission.
+
+    The native counters are sampled after every rank-local MXFP4 buffer has
+    been constructed and finalized, but before the HTTP server starts serving
+    requests.  Execution is proved separately from the post-warmup, PID-tagged
+    first-dispatch log; this getter deliberately does not require a positive
+    dispatch counter.
+    """
+
+    requested_mode = os.environ.get(_KT_MXFP4_AVX_SCALE_FOLD_MODE_ENV, "off")
+    if requested_mode not in _KT_MXFP4_AVX_SCALE_FOLD_MODES:
+        raise RuntimeError(
+            f"{_KT_MXFP4_AVX_SCALE_FOLD_MODE_ENV} must select one admitted "
+            f"mode; got {requested_mode!r}"
+        )
+    if kt_kernel_ext is None:
+        raise RuntimeError("KTransformers native extension is unavailable")
+    native_getter = getattr(
+        kt_kernel_ext,
+        "mxfp4_avx_scale_fold_telemetry",
+        None,
+    )
+    if not callable(native_getter):
+        raise RuntimeError(
+            "the live kt_kernel extension has no MXFP4 AVX scale-fold "
+            "telemetry; rebuild the admitted native overlay"
+        )
+    telemetry = _require_exact_native_mapping(
+        native_getter(),
+        _KT_MXFP4_AVX_SCALE_FOLD_NATIVE_KEYS,
+        "kt_kernel_ext.mxfp4_avx_scale_fold_telemetry()",
+    )
+
+    boolean_keys = (
+        "configuration_valid",
+        "architecture_supported",
+        "whole_buffer_domain_finalized",
+        "whole_buffer_domain_admitted",
+        "zero_invalid_or_fallback_counts",
+    )
+    integer_keys = (
+        "schema_version",
+        "n_block",
+        "fold_safe_minimum",
+        "fold_safe_maximum",
+        "lut_bytes",
+        "buffers_constructed",
+        "buffers_finalized",
+        "buffers_admitted",
+        "buffers_rejected",
+        "scale_bytes_audited",
+        "unsafe_scale_bytes",
+        "nan_scale_bytes",
+        "invalid_mode_requests",
+        "observed_scale_minimum",
+        "observed_scale_maximum",
+        "decode_dispatch_count",
+        "prefill_dispatch_count",
+        "real_dispatch_count",
+        "scale_fold_dispatch_count",
+        "lut_decode_dispatch_count",
+        "lut_prefill_dispatch_count",
+        "exponent_decode_dispatch_count",
+        "exponent_prefill_dispatch_count",
+        "fallback_dispatch_count",
+        "fallback_decode_dispatch_count",
+        "fallback_prefill_dispatch_count",
+    )
+    string_keys = (
+        "requested_mode",
+        "execution_mode",
+        "lut_identity",
+        "lut_hash_algorithm",
+        "lut_hash",
+    )
+    if any(type(telemetry[key]) is not bool for key in boolean_keys):
+        raise RuntimeError("MXFP4 AVX scale-fold boolean telemetry is malformed")
+    if any(type(telemetry[key]) is not int for key in integer_keys):
+        raise RuntimeError("MXFP4 AVX scale-fold integer telemetry is malformed")
+    if any(type(telemetry[key]) is not str for key in string_keys):
+        raise RuntimeError("MXFP4 AVX scale-fold string telemetry is malformed")
+
+    exact_contract = {
+        "schema_version": 1,
+        "requested_mode": requested_mode,
+        "configuration_valid": True,
+        "architecture_supported": True,
+        "n_block": _KT_MXFP4_AVX_SCALE_FOLD_N_BLOCK,
+        "fold_safe_minimum": 2,
+        "fold_safe_maximum": 252,
+        "lut_identity": "mxfp4-e2m1-bf16-ue8m0-lut-v1",
+        "lut_hash_algorithm": "fnv1a64-le",
+        "lut_hash": "06d1a83dbf20f545",
+        "lut_bytes": 16_384,
+        "whole_buffer_domain_finalized": True,
+        "whole_buffer_domain_admitted": True,
+        "buffers_rejected": 0,
+        "unsafe_scale_bytes": 0,
+        "nan_scale_bytes": 0,
+        "invalid_mode_requests": 0,
+        "fallback_dispatch_count": 0,
+        "fallback_decode_dispatch_count": 0,
+        "fallback_prefill_dispatch_count": 0,
+        "zero_invalid_or_fallback_counts": True,
+    }
+    mismatches = {
+        key: telemetry[key]
+        for key, expected in exact_contract.items()
+        if telemetry[key] != expected
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"MXFP4 AVX scale-fold startup contract mismatch: {mismatches}"
+        )
+
+    constructed = telemetry["buffers_constructed"]
+    finalized = telemetry["buffers_finalized"]
+    admitted = telemetry["buffers_admitted"]
+    if constructed <= 0 or (constructed, finalized, admitted) != (
+        constructed,
+        constructed,
+        constructed,
+    ):
+        raise RuntimeError(
+            "MXFP4 AVX scale-fold did not admit every constructed buffer: "
+            f"constructed={constructed}, finalized={finalized}, admitted={admitted}"
+        )
+    if telemetry["scale_bytes_audited"] <= 0:
+        raise RuntimeError("MXFP4 AVX scale-fold audited no checkpoint scale bytes")
+    observed_minimum = telemetry["observed_scale_minimum"]
+    observed_maximum = telemetry["observed_scale_maximum"]
+    if not (
+        _KT_MXFP4_AVX_SCALE_FOLD_OBSERVED_MINIMUM
+        <= observed_minimum
+        <= observed_maximum
+        <= _KT_MXFP4_AVX_SCALE_FOLD_OBSERVED_MAXIMUM
+    ):
+        raise RuntimeError(
+            "MXFP4 AVX scale-fold observed scale range is outside the admitted "
+            f"checkpoint domain: [{observed_minimum}, {observed_maximum}]"
+        )
+
+    decode_dispatches = telemetry["decode_dispatch_count"]
+    prefill_dispatches = telemetry["prefill_dispatch_count"]
+    real_dispatches = telemetry["real_dispatch_count"]
+    if min(telemetry[key] for key in integer_keys) < 0:
+        raise RuntimeError("MXFP4 AVX scale-fold telemetry contains a negative count")
+    if real_dispatches != decode_dispatches + prefill_dispatches:
+        raise RuntimeError("MXFP4 AVX scale-fold dispatch totals do not reconcile")
+    selected_prefix = "lut" if requested_mode == "lut-v1" else "exponent"
+    other_prefix = "exponent" if selected_prefix == "lut" else "lut"
+    selected_decode = telemetry[f"{selected_prefix}_decode_dispatch_count"]
+    selected_prefill = telemetry[f"{selected_prefix}_prefill_dispatch_count"]
+    if (
+        selected_decode != decode_dispatches
+        or selected_prefill != prefill_dispatches
+        or telemetry[f"{other_prefix}_decode_dispatch_count"] != 0
+        or telemetry[f"{other_prefix}_prefill_dispatch_count"] != 0
+        or telemetry["scale_fold_dispatch_count"] != real_dispatches
+    ):
+        raise RuntimeError(
+            "MXFP4 AVX scale-fold mode counters do not cover every dispatch"
+        )
+    expected_execution_mode = "not-executed" if real_dispatches == 0 else requested_mode
+    if telemetry["execution_mode"] != expected_execution_mode:
+        raise RuntimeError(
+            "MXFP4 AVX scale-fold execution mode does not match its counters: "
+            f"expected={expected_execution_mode!r}, "
+            f"observed={telemetry['execution_mode']!r}"
+        )
+    return dict(telemetry)
+
+
+def get_kt_task_queue_affinity_telemetry() -> dict[str, Any]:
+    """Return fail-closed live TaskQueue affinity proof for this worker.
+
+    This function is called only when the launcher selected the exact opt-in
+    value.  It intentionally uses the native ``CPUInfer.task_queue_affinity``
+    getter rather than inferring a pin from launcher arguments.
+    """
+
+    if os.environ.get(_KT_TASK_QUEUE_AFFINITY_ENV) != "1":
+        raise RuntimeError(
+            f"{_KT_TASK_QUEUE_AFFINITY_ENV}=1 is required for affinity telemetry"
+        )
+    if len(_KT_TASK_QUEUE_AFFINITY_REGISTRATIONS) != 1:
+        raise RuntimeError(
+            "TaskQueue affinity requires exactly one live CPUInfer singleton; "
+            f"found {len(_KT_TASK_QUEUE_AFFINITY_REGISTRATIONS)}"
+        )
+
+    registration = next(iter(_KT_TASK_QUEUE_AFFINITY_REGISTRATIONS.values()))
+    if len(registration.configurations) != 1:
+        raise RuntimeError(
+            "the CPUInfer singleton was registered with inconsistent worker-pool "
+            f"configurations: {sorted(registration.configurations)}"
+        )
+    threadpool_count, numa_nodes = next(iter(registration.configurations))
+    if threadpool_count != 1 or len(numa_nodes) != 1:
+        raise RuntimeError(
+            "TaskQueue affinity requires one rank-local NUMA subpool; "
+            f"threadpool_count={threadpool_count}, numa_nodes={list(numa_nodes)}"
+        )
+    expected_numa_id = numa_nodes[0]
+    if expected_numa_id < 0:
+        raise RuntimeError(f"TaskQueue affinity has invalid NUMA id {expected_numa_id}")
+
+    getter = getattr(registration.cpu_infer, "task_queue_affinity", None)
+    if not callable(getter):
+        raise RuntimeError(
+            "the live CPUInfer does not expose task_queue_affinity(); rebuild "
+            "kt_kernel with TaskQueue affinity telemetry"
+        )
+    native = getter()
+    if not isinstance(native, dict):
+        raise RuntimeError("CPUInfer.task_queue_affinity() must return a dict")
+    if set(native) != _KT_TASK_QUEUE_AFFINITY_NATIVE_KEYS:
+        missing = sorted(_KT_TASK_QUEUE_AFFINITY_NATIVE_KEYS - set(native))
+        extra = sorted(set(native) - _KT_TASK_QUEUE_AFFINITY_NATIVE_KEYS, key=repr)
+        raise RuntimeError(
+            "CPUInfer TaskQueue affinity telemetry has the wrong schema: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    for key in (
+        "environment_enabled",
+        "eligible_single_numa_subpool",
+        "requested",
+        "active",
+    ):
+        if type(native[key]) is not bool:
+            raise RuntimeError(f"CPUInfer TaskQueue affinity {key} must be bool")
+    for key in ("numa_id", "cpu_id", "native_thread_id"):
+        if type(native[key]) is not int:
+            raise RuntimeError(f"CPUInfer TaskQueue affinity {key} must be int")
+    if type(native["status"]) is not str:
+        raise RuntimeError("CPUInfer TaskQueue affinity status must be str")
+
+    required_values = {
+        "environment_enabled": True,
+        "eligible_single_numa_subpool": True,
+        "requested": True,
+        "active": True,
+        "status": "active",
+        "numa_id": expected_numa_id,
+    }
+    mismatches = {
+        key: native[key]
+        for key, expected in required_values.items()
+        if native[key] != expected
+    }
+    if mismatches:
+        raise RuntimeError(
+            "CPUInfer TaskQueue affinity is not active on the admitted NUMA node: "
+            f"{mismatches}"
+        )
+    cpu_id = native["cpu_id"]
+    native_thread_id = native["native_thread_id"]
+    if cpu_id < 0 or native_thread_id <= 0:
+        raise RuntimeError(
+            "CPUInfer TaskQueue affinity returned invalid CPU/TID readback: "
+            f"cpu_id={cpu_id}, native_thread_id={native_thread_id}"
+        )
+
+    live_cpu_affinity = sorted(os.sched_getaffinity(native_thread_id))
+    if live_cpu_affinity != [cpu_id]:
+        raise RuntimeError(
+            "CPUInfer TaskQueue thread affinity changed after native admission: "
+            f"expected={[cpu_id]}, live={live_cpu_affinity}"
+        )
+    cpu_in_expected_numa = os.path.exists(
+        f"/sys/devices/system/node/node{expected_numa_id}/cpu{cpu_id}"
+    )
+    if not cpu_in_expected_numa:
+        raise RuntimeError(
+            f"CPU {cpu_id} is not a member of admitted NUMA node {expected_numa_id}"
+        )
+
+    return {
+        **native,
+        "expected_numa_id": expected_numa_id,
+        "live_cpu_affinity": live_cpu_affinity,
+        "cpu_in_expected_numa": cpu_in_expected_numa,
+        "singleton_instance_count": 1,
+        "registered_configuration_count": 1,
+    }
+
+
+def _require_exact_native_mapping(
+    value: Any,
+    expected_keys: frozenset[str],
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{label} must return a dict")
+    if set(value) != expected_keys:
+        missing = sorted(expected_keys - set(value))
+        extra = sorted(set(value) - expected_keys, key=repr)
+        raise RuntimeError(
+            f"{label} has the wrong schema: missing={missing}, extra={extra}"
+        )
+    return value
+
+
+def get_kt_single_numa_inline_dispatch_telemetry() -> dict[str, Any]:
+    """Exercise and validate one rank's complete native inline-dispatch path.
+
+    The startup probe is intentional. Scheduler startup is the last point at
+    which every TP/EP/PP rank can safely enter a world collective, but it is
+    earlier than the generic server warmup. Running one native 56-task probe
+    here proves a nonzero dispatch without adding a request-time collective or
+    caching an uninformative zero counter.
+    """
+
+    if os.environ.get(_KT_SINGLE_NUMA_INLINE_DISPATCH_ENV) != "1":
+        raise RuntimeError(
+            f"{_KT_SINGLE_NUMA_INLINE_DISPATCH_ENV}=1 is required for "
+            "inline-dispatch telemetry"
+        )
+    if len(_KT_TASK_QUEUE_AFFINITY_REGISTRATIONS) != 1:
+        raise RuntimeError(
+            "single-NUMA inline dispatch requires exactly one live CPUInfer "
+            f"singleton; found {len(_KT_TASK_QUEUE_AFFINITY_REGISTRATIONS)}"
+        )
+
+    registration = next(iter(_KT_TASK_QUEUE_AFFINITY_REGISTRATIONS.values()))
+    if len(registration.configurations) != 1:
+        raise RuntimeError(
+            "the CPUInfer singleton was registered with inconsistent worker-pool "
+            f"configurations: {sorted(registration.configurations)}"
+        )
+    threadpool_count, numa_nodes = next(iter(registration.configurations))
+    if threadpool_count != 1 or len(numa_nodes) != 1:
+        raise RuntimeError(
+            "single-NUMA inline dispatch requires one rank-local NUMA subpool; "
+            f"threadpool_count={threadpool_count}, numa_nodes={list(numa_nodes)}"
+        )
+    expected_numa_id = numa_nodes[0]
+    if expected_numa_id < 0:
+        raise RuntimeError(
+            f"single-NUMA inline dispatch has invalid NUMA id {expected_numa_id}"
+        )
+
+    cpu_infer = registration.cpu_infer
+    getters = {
+        "CPUInfer.task_queue_affinity()": getattr(
+            cpu_infer, "task_queue_affinity", None
+        ),
+        "CPUInfer.single_numa_inline_dispatch()": getattr(
+            cpu_infer, "single_numa_inline_dispatch", None
+        ),
+        "CPUInfer.worker_pool_affinity()": getattr(
+            cpu_infer, "worker_pool_affinity", None
+        ),
+        "CPUInfer.probe_single_numa_inline_dispatch()": getattr(
+            cpu_infer, "probe_single_numa_inline_dispatch", None
+        ),
+    }
+    missing_getters = [name for name, getter in getters.items() if not callable(getter)]
+    if missing_getters:
+        raise RuntimeError(
+            "the live CPUInfer is missing native inline-dispatch telemetry: "
+            f"{missing_getters}; rebuild kt_kernel"
+        )
+
+    task_queue_getter = getters["CPUInfer.task_queue_affinity()"]
+    inline_getter = getters["CPUInfer.single_numa_inline_dispatch()"]
+    worker_pool_getter = getters["CPUInfer.worker_pool_affinity()"]
+    probe_getter = getters["CPUInfer.probe_single_numa_inline_dispatch()"]
+    assert callable(task_queue_getter)
+    assert callable(inline_getter)
+    assert callable(worker_pool_getter)
+    assert callable(probe_getter)
+
+    task_queue = _require_exact_native_mapping(
+        task_queue_getter(),
+        _KT_TASK_QUEUE_AFFINITY_NATIVE_KEYS,
+        "CPUInfer.task_queue_affinity()",
+    )
+    for key in (
+        "environment_enabled",
+        "eligible_single_numa_subpool",
+        "requested",
+        "active",
+    ):
+        if type(task_queue[key]) is not bool:
+            raise RuntimeError(f"TaskQueue affinity {key} must be bool")
+    for key in ("numa_id", "cpu_id", "native_thread_id"):
+        if type(task_queue[key]) is not int:
+            raise RuntimeError(f"TaskQueue affinity {key} must be int")
+    if type(task_queue["status"]) is not str:
+        raise RuntimeError("TaskQueue affinity status must be str")
+    required_task_queue_values = {
+        "environment_enabled": True,
+        "eligible_single_numa_subpool": True,
+        "requested": True,
+        "active": True,
+        "status": "active",
+        "numa_id": expected_numa_id,
+    }
+    task_queue_mismatches = {
+        key: task_queue[key]
+        for key, expected in required_task_queue_values.items()
+        if task_queue[key] != expected
+    }
+    if task_queue_mismatches:
+        raise RuntimeError(
+            "the inline TaskQueue is not active on the admitted NUMA node: "
+            f"{task_queue_mismatches}"
+        )
+    task_queue_cpu_id = task_queue["cpu_id"]
+    task_queue_native_thread_id = task_queue["native_thread_id"]
+    if task_queue_cpu_id < 0 or task_queue_native_thread_id <= 0:
+        raise RuntimeError(
+            "the inline TaskQueue returned invalid CPU/TID readback: "
+            f"cpu_id={task_queue_cpu_id}, "
+            f"native_thread_id={task_queue_native_thread_id}"
+        )
+
+    inline_boolean_keys = (
+        "environment_enabled",
+        "eligible_single_numa_subpool",
+        "requested",
+        "active",
+        "distributor_thread_elided",
+        "task_queue_affinity_active",
+        "last_dispatch_on_task_queue_thread",
+        "last_dispatch_on_task_queue_cpu",
+        "logical_worker_zero_proven",
+        "collision_free_worker_zero",
+    )
+    inline_integer_keys = (
+        "physical_numa_id",
+        "configured_worker_count",
+        "distributor_worker_count",
+        "dispatch_count",
+        "exception_count",
+        "last_native_thread_id",
+        "last_cpu_id",
+        "last_worker_pool_thread_id",
+        "task_queue_native_thread_id",
+        "task_queue_cpu_id",
+    )
+
+    def validate_inline_types(value: Any) -> dict[str, Any]:
+        inline = _require_exact_native_mapping(
+            value,
+            _KT_SINGLE_NUMA_INLINE_NATIVE_KEYS,
+            "CPUInfer.single_numa_inline_dispatch()",
+        )
+        for key in inline_boolean_keys:
+            if type(inline[key]) is not bool:
+                raise RuntimeError(f"inline-dispatch {key} must be bool")
+        for key in inline_integer_keys:
+            if type(inline[key]) is not int:
+                raise RuntimeError(f"inline-dispatch {key} must be int")
+        if type(inline["status"]) is not str:
+            raise RuntimeError("inline-dispatch status must be str")
+        return inline
+
+    inline_before_probe = validate_inline_types(inline_getter())
+    required_inline_startup_values = {
+        "environment_enabled": True,
+        "eligible_single_numa_subpool": True,
+        "requested": True,
+        "active": True,
+        "status": "active",
+        "physical_numa_id": expected_numa_id,
+        "configured_worker_count": _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT,
+        "distributor_worker_count": 0,
+        "distributor_thread_elided": True,
+        "exception_count": 0,
+        "task_queue_native_thread_id": task_queue_native_thread_id,
+        "task_queue_cpu_id": task_queue_cpu_id,
+        "task_queue_affinity_active": True,
+        "collision_free_worker_zero": True,
+    }
+    inline_startup_mismatches = {
+        key: inline_before_probe[key]
+        for key, expected in required_inline_startup_values.items()
+        if inline_before_probe[key] != expected
+    }
+    if inline_startup_mismatches:
+        raise RuntimeError(
+            "native single-NUMA inline dispatch failed startup admission: "
+            f"{inline_startup_mismatches}"
+        )
+    dispatch_count_before_probe = inline_before_probe["dispatch_count"]
+    if dispatch_count_before_probe < 0:
+        raise RuntimeError("inline-dispatch dispatch_count must be non-negative")
+
+    startup_probe = _require_exact_native_mapping(
+        probe_getter(_KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT),
+        _KT_SINGLE_NUMA_INLINE_PROBE_KEYS,
+        "CPUInfer.probe_single_numa_inline_dispatch()",
+    )
+    if type(startup_probe["executed_task_count"]) is not int:
+        raise RuntimeError("inline-dispatch probe executed_task_count must be int")
+    probe_native_thread_ids = startup_probe["worker_native_thread_ids"]
+    probe_cpu_ids = startup_probe["worker_cpu_ids"]
+    if not isinstance(probe_native_thread_ids, list) or not isinstance(
+        probe_cpu_ids, list
+    ):
+        raise RuntimeError("inline-dispatch probe worker readbacks must be lists")
+    if (
+        startup_probe["executed_task_count"]
+        != _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT
+        or len(probe_native_thread_ids) != _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT
+        or len(probe_cpu_ids) != _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT
+        or any(
+            type(native_thread_id) is not int
+            for native_thread_id in probe_native_thread_ids
+        )
+        or any(type(cpu_id) is not int for cpu_id in probe_cpu_ids)
+    ):
+        raise RuntimeError(
+            "inline-dispatch startup probe did not execute all 56 logical workers"
+        )
+
+    inline = validate_inline_types(inline_getter())
+    required_inline_values = {
+        **required_inline_startup_values,
+        "last_native_thread_id": task_queue_native_thread_id,
+        "last_cpu_id": task_queue_cpu_id,
+        "last_worker_pool_thread_id": 0,
+        "last_dispatch_on_task_queue_thread": True,
+        "last_dispatch_on_task_queue_cpu": True,
+        "logical_worker_zero_proven": True,
+    }
+    inline_mismatches = {
+        key: inline[key]
+        for key, expected in required_inline_values.items()
+        if inline[key] != expected
+    }
+    if inline_mismatches:
+        raise RuntimeError(
+            "native single-NUMA inline dispatch failed live admission: "
+            f"{inline_mismatches}"
+        )
+    if inline["dispatch_count"] <= dispatch_count_before_probe:
+        raise RuntimeError(
+            "inline-dispatch startup probe did not advance dispatch_count: "
+            f"before={dispatch_count_before_probe}, after={inline['dispatch_count']}"
+        )
+
+    worker_pool = _require_exact_native_mapping(
+        worker_pool_getter(),
+        _KT_WORKER_POOL_AFFINITY_NATIVE_KEYS,
+        "CPUInfer.worker_pool_affinity()",
+    )
+    for key in ("subpool_count", "configured_worker_count"):
+        if type(worker_pool[key]) is not int:
+            raise RuntimeError(f"worker-pool affinity {key} must be int")
+    for key in (
+        "all_worker_bindings_active",
+        "all_worker_cpu_ids_unique",
+        "all_workers_on_expected_numa",
+    ):
+        if type(worker_pool[key]) is not bool:
+            raise RuntimeError(f"worker-pool affinity {key} must be bool")
+    if (
+        worker_pool["subpool_count"] != 1
+        or worker_pool["configured_worker_count"]
+        != _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT
+        or worker_pool["all_worker_bindings_active"] is not True
+        or worker_pool["all_worker_cpu_ids_unique"] is not True
+        or worker_pool["all_workers_on_expected_numa"] is not True
+    ):
+        raise RuntimeError(
+            "worker-pool affinity root did not prove one exact 56-worker subpool"
+        )
+    subpools = worker_pool["subpools"]
+    if not isinstance(subpools, list) or len(subpools) != 1:
+        raise RuntimeError("worker-pool affinity must report exactly one subpool")
+    subpool = _require_exact_native_mapping(
+        subpools[0],
+        _KT_WORKER_POOL_SUBPOOL_NATIVE_KEYS,
+        "CPUInfer.worker_pool_affinity().subpools[0]",
+    )
+    for key in (
+        "logical_subpool_index",
+        "physical_numa_id",
+        "configured_worker_count",
+        "active_worker_count",
+        "last_caller_native_thread_id",
+        "last_caller_cpu_id",
+    ):
+        if type(subpool[key]) is not int:
+            raise RuntimeError(f"worker-pool subpool {key} must be int")
+    required_subpool_values = {
+        "logical_subpool_index": 0,
+        "physical_numa_id": expected_numa_id,
+        "configured_worker_count": _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT,
+        "active_worker_count": _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT,
+        "last_caller_native_thread_id": task_queue_native_thread_id,
+        "last_caller_cpu_id": task_queue_cpu_id,
+    }
+    subpool_mismatches = {
+        key: subpool[key]
+        for key, expected in required_subpool_values.items()
+        if subpool[key] != expected
+    }
+    if subpool_mismatches:
+        raise RuntimeError(
+            f"worker-pool subpool failed exact inline admission: {subpool_mismatches}"
+        )
+
+    worker_cpu_ids = subpool["worker_cpu_ids"]
+    worker_native_thread_ids = subpool["worker_native_thread_ids"]
+    worker_affinity_statuses = subpool["worker_affinity_statuses"]
+    worker_roles = subpool["worker_roles"]
+    worker_lists = (
+        worker_cpu_ids,
+        worker_native_thread_ids,
+        worker_affinity_statuses,
+        worker_roles,
+    )
+    if any(
+        not isinstance(values, list)
+        or len(values) != _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT
+        for values in worker_lists
+    ):
+        raise RuntimeError("worker-pool subpool must report four exact 56-entry lists")
+    if (
+        any(type(cpu_id) is not int or cpu_id < 0 for cpu_id in worker_cpu_ids)
+        or any(
+            type(native_thread_id) is not int or native_thread_id <= 0
+            for native_thread_id in worker_native_thread_ids
+        )
+        or len(set(worker_cpu_ids)) != _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT
+        or len(set(worker_native_thread_ids))
+        != _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT
+        or worker_affinity_statuses
+        != ["active"] * _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT
+        or worker_roles[0] != "inline_task_queue_worker0"
+        or worker_roles[1:]
+        != ["background_worker"] * (_KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT - 1)
+    ):
+        raise RuntimeError("worker-pool subpool roles or bindings are not exact")
+    if (
+        worker_native_thread_ids != probe_native_thread_ids
+        or worker_cpu_ids != probe_cpu_ids
+        or worker_native_thread_ids[0] != task_queue_native_thread_id
+        or worker_cpu_ids[0] != task_queue_cpu_id
+    ):
+        raise RuntimeError(
+            "worker-pool bindings do not match the executed startup probe or TaskQueue"
+        )
+
+    worker_live_cpu_affinities: list[list[int]] = []
+    all_worker_cpus_in_expected_numa = True
+    for native_thread_id, cpu_id in zip(
+        worker_native_thread_ids, worker_cpu_ids, strict=True
+    ):
+        live_affinity = sorted(os.sched_getaffinity(native_thread_id))
+        if live_affinity != [cpu_id]:
+            raise RuntimeError(
+                "a live inline worker affinity changed after native admission: "
+                f"tid={native_thread_id}, expected={[cpu_id]}, live={live_affinity}"
+            )
+        worker_live_cpu_affinities.append(live_affinity)
+        if not os.path.exists(
+            f"/sys/devices/system/node/node{expected_numa_id}/cpu{cpu_id}"
+        ):
+            all_worker_cpus_in_expected_numa = False
+    if not all_worker_cpus_in_expected_numa:
+        raise RuntimeError(
+            "a live inline worker CPU is outside the admitted physical NUMA node"
+        )
+
+    task_queue_live_cpu_affinity = sorted(
+        os.sched_getaffinity(task_queue_native_thread_id)
+    )
+    if task_queue_live_cpu_affinity != [task_queue_cpu_id]:
+        raise RuntimeError(
+            "the live inline TaskQueue affinity changed after native admission"
+        )
+
+    return {
+        "environment_enabled": True,
+        "expected_numa_id": expected_numa_id,
+        "required_worker_count": _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT,
+        "singleton_instance_count": 1,
+        "registered_configuration_count": 1,
+        "dispatch_count_before_startup_probe": dispatch_count_before_probe,
+        "dispatch_count_after_startup_probe": inline["dispatch_count"],
+        "startup_probe_advanced_dispatch_count": True,
+        "task_queue_affinity": task_queue,
+        "single_numa_inline_dispatch": inline,
+        "worker_pool_affinity": worker_pool,
+        "startup_probe": startup_probe,
+        "task_queue_live_cpu_affinity": task_queue_live_cpu_affinity,
+        "worker_live_cpu_affinities": worker_live_cpu_affinities,
+        "all_live_worker_affinities_exact": True,
+        "all_worker_cpus_in_expected_numa": True,
+    }
+
+
+def _parse_positive_environment_integer(name: str, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f"{name} must be a positive integer") from error
+    if parsed <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _should_sample_kt_hybrid_timing(step: int) -> bool:
+    """Return whether an enabled timing stream should retain this call."""
+    sample_every = _parse_positive_environment_integer(
+        "SGLANG_KT_HYBRID_TIMING_SAMPLE_EVERY", 1
+    )
+    return step == 1 or step % sample_every == 0
+
+
+def _collect_kt_cpu_route_stats(
+    wrapper: object,
+    *,
+    layer_index: int,
+) -> tuple[dict[str, object] | None, str | None]:
+    """Collect optional CPU-route evidence without affecting model serving."""
+    try:
+        route_stats = getattr(wrapper, "get_last_forward_route_stats", None)
+        if not callable(route_stats):
+            return None, None
+        collected = route_stats()
+        if collected is not None and not isinstance(collected, dict):
+            raise TypeError(
+                "get_last_forward_route_stats must return a dictionary or None"
+            )
+        return collected, None
+    except Exception as error:
+        error_type = type(error).__name__
+        now = time.monotonic()
+        error_key = (id(wrapper), layer_index, error_type)
+        should_log = False
+        with _KT_ROUTE_STATS_ERROR_LOG_LOCK:
+            last_logged = _KT_ROUTE_STATS_ERROR_LAST_LOGGED.get(error_key)
+            if (
+                last_logged is None
+                or now - last_logged >= _KT_ROUTE_STATS_ERROR_LOG_INTERVAL_SECONDS
+            ):
+                _KT_ROUTE_STATS_ERROR_LAST_LOGGED[error_key] = now
+                should_log = True
+        if should_log:
+            logger.exception(
+                "KT timing route-stat collection failed for layer %s; model serving "
+                "will continue without route evidence (repeats are rate-limited)",
+                layer_index,
+            )
+        return None, error_type
+
+
+def _read_process_numa_pages() -> dict[str, int]:
+    """Read process-wide NUMA residency without touching CUDA state."""
+    pages_by_node: dict[str, int] = {}
+    try:
+        with open("/proc/self/numa_maps", encoding="utf-8") as numa_maps:
+            for line in numa_maps:
+                for match in _KT_NUMA_PAGE_PATTERN.finditer(line):
+                    node = match.group("node")
+                    pages_by_node[node] = pages_by_node.get(node, 0) + int(
+                        match.group("pages")
+                    )
+    except OSError as error:
+        logger.debug("Unable to sample /proc/self/numa_maps: %s", error)
+    return pages_by_node
+
+
+def _emit_kt_hybrid_timing_receipt(receipt: dict[str, object]) -> None:
+    """Emit one JSONL receipt using CPU-only, CUDA-graph-safe operations."""
+    serialized = (
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    logger.info("[kt-time-json] %s", serialized[:-1].decode("utf-8"))
+
+    receipt_path = os.environ.get("SGLANG_KT_HYBRID_TIMING_RECEIPT")
+    if not receipt_path:
+        return
+    resolved_path = str(Path(receipt_path).expanduser().resolve())
+    with _KT_HYBRID_TIMING_FILE_LOCK:
+        file_descriptor = _KT_HYBRID_TIMING_FILE_DESCRIPTORS.get(resolved_path)
+        if file_descriptor is None:
+            Path(resolved_path).parent.mkdir(parents=True, exist_ok=True)
+            file_descriptor = os.open(
+                resolved_path,
+                os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                0o644,
+            )
+            _KT_HYBRID_TIMING_FILE_DESCRIPTORS[resolved_path] = file_descriptor
+        os.write(file_descriptor, serialized)
 
 
 @dataclass(frozen=True)
@@ -94,6 +1107,19 @@ class _KTRemotePending:
     prepared_tiers: tuple[tuple, ...]
     futures: tuple[Future[torch.Tensor], ...]
     token_count: int
+
+
+def _merge_hybrid_expert_outputs(
+    gpu_output: torch.Tensor,
+    cpu_output: torch.Tensor,
+    *,
+    inplace: bool,
+) -> torch.Tensor:
+    """Merge CPU and GPU expert partials, optionally retaining GPU storage."""
+    if inplace:
+        gpu_output.add_(cpu_output)
+        return gpu_output
+    return gpu_output + cpu_output
 
 
 @dataclass
@@ -133,6 +1159,42 @@ class KTConfig:
     global_num_experts: Optional[int] = None
     remote_expert_id_tiers: Optional[tuple[torch.Tensor, ...]] = None
     remote_expert_endpoints: Optional[tuple[str, ...]] = None
+    rank_local_logical_expert_ids: bool = False
+    hotspot_cpu_shadow: bool = False
+
+
+def validate_kt_fused_shared_experts(
+    *,
+    kt_config: KTConfig,
+    model_num_experts: int,
+    num_fused_shared_experts: int,
+) -> None:
+    """Reject a fused-shared layout the KT wrapper cannot represent yet.
+
+    KT plans, masks, compact GPU mappings, and native CPU weights currently
+    use the routed-expert namespace from ``n_routed_experts``.  A fused shared
+    expert is a distinct replicated slot after that namespace; merely growing
+    a GPU tensor would still leave its checkpoint remap, CPU weight source,
+    EP replication/scaling, and runtime routing unsupported.
+    """
+
+    if num_fused_shared_experts <= 0:
+        return
+
+    kt_num_experts = int(
+        kt_config.global_num_experts
+        if kt_config.global_num_experts is not None
+        else kt_config.gpu_experts_mask.numel()
+    )
+    raise ValueError(
+        "KTransformers EP does not support fused shared experts: "
+        f"the MoE layer has {model_num_experts} experts including "
+        f"{num_fused_shared_experts} fused shared expert(s), while the KT "
+        f"plan/mask namespace contains {kt_num_experts} routed experts. "
+        "Use --disable-shared-experts-fusion. Support requires an explicit "
+        "shared-slot checkpoint loader, replicated EP placement/scaling, and "
+        "shared-ID routing in both the GPU and CPU paths."
+    )
 
 
 @dataclass
@@ -460,7 +1522,12 @@ class SharedFullContext:
             from sglang.srt.server_args import get_global_server_args
 
             _v4_env = _os_v4.environ.get("SGLANG_V4_USE_TRITON_KERNELS")
-            if _v4_env == "1":
+            _split_mxfp4_gpu = (
+                _os_v4.environ.get(_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU_ENV, "0") == "1"
+            )
+            if _split_mxfp4_gpu:
+                _do_v4_wrap = True
+            elif _v4_env == "1":
                 _do_v4_wrap = True
             elif _v4_env == "0":
                 _do_v4_wrap = False
@@ -471,6 +1538,11 @@ class SharedFullContext:
             if _do_v4_wrap and isinstance(self.gpu_method, Fp8MoEMethod):
                 self.gpu_method = DeepSeekMxfp4MoEMethod(self.gpu_method, prefix="")
         except Exception as _v4_tk_wrap_exc:
+            if _os_v4.environ.get(_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU_ENV, "0") == "1":
+                raise RuntimeError(
+                    "experimental split tier could not install the required "
+                    "native MXFP4 GPU quantization wrapper"
+                ) from _v4_tk_wrap_exc
             logger.warning(
                 f"[kt-ep-wrapper] V4-Flash MXFP4 wrap skipped: {_v4_tk_wrap_exc}"
             )
@@ -1882,7 +2954,10 @@ def load_cpu_expert_shard_plan(
             "KTransformers CPU expert shard rank count does not match EP: "
             f"plan={len(shards)} ep_rank={ep_rank} ep_size={ep_size}"
         )
-    expected = torch.arange(num_experts, dtype=torch.int64)
+    # Model workers install their CUDA device as PyTorch's default device.
+    # Keep plan validation host-only just like the tensors loaded above; an
+    # implicit CUDA arange both wastes device work and makes torch.equal fail.
+    expected = torch.arange(num_experts, dtype=torch.int64, device="cpu")
     for rank, shard in enumerate(shards):
         if shard.ndim != 2 or shard.shape[0] < num_layers:
             raise ValueError(
@@ -1898,6 +2973,249 @@ def load_cpu_expert_shard_plan(
                 f"partition at layer {layer_idx}"
             )
     return shards[ep_rank][:num_layers].contiguous()
+
+
+def load_hybrid_expert_shard_plan(
+    plan_path: str,
+    *,
+    num_layers: int,
+    num_experts: int,
+    ep_size: int,
+    ep_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Load one exact-cover GPU/CPU placement for the local EP rank."""
+    real_path = os.path.realpath(plan_path)
+    cached = _KT_HYBRID_EXPERT_SHARD_PLANS.get(real_path)
+    if cached is None:
+
+        def plan_sha256() -> str:
+            digest = hashlib.sha256()
+            with open(real_path, "rb") as plan_file:
+                for chunk in iter(lambda: plan_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        target_plan = os.environ.get("SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN")
+        draft_plan = os.environ.get("SGLANG_KT_DRAFT_HYBRID_EXPERT_SHARD_PLAN")
+        expected_sha256 = None
+        if target_plan and os.path.realpath(target_plan) == real_path:
+            expected_sha256 = os.environ.get("SGLANG_KT_HYBRID_EXPERT_PLAN_SHA256")
+        elif draft_plan and os.path.realpath(draft_plan) == real_path:
+            expected_sha256 = os.environ.get(
+                "SGLANG_KT_DRAFT_HYBRID_EXPERT_PLAN_SHA256"
+            )
+        before_sha256 = plan_sha256()
+        if expected_sha256 is not None and before_sha256 != expected_sha256:
+            raise ValueError(
+                "KTransformers hybrid expert shard plan SHA-256 does not match "
+                f"the launcher-admitted digest: {real_path}"
+            )
+        loaded = torch.load(real_path, map_location="cpu", weights_only=True)
+        if plan_sha256() != before_sha256:
+            raise ValueError(
+                "KTransformers hybrid expert shard plan changed while loading: "
+                f"{real_path}"
+            )
+        raw_gpu_masks = (
+            loaded.get("gpu_experts_mask_by_rank") if isinstance(loaded, dict) else None
+        )
+        raw_cpu_shards = (
+            loaded.get("cpu_expert_ids_by_rank") if isinstance(loaded, dict) else None
+        )
+        raw_cpu_padded = (
+            loaded.get("cpu_expert_ids_padded_by_rank")
+            if isinstance(loaded, dict)
+            else None
+        )
+        raw_cpu_counts = (
+            loaded.get("cpu_rank_counts_by_layer") if isinstance(loaded, dict) else None
+        )
+        uses_variable_v2 = raw_cpu_padded is not None or raw_cpu_counts is not None
+        if raw_cpu_shards is not None and uses_variable_v2:
+            raise ValueError(
+                "KTransformers hybrid expert shard plan cannot mix v1 and v2 "
+                f"CPU shard fields: {real_path}"
+            )
+        if raw_gpu_masks is None or (
+            not isinstance(raw_cpu_shards, (list, tuple)) and not uses_variable_v2
+        ):
+            raise ValueError(
+                "KTransformers hybrid expert shard plan must contain "
+                "'gpu_experts_mask_by_rank' plus v1 CPU shards or v2 padded "
+                "CPU shards and counts: "
+                f"{real_path}"
+            )
+        gpu_masks = (
+            raw_gpu_masks.to(device="cpu", dtype=torch.bool).contiguous()
+            if isinstance(raw_gpu_masks, torch.Tensor)
+            else torch.as_tensor(
+                raw_gpu_masks, dtype=torch.bool, device="cpu"
+            ).contiguous()
+        )
+        if uses_variable_v2:
+            if (
+                not isinstance(loaded, dict)
+                or loaded.get("format") != "sglang_kt_hybrid_expert_shard_v2_variable"
+                or not isinstance(raw_cpu_padded, torch.Tensor)
+                or not isinstance(raw_cpu_counts, torch.Tensor)
+            ):
+                raise ValueError(
+                    "KTransformers variable-width hybrid plan must use format "
+                    "sglang_kt_hybrid_expert_shard_v2_variable and tensor CPU "
+                    f"shard/count fields: {real_path}"
+                )
+            cpu_padded = raw_cpu_padded.to(device="cpu", dtype=torch.int64).contiguous()
+            cpu_counts = raw_cpu_counts.to(device="cpu", dtype=torch.int64).contiguous()
+            if cpu_padded.ndim != 3 or tuple(cpu_padded.shape[:2]) != (
+                ep_size,
+                num_layers,
+            ):
+                raise ValueError(
+                    "KTransformers variable-width padded CPU shards must have "
+                    f"shape [{ep_size}, {num_layers}, max_cpu_experts]"
+                )
+            if tuple(cpu_counts.shape) != (ep_size, num_layers):
+                raise ValueError(
+                    "KTransformers variable-width CPU counts must have shape "
+                    f"[{ep_size}, {num_layers}]"
+                )
+            if cpu_counts.numel() and (
+                int(cpu_counts.min()) < 0 or int(cpu_counts.max()) > cpu_padded.shape[2]
+            ):
+                raise ValueError(
+                    "KTransformers variable-width CPU counts exceed padded storage"
+                )
+            for rank in range(ep_size):
+                for layer_idx in range(num_layers):
+                    count = int(cpu_counts[rank, layer_idx])
+                    if count and bool(
+                        torch.any(
+                            (cpu_padded[rank, layer_idx, :count] < 0)
+                            | (cpu_padded[rank, layer_idx, :count] >= num_experts)
+                        )
+                    ):
+                        raise ValueError(
+                            "KTransformers variable-width CPU shard has an expert "
+                            f"outside [0, {num_experts}) at rank {rank}, "
+                            f"layer {layer_idx}"
+                        )
+                    if bool(torch.any(cpu_padded[rank, layer_idx, count:] != -1)):
+                        raise ValueError(
+                            "KTransformers variable-width CPU shard padding must "
+                            f"be -1 at rank {rank}, layer {layer_idx}"
+                        )
+            raw_gpu_counts = loaded.get("gpu_rank_counts_by_layer")
+            if not isinstance(raw_gpu_counts, torch.Tensor) or tuple(
+                raw_gpu_counts.shape
+            ) != (ep_size, num_layers):
+                raise ValueError(
+                    "KTransformers variable-width plan must publish GPU counts "
+                    f"with shape [{ep_size}, {num_layers}]"
+                )
+            gpu_counts = raw_gpu_counts.to(device="cpu", dtype=torch.int64).contiguous()
+            if not torch.equal(gpu_counts, gpu_masks.sum(dim=2)):
+                raise ValueError(
+                    "KTransformers variable-width GPU counts do not match masks"
+                )
+            cpu_shards = tuple(cpu_padded[rank] for rank in range(ep_size))
+        else:
+            cpu_shards = tuple(
+                shard.to(device="cpu", dtype=torch.int64).contiguous()
+                if isinstance(shard, torch.Tensor)
+                else torch.as_tensor(
+                    shard, dtype=torch.int64, device="cpu"
+                ).contiguous()
+                for shard in raw_cpu_shards
+            )
+        cached = (gpu_masks, cpu_shards)
+        _KT_HYBRID_EXPERT_SHARD_PLANS[real_path] = cached
+
+    gpu_masks, cpu_shards = cached
+    if not 0 <= ep_rank < ep_size:
+        raise ValueError(f"KTransformers hybrid EP rank {ep_rank} is invalid")
+    expected_gpu_shape = (ep_size, num_layers, num_experts)
+    if tuple(gpu_masks.shape) != expected_gpu_shape:
+        raise ValueError(
+            "KTransformers hybrid GPU masks must have shape "
+            f"{expected_gpu_shape}, got {tuple(gpu_masks.shape)}"
+        )
+    if len(cpu_shards) != ep_size:
+        raise ValueError(
+            "KTransformers hybrid CPU shard rank count does not match EP: "
+            f"plan={len(cpu_shards)} ep_size={ep_size}"
+        )
+    for rank, shard in enumerate(cpu_shards):
+        if shard.ndim != 2 or shard.shape[0] != num_layers:
+            raise ValueError(
+                f"KTransformers hybrid CPU shard rank {rank} has invalid "
+                f"shape {tuple(shard.shape)}"
+            )
+        valid_ids = shard[shard >= 0]
+        if valid_ids.numel() and int(valid_ids.max()) >= num_experts:
+            raise ValueError(
+                f"KTransformers hybrid CPU shard rank {rank} has an expert "
+                f"outside [0, {num_experts})"
+            )
+
+    expected = torch.arange(num_experts, dtype=torch.int64, device="cpu")
+    for layer_idx in range(num_layers):
+        assigned = torch.cat(
+            [
+                *[shard[layer_idx][shard[layer_idx] >= 0] for shard in cpu_shards],
+                *[
+                    torch.where(gpu_masks[rank, layer_idx])[0]
+                    for rank in range(ep_size)
+                ],
+            ]
+        )
+        if assigned.numel() != num_experts or not torch.equal(
+            torch.sort(assigned).values, expected
+        ):
+            raise ValueError(
+                "KTransformers hybrid GPU/CPU shards must form an exact, "
+                f"disjoint cover at layer {layer_idx}"
+            )
+    return (
+        gpu_masks[ep_rank].clone(),
+        cpu_shards[ep_rank].clone(),
+    )
+
+
+def _select_rank_local_numa_pool(
+    *,
+    numa_nodes: Optional[List[int]],
+    threadpool_count: int,
+    parallel,
+    placement_name: str,
+) -> tuple[Optional[List[int]], int]:
+    """Select the one socket owned by a rank-local expert shard.
+
+    Hybrid/CPU plans are indexed by EP rank, but a TP1 pipeline has EP size one
+    in every stage.  In that topology each PP process still owns a disjoint
+    layer slice and needs its own socket-local CPUInfer singleton.  The launch
+    command is shared by all child processes, so select the PP-indexed NUMA
+    entry after distributed ranks are initialized.
+    """
+    moe_ep_size = int(getattr(parallel, "moe_ep_size", 1))
+    if moe_ep_size > 1:
+        if numa_nodes is None or len(numa_nodes) != moe_ep_size:
+            raise ValueError(
+                f"KTransformers {placement_name} expert sharding requires one "
+                "NUMA node per EP rank in --kt-numa-nodes"
+            )
+        return [numa_nodes[int(parallel.moe_ep_rank)]], 1
+
+    pp_size = int(getattr(parallel, "pp_size", 1))
+    tp_size = int(getattr(parallel, "tp_size", 1))
+    if pp_size > 1 and tp_size == 1:
+        if numa_nodes is None or len(numa_nodes) != pp_size:
+            raise ValueError(
+                f"KTransformers {placement_name} expert sharding in a TP1 "
+                "pipeline requires one NUMA node per PP rank in --kt-numa-nodes"
+            )
+        return [numa_nodes[int(parallel.pp_rank)]], 1
+
+    return numa_nodes, threadpool_count
 
 
 def build_logical_to_gpu_index(gpu_experts_mask: torch.Tensor) -> torch.Tensor:
@@ -2563,11 +3881,52 @@ def create_kt_config_from_server_args(
         if dspark_stage_match is not None
         else None
     )
-    gpu_experts_mask = resolve_gpu_experts_mask(
-        server_args,
-        layer_idx=layer_idx,
-        weight_key_prefix=weight_key_prefix,
+    split_tier_setting = os.environ.get(_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU_ENV, "0")
+    if split_tier_setting not in ("0", "1"):
+        raise ValueError(
+            f"{_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU_ENV} must be exactly 0 or 1, "
+            f"got {split_tier_setting!r}"
+        )
+    split_tier_enabled = split_tier_setting == "1"
+    effective_kt_method = server_args.kt_method
+    effective_kt_weight_path = server_args.kt_weight_path
+    if split_tier_enabled:
+        if (server_args.kt_method or "").upper() != "AMXINT4":
+            raise ValueError(
+                f"{_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU_ENV}=1 requires the "
+                "target --kt-method AMXINT4"
+            )
+        if weight_key_prefix is not None:
+            draft_method = os.environ.get("SGLANG_KT_DRAFT_METHOD", "")
+            draft_weight_path = os.environ.get("SGLANG_KT_DRAFT_WEIGHT_PATH", "")
+            if draft_method.upper() != "MXFP4" or not draft_weight_path:
+                raise ValueError(
+                    f"{_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU_ENV}=1 requires "
+                    "SGLANG_KT_DRAFT_METHOD=MXFP4 and a non-empty "
+                    "SGLANG_KT_DRAFT_WEIGHT_PATH for every DSpark stage"
+                )
+            effective_kt_method = "MXFP4"
+            effective_kt_weight_path = draft_weight_path
+    target_hybrid_shard_plan = os.environ.get("SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN")
+    draft_hybrid_shard_plan = os.environ.get("SGLANG_KT_DRAFT_HYBRID_EXPERT_SHARD_PLAN")
+    uses_dedicated_draft_hybrid_plan = bool(
+        weight_key_prefix is not None and draft_hybrid_shard_plan
     )
+    hybrid_shard_plan = (
+        draft_hybrid_shard_plan
+        if uses_dedicated_draft_hybrid_plan
+        else target_hybrid_shard_plan
+    )
+    if hybrid_shard_plan:
+        gpu_experts_mask = torch.zeros(
+            global_num_experts, dtype=torch.bool, device="cpu"
+        )
+    else:
+        gpu_experts_mask = resolve_gpu_experts_mask(
+            server_args,
+            layer_idx=layer_idx,
+            weight_key_prefix=weight_key_prefix,
+        )
     cpu_expert_ids = None
     remote_expert_id_tiers = None
     remote_expert_endpoints = None
@@ -2609,6 +3968,38 @@ def create_kt_config_from_server_args(
         configured_endpoints = ()
 
     shard_plan = os.environ.get("SGLANG_KT_CPU_EXPERT_SHARD_PLAN")
+    cpuinfer_threads = server_args.kt_cpuinfer
+    threadpool_count = server_args.kt_threadpool_count
+    numa_nodes = getattr(server_args, "kt_numa_nodes", None)
+    gpu_prefill_token_threshold = (
+        getattr(server_args, "kt_gpu_prefill_token_threshold", None)
+        or int(os.environ.get("SGLANG_KT_GPU_PREFILL_TOKEN_THRESHOLD", "0"))
+        or None
+    )
+    dynamic_expert_update = getattr(
+        server_args, "kt_enable_dynamic_expert_update", False
+    )
+    hotspot_env = os.environ.get(_KT_HOTSPOT_EXPERT_CACHE_ENV, "0")
+    if hotspot_env not in ("0", "1"):
+        raise ValueError(
+            f"{_KT_HOTSPOT_EXPERT_CACHE_ENV} must be exactly 0 or 1, "
+            f"got {hotspot_env!r}"
+        )
+    hotspot_cpu_shadow = False
+    if (
+        hybrid_shard_plan
+        and not uses_dedicated_draft_hybrid_plan
+        and (
+            remote_plan_paths
+            or shard_plan
+            or os.environ.get("SGLANG_KT_GPU_EXPERT_MASK_PLAN")
+            or os.environ.get("SGLANG_KT_EXPERT_PROFILE")
+        )
+    ):
+        raise ValueError(
+            "SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN is mutually exclusive with "
+            "remote, CPU-only, and standalone GPU expert plans"
+        )
     if remote_plan_paths and shard_plan:
         raise ValueError(
             "KTransformers remote and CPU-shard plans are mutually exclusive"
@@ -2634,12 +4025,115 @@ def create_kt_config_from_server_args(
             gpu_experts_mask, cpu_expert_ids = partition_remote_local_gpu_experts(
                 gpu_experts_mask, combined_remote_ids
             )
+    elif hybrid_shard_plan:
+        if getattr(server_args, "init_expert_location", "trivial") != "trivial":
+            raise ValueError(
+                "Hybrid KTransformers sharding requires trivial expert location"
+            )
+        if getattr(server_args, "enable_eplb", False) or getattr(
+            server_args, "ep_num_redundant_experts", 0
+        ):
+            raise ValueError(
+                "Hybrid KTransformers sharding is incompatible with EPLB and "
+                "redundant experts"
+            )
+        if getattr(server_args, "moe_a2a_backend", "none") != "none":
+            raise ValueError(
+                "Hybrid KTransformers sharding currently requires "
+                "--moe-a2a-backend none"
+            )
+        if dynamic_expert_update or gpu_prefill_token_threshold is not None:
+            raise ValueError(
+                "Hybrid KTransformers sharding is incompatible with dynamic "
+                "expert updates and full-GPU prefill fallback"
+            )
+        parallel = get_parallel()
+        numa_nodes, threadpool_count = _select_rank_local_numa_pool(
+            numa_nodes=numa_nodes,
+            threadpool_count=threadpool_count,
+            parallel=parallel,
+            placement_name="hybrid",
+        )
+        hybrid_plan_num_layers = int(num_layers)
+        if uses_dedicated_draft_hybrid_plan:
+            dspark_target_layer_ids = getattr(
+                hf_config, "dspark_target_layer_ids", None
+            )
+            hybrid_plan_num_layers = (
+                len(dspark_target_layer_ids)
+                if isinstance(dspark_target_layer_ids, (list, tuple))
+                and dspark_target_layer_ids
+                else int(getattr(hf_config, "num_nextn_predict_layers", 1) or 1)
+            )
+        gpu_masks, cpu_shards = load_hybrid_expert_shard_plan(
+            hybrid_shard_plan,
+            num_layers=hybrid_plan_num_layers,
+            num_experts=global_num_experts,
+            ep_size=parallel.moe_ep_size,
+            ep_rank=parallel.moe_ep_rank,
+        )
+        gpu_experts_mask = gpu_masks[layer_idx].clone()
+        cpu_expert_ids = cpu_shards[layer_idx].clone()
+        cpu_expert_ids = cpu_expert_ids[cpu_expert_ids >= 0].contiguous()
+        requested_gpu_experts = getattr(server_args, "kt_num_gpu_experts", None)
+        if requested_gpu_experts is None or requested_gpu_experts < 0:
+            raise ValueError(
+                "Hybrid KTransformers sharding requires a non-negative "
+                "--kt-num-gpu-experts"
+            )
+        actual_gpu_experts = int(gpu_experts_mask.sum().item())
+        if actual_gpu_experts > requested_gpu_experts:
+            raise ValueError(
+                "Hybrid KTransformers GPU shard width exceeds the "
+                "--kt-num-gpu-experts admission ceiling: "
+                f"plan={actual_gpu_experts} ceiling={requested_gpu_experts}"
+            )
+        if hotspot_env == "1" and weight_key_prefix is None:
+            if (effective_kt_method or "").upper() != "MXFP4":
+                raise ValueError(
+                    f"{_KT_HOTSPOT_EXPERT_CACHE_ENV}=1 currently requires "
+                    "--kt-method MXFP4"
+                )
+            # Keep a CPU shadow for every expert already owned by this EP
+            # rank.  The ownership union remains disjoint across ranks; only
+            # the GPU/CPU tier within that union may change at runtime.
+            cpu_expert_ids = torch.sort(
+                torch.cat([cpu_expert_ids, torch.where(gpu_experts_mask)[0]])
+            ).values
+            hotspot_cpu_shadow = True
+        if weight_key_prefix is not None and not uses_dedicated_draft_hybrid_plan:
+            draft_gpu_experts = int(os.environ.get("SGLANG_KT_DRAFT_GPU_EXPERTS", "0"))
+            if draft_gpu_experts != 0:
+                raise ValueError(
+                    "Hybrid KTransformers sharding currently requires "
+                    "SGLANG_KT_DRAFT_GPU_EXPERTS=0"
+                )
+            cpu_expert_ids = torch.sort(
+                torch.cat([cpu_expert_ids, torch.where(gpu_experts_mask)[0]])
+            ).values
+            gpu_experts_mask = torch.zeros(
+                global_num_experts, dtype=torch.bool, device="cpu"
+            )
+        elif (
+            weight_key_prefix is not None
+            and int(os.environ.get("SGLANG_KT_DRAFT_GPU_EXPERTS", "0")) != 0
+        ):
+            raise ValueError(
+                "SGLANG_KT_DRAFT_GPU_EXPERTS cannot be combined with "
+                "SGLANG_KT_DRAFT_HYBRID_EXPERT_SHARD_PLAN"
+            )
     elif shard_plan:
         if getattr(server_args, "kt_num_gpu_experts", None) != 0:
             raise ValueError(
                 "SGLANG_KT_CPU_EXPERT_SHARD_PLAN requires --kt-num-gpu-experts 0"
             )
         parallel = get_parallel()
+        numa_nodes, threadpool_count = _select_rank_local_numa_pool(
+            numa_nodes=numa_nodes,
+            threadpool_count=threadpool_count,
+            parallel=parallel,
+            placement_name="CPU",
+        )
         shards = load_cpu_expert_shard_plan(
             shard_plan,
             num_layers=int(num_layers),
@@ -2659,28 +4153,26 @@ def create_kt_config_from_server_args(
     return KTConfig(
         layer_idx=layer_idx,
         gpu_experts_mask=gpu_experts_mask,
-        cpuinfer_threads=server_args.kt_cpuinfer,
-        threadpool_count=server_args.kt_threadpool_count,
-        numa_nodes=getattr(server_args, "kt_numa_nodes", None),
-        weight_path=server_args.kt_weight_path,
+        cpuinfer_threads=cpuinfer_threads,
+        threadpool_count=threadpool_count,
+        numa_nodes=numa_nodes,
+        weight_path=effective_kt_weight_path,
         chunked_prefill_size=server_args.chunked_prefill_size,
-        method=server_args.kt_method,
+        method=effective_kt_method,
         max_deferred_experts_per_token=server_args.kt_max_deferred_experts_per_token,
-        num_layers=num_layers,
-        gpu_prefill_token_threshold=(
-            getattr(server_args, "kt_gpu_prefill_token_threshold", None)
-            or int(os.environ.get("SGLANG_KT_GPU_PREFILL_TOKEN_THRESHOLD", "0"))
-            or None
+        num_layers=(
+            hybrid_plan_num_layers if uses_dedicated_draft_hybrid_plan else num_layers
         ),
-        kt_enable_dynamic_expert_update=getattr(
-            server_args, "kt_enable_dynamic_expert_update", False
-        ),
+        gpu_prefill_token_threshold=gpu_prefill_token_threshold,
+        kt_enable_dynamic_expert_update=dynamic_expert_update,
         expert_lora_path=getattr(server_args, "kt_expert_lora_path", None),
         weight_key_prefix=weight_key_prefix,
         cpu_expert_ids=cpu_expert_ids,
         global_num_experts=global_num_experts,
         remote_expert_id_tiers=remote_expert_id_tiers,
         remote_expert_endpoints=remote_expert_endpoints,
+        rank_local_logical_expert_ids=bool(hybrid_shard_plan),
+        hotspot_cpu_shadow=hotspot_cpu_shadow,
     )
 
 
@@ -2991,6 +4483,75 @@ def update_kt_wrapper_masks(
     wrapper.gpu_experts_mask.copy_(gpu_experts_mask_cpu)
 
 
+@dataclass
+class _Mxfp4HotspotStaging:
+    """One reusable rank-local CPU-to-GPU expert promotion buffer."""
+
+    host_w13: torch.Tensor
+    host_w13_scale: torch.Tensor
+    host_w2: torch.Tensor
+    host_w2_scale: torch.Tensor
+    device_w13: torch.Tensor
+    device_w13_scale_bf16: torch.Tensor
+    device_w13_scale_e8m0: torch.Tensor
+    device_w2: torch.Tensor
+    device_w2_scale_bf16: torch.Tensor
+    device_w2_scale_e8m0: torch.Tensor
+
+
+_MXFP4_HOTSPOT_STAGING: dict[tuple, _Mxfp4HotspotStaging] = {}
+
+
+def _get_mxfp4_hotspot_staging(
+    *,
+    device: torch.device,
+    w13_shape: tuple[int, ...],
+    w13_scale_shape: tuple[int, ...],
+    w2_shape: tuple[int, ...],
+    w2_scale_shape: tuple[int, ...],
+) -> _Mxfp4HotspotStaging:
+    """Allocate one persistent staging set per device/layout, never per layer."""
+
+    key = (
+        str(device),
+        w13_shape,
+        w13_scale_shape,
+        w2_shape,
+        w2_scale_shape,
+    )
+    cached = _MXFP4_HOTSPOT_STAGING.get(key)
+    if cached is not None:
+        return cached
+
+    def host(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        return torch.empty(
+            shape, dtype=dtype, device="cpu", pin_memory=torch.cuda.is_available()
+        )
+
+    cached = _Mxfp4HotspotStaging(
+        host_w13=host(w13_shape, torch.uint8),
+        host_w13_scale=host(w13_scale_shape, torch.bfloat16),
+        host_w2=host(w2_shape, torch.uint8),
+        host_w2_scale=host(w2_scale_shape, torch.bfloat16),
+        device_w13=torch.empty(w13_shape, dtype=torch.uint8, device=device),
+        device_w13_scale_bf16=torch.empty(
+            w13_scale_shape, dtype=torch.bfloat16, device=device
+        ),
+        device_w13_scale_e8m0=torch.empty(
+            w13_scale_shape, dtype=torch.float8_e8m0fnu, device=device
+        ),
+        device_w2=torch.empty(w2_shape, dtype=torch.uint8, device=device),
+        device_w2_scale_bf16=torch.empty(
+            w2_scale_shape, dtype=torch.bfloat16, device=device
+        ),
+        device_w2_scale_e8m0=torch.empty(
+            w2_scale_shape, dtype=torch.float8_e8m0fnu, device=device
+        ),
+    )
+    _MXFP4_HOTSPOT_STAGING[key] = cached
+    return cached
+
+
 class KTEPWrapperMethod(FusedMoEMethodBase):
     """Wrapper for any MoE quantization method to enable CPU-GPU expert parallelism.
 
@@ -3051,7 +4612,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.kt_expert_lora_weights: Optional[KTExpertLoraWeights] = None
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
-        self.tp_rank = get_tensor_model_parallel_rank()
+        # CPU experts are replicated across MoE-TP ranks but sharded across
+        # MoE-EP ranks.  Selecting by moe_tp_rank keeps one CPU owner in
+        # ordinary TP while allowing every EP rank to execute its local shard.
+        self.tp_rank = get_parallel().moe_tp_rank
         self.cpu_expert_ids = kt_config.cpu_expert_ids
         self.remote_expert_id_tiers = kt_config.remote_expert_id_tiers
         self.remote_expert_endpoints = kt_config.remote_expert_endpoints
@@ -3060,6 +4624,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             if kt_config.global_num_experts is not None
             else int(kt_config.gpu_experts_mask.numel())
         )
+        self.rank_local_logical_expert_ids = getattr(
+            kt_config, "rank_local_logical_expert_ids", False
+        )
+        self.hotspot_cpu_shadow = bool(getattr(kt_config, "hotspot_cpu_shadow", False))
+        self._hotspot_layer_ref: Optional[weakref.ReferenceType[torch.nn.Module]] = None
         self.global_to_local_expert_mapping_cuda: Optional[torch.Tensor] = None
         self.remote_expert_masks_cuda: tuple[torch.Tensor, ...] = ()
         self.remote_clients = ()
@@ -3142,11 +4711,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             params_dtype: Data type for parameters
             **extra_weight_attrs: Additional weight attributes
         """
-        self.global_num_experts = num_experts
+        # FusedMoE passes the rank-local expert count here under EP.  Keep the
+        # model-wide count captured in KTConfig; arbitrary CPU shard IDs remain
+        # in that global namespace until the KT remap below.
+        if self.gpu_experts_mask.numel() != self.global_num_experts:
+            raise ValueError(
+                "KTransformers global expert mask/count mismatch: "
+                f"mask={self.gpu_experts_mask.numel()} "
+                f"global={self.global_num_experts}"
+            )
         native_num_experts = num_experts
         native_gpu_experts_mask = self.gpu_experts_mask
         if self.cpu_expert_ids is not None:
             native_num_experts = int(self.cpu_expert_ids.numel())
+            # Materialize every compact CPU-shadow expert during load.  Some
+            # native backends honor this mask while loading and would otherwise
+            # leave initially-GPU experts uninitialized.  Hotspot mode installs
+            # the actual runtime skip mask immediately after load below.
             native_gpu_experts_mask = torch.zeros(
                 native_num_experts, dtype=torch.bool, device="cpu"
             )
@@ -3266,10 +4847,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _kt_swiglu_limit = float(
                 _cfg_clamp if _cfg_clamp is not None else (_cfg_swglim or 0.0)
             )
-            # kt-kernel guards swiglu_limit to MXFP4/MXFP8 only.
-            # Zero it out for other methods (AMXINT4, BF16, etc.)
-            # so V4-Flash + non-MXFP runs don't crash at init.
-            if (self.kt_config.method or "").upper() not in ("MXFP4", "MXFP8"):
+            # The explicit split-tier experiment applies the same DSV4 clamp
+            # to AMXINT4 CPU experts while GPU experts stay native MXFP4.
+            _split_amxint4 = (
+                os.environ.get(_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU_ENV, "0") == "1"
+                and (self.kt_config.method or "").upper() == "AMXINT4"
+            )
+            if (self.kt_config.method or "").upper() not in (
+                "MXFP4",
+                "MXFP8",
+            ) and not _split_amxint4:
                 _kt_swiglu_limit = 0.0
                 _kt_swiglu_alpha = 0.0
             common_wrapper_kwargs = dict(
@@ -3315,6 +4902,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     method=self.kt_config.method,
                     max_deferred_experts_per_token=layer_max_deferred,
                 )
+            _register_kt_task_queue_affinity_instance(
+                getattr(self.wrapper, "cpu_infer", None),
+                threadpool_count=self.kt_config.threadpool_count,
+                numa_nodes=self.kt_config.numa_nodes,
+            )
             if self.cpu_expert_ids is not None:
                 self.wrapper.weight_expert_ids = self.cpu_expert_ids
             if self.kt_config.weight_key_prefix is not None:
@@ -3357,6 +4949,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     layer.num_experts, dtype=torch.int64, device="cpu"
                 )
             self.wrapper.load_weights(physical_to_logical_map_cpu)
+            if self.hotspot_cpu_shadow:
+                if self.cpu_expert_ids is None:
+                    raise RuntimeError(
+                        "Hotspot CPU shadow is missing rank-local expert IDs"
+                    )
+                update_kt_wrapper_masks(
+                    self.wrapper,
+                    self.gpu_experts_mask[self.cpu_expert_ids],
+                )
             if self.kt_expert_lora_enabled:
                 if self.kt_expert_lora_weights is None:
                     raise RuntimeError(
@@ -3404,6 +5005,386 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                     lora.alpha,
                 )
 
+        if self.hotspot_cpu_shadow:
+            if self.tp_rank != 0 or self.wrapper is None:
+                raise RuntimeError(
+                    "Hotspot expert cache requires one local KT CPU owner"
+                )
+            self._hotspot_layer_ref = weakref.ref(layer)
+            from sglang.srt.layers.moe.kt_hotspot import register_hotspot_method
+
+            register_hotspot_method(self)
+            logger.info(
+                "Registered graph-safe MXFP4 hotspot cache for layer %d "
+                "(%d fixed GPU slots, %d CPU-shadow experts)",
+                self.kt_config.layer_idx,
+                self.num_gpu_experts,
+                int(self.cpu_expert_ids.numel()),
+            )
+
+    def _hotspot_layer(self) -> torch.nn.Module:
+        layer = (
+            self._hotspot_layer_ref() if self._hotspot_layer_ref is not None else None
+        )
+        if layer is None:
+            raise RuntimeError(
+                f"Hotspot layer {self.kt_config.layer_idx} is no longer live"
+            )
+        return layer
+
+    @staticmethod
+    def _hotspot_tensor_storage(tensor_like) -> torch.Tensor:
+        data = getattr(tensor_like, "data", None)
+        if not isinstance(data, torch.Tensor):
+            raise RuntimeError(
+                "Hotspot MXFP4 path requires triton_kernels Tensor storage"
+            )
+        return data
+
+    @classmethod
+    def _hotspot_e8m0_byte_storage(cls, tensor_like, *, name: str) -> torch.Tensor:
+        """Return an architecture-neutral byte view of a UE8M0 scale tensor.
+
+        ``triton_kernels.Tensor`` keeps the logical dtype separately from its
+        physical torch storage.  The native adapter creates StridedLayout
+        scales as ``float8_e8m0fnu``, then ``matmul_ogs`` canonicalizes both
+        ``storage.data`` and ``Tensor.dtype`` to ``uint8`` on first execution
+        because the simulated-MXFP kernel requires a byte pointer.  Both states
+        contain the same one-byte UE8M0 encoding.  Hotspot replacement must copy
+        those bits, not numerically convert FP8 values into integers.
+        """
+
+        storage = cls._hotspot_tensor_storage(tensor_like)
+        semantic_dtype = getattr(tensor_like, "dtype", storage.dtype)
+        valid_representation = (
+            semantic_dtype == torch.float8_e8m0fnu
+            and storage.dtype in (torch.float8_e8m0fnu, torch.uint8)
+        ) or (semantic_dtype == torch.uint8 and storage.dtype == torch.uint8)
+        if not valid_representation:
+            raise RuntimeError(
+                f"Hotspot MXFP4 {name} must use a UE8M0 byte representation; "
+                f"semantic_dtype={semantic_dtype} storage_dtype={storage.dtype}"
+            )
+        # The dtypes have equal item size, so this is a zero-copy view that
+        # preserves shape, strides, storage offset, and captured data pointer.
+        return storage.view(torch.uint8)
+
+    def _hotspot_mxfp4_storages(
+        self, layer: torch.nn.Module
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Two SGLang quant adapters use the same portable StridedLayout tensors
+        # but publish them under different names.  The native V4 loader uses
+        # ``_dsv4_tk_*``; DeepSeekMxfp4MoEMethod uses the older ``_v4_tk_*``
+        # names.  Resolve the complete tuple atomically so a partially
+        # initialized adapter cannot mix weight and precision objects.
+        attribute_sets = (
+            (
+                "native",
+                "_dsv4_tk_w13",
+                "_dsv4_tk_w13_precision",
+                "_dsv4_tk_w2",
+                "_dsv4_tk_w2_precision",
+            ),
+            (
+                "deepseek",
+                "_v4_tk_w13",
+                "_v4_tk_w13_pcg",
+                "_v4_tk_w2",
+                "_v4_tk_w2_pcg",
+            ),
+        )
+        matches = [
+            attributes
+            for attributes in attribute_sets
+            if all(hasattr(layer, name) for name in attributes[1:])
+        ]
+        if len(matches) != 1:
+            availability = {
+                adapter: [name for name in names if not hasattr(layer, name)]
+                for adapter, *names in attribute_sets
+            }
+            raise RuntimeError(
+                "Hotspot cache requires the V4 triton_kernels MXFP4 layout; "
+                f"matched={len(matches)} missing={availability}"
+            )
+        _, w13_name, w13_precision_name, w2_name, w2_precision_name = matches[0]
+        w13_object = getattr(layer, w13_name)
+        w13_precision = getattr(layer, w13_precision_name)
+        w2_object = getattr(layer, w2_name)
+        w2_precision = getattr(layer, w2_precision_name)
+        if not hasattr(w13_precision, "weight_scale") or not hasattr(
+            w2_precision, "weight_scale"
+        ):
+            raise RuntimeError(
+                "Hotspot cache requires MXFP4 precision objects with weight scales"
+            )
+        tensor_objects = (
+            w13_object,
+            w13_precision.weight_scale,
+            w2_object,
+            w2_precision.weight_scale,
+        )
+        layouts = {
+            type(getattr(tensor, "storage", None).layout).__name__
+            if getattr(tensor, "storage", None) is not None
+            else "missing"
+            for tensor in tensor_objects
+        }
+        if layouts != {"StridedLayout"}:
+            raise RuntimeError(
+                "Hotspot byte replacement currently requires the SM86-style "
+                f"StridedLayout, got {sorted(layouts)}"
+            )
+        w13 = self._hotspot_tensor_storage(w13_object)
+        w2 = self._hotspot_tensor_storage(w2_object)
+        w13_scale = self._hotspot_e8m0_byte_storage(
+            w13_precision.weight_scale, name="w13_scale"
+        )
+        w2_scale = self._hotspot_e8m0_byte_storage(
+            w2_precision.weight_scale, name="w2_scale"
+        )
+        if w13.dtype != torch.uint8 or w2.dtype != torch.uint8:
+            raise RuntimeError(
+                "Hotspot MXFP4 weights must use architecture-neutral uint8 storage"
+            )
+        return w13, w13_scale, w2, w2_scale
+
+    def validate_hotspot_slots(self, slot_experts: tuple[int, ...]) -> None:
+        """Fail closed before a request-boundary transaction mutates bytes."""
+
+        if not self.hotspot_cpu_shadow:
+            raise RuntimeError("Layer was not launched with a hotspot CPU shadow")
+        if (self.kt_config.method or "").upper() != "MXFP4":
+            raise RuntimeError("Hotspot promotion currently supports MXFP4 only")
+        if self.tp_rank != 0 or self.wrapper is None:
+            raise RuntimeError("Hotspot promotion requires a local KT CPU owner")
+        if self.cpu_expert_ids is None:
+            raise RuntimeError("Hotspot promotion is missing rank-local ownership")
+        if len(slot_experts) != self.num_gpu_experts:
+            raise ValueError(
+                "Hotspot placement changed the fixed GPU slot count: "
+                f"expected={self.num_gpu_experts} got={len(slot_experts)}"
+            )
+        if len(set(slot_experts)) != len(slot_experts):
+            raise ValueError("Hotspot placement contains duplicate experts")
+        owned = set(int(value) for value in self.cpu_expert_ids.tolist())
+        foreign = sorted(set(slot_experts) - owned)
+        if foreign:
+            raise ValueError(
+                "Hotspot placement attempted cross-rank expert migration: "
+                f"layer={self.kt_config.layer_idx} foreign={foreign}"
+            )
+        if not hasattr(
+            self.wrapper, "submit_write_weight_scale_to_buffer"
+        ) or not hasattr(self.wrapper, "sync_write_weight_scale_to_buffer"):
+            raise RuntimeError("KT MXFP4 wrapper cannot export CPU-shadow weights")
+
+        layer = self._hotspot_layer()
+        w13, w13_scale, w2, w2_scale = self._hotspot_mxfp4_storages(layer)
+        for name, tensor in (
+            ("w13", w13),
+            ("w13_scale", w13_scale),
+            ("w2", w2),
+            ("w2_scale", w2_scale),
+        ):
+            if tensor.ndim != 3 or tensor.shape[0] != self.num_gpu_experts:
+                raise RuntimeError(
+                    f"Hotspot {name} storage does not preserve fixed expert slots: "
+                    f"shape={tuple(tensor.shape)} slots={self.num_gpu_experts}"
+                )
+        if not all(tensor.device == w13.device for tensor in (w13_scale, w2, w2_scale)):
+            raise RuntimeError("Hotspot MXFP4 storages are not on one CUDA device")
+
+    def _promote_hotspot_mxfp4_expert(
+        self,
+        *,
+        layer: torch.nn.Module,
+        global_expert_id: int,
+        gpu_slot: int,
+    ) -> int:
+        """Export one CPU-shadow expert and replace one existing GPU slot."""
+
+        w13, w13_scale, w2, w2_scale = self._hotspot_mxfp4_storages(layer)
+        owned_matches = torch.where(self.cpu_expert_ids == global_expert_id)[0]
+        if owned_matches.numel() != 1:
+            raise RuntimeError(
+                f"Expert {global_expert_id} is not uniquely present in the local CPU shadow"
+            )
+        local_expert_id = int(owned_matches.item())
+
+        raw_w13_shape = tuple(w13[gpu_slot].transpose(-2, -1).shape)
+        raw_w13_scale_shape = tuple(w13_scale[gpu_slot].transpose(-2, -1).shape)
+        raw_w2_shape = tuple(w2[gpu_slot].transpose(-2, -1).shape)
+        raw_w2_scale_shape = tuple(w2_scale[gpu_slot].transpose(-2, -1).shape)
+        staging = _get_mxfp4_hotspot_staging(
+            device=w13.device,
+            w13_shape=raw_w13_shape,
+            w13_scale_shape=raw_w13_scale_shape,
+            w2_shape=raw_w2_shape,
+            w2_scale_shape=raw_w2_scale_shape,
+        )
+
+        # EP2 shards full-width experts, so each process exports one complete
+        # rank-local expert (gpu_tp_count=1).  Passing the global TP size here
+        # would incorrectly split a full-width expert between the two GPUs.
+        self.wrapper.submit_write_weight_scale_to_buffer(
+            1,
+            local_expert_id,
+            [staging.host_w13.data_ptr()],
+            [staging.host_w13_scale.data_ptr()],
+            [staging.host_w2.data_ptr()],
+            [staging.host_w2_scale.data_ptr()],
+        )
+        self.wrapper.sync_write_weight_scale_to_buffer()
+
+        staging.device_w13.copy_(staging.host_w13, non_blocking=True)
+        staging.device_w13_scale_bf16.copy_(staging.host_w13_scale, non_blocking=True)
+        staging.device_w2.copy_(staging.host_w2, non_blocking=True)
+        staging.device_w2_scale_bf16.copy_(staging.host_w2_scale, non_blocking=True)
+        staging.device_w13_scale_e8m0.copy_(staging.device_w13_scale_bf16)
+        staging.device_w2_scale_e8m0.copy_(staging.device_w2_scale_bf16)
+
+        # SM86 uses StridedLayout, whose conversion is only the transposed
+        # view below.  copy_ updates the existing captured storage in-place;
+        # neither triton_kernels Tensor nor PrecisionConfig is replaced.
+        w13[gpu_slot].transpose(-2, -1).copy_(staging.device_w13)
+        w13_scale[gpu_slot].transpose(-2, -1).copy_(
+            staging.device_w13_scale_e8m0.view(torch.uint8)
+        )
+        w2[gpu_slot].transpose(-2, -1).copy_(staging.device_w2)
+        w2_scale[gpu_slot].transpose(-2, -1).copy_(
+            staging.device_w2_scale_e8m0.view(torch.uint8)
+        )
+
+        # The staging set is shared by every layer on this device.  In
+        # particular, its pinned host tensors are passed directly to the
+        # asynchronous H2D copies above.  Do not let the next CPU export reuse
+        # those host addresses until this promotion has reached the destination
+        # slot; otherwise a plan with multiple misses in one layer can race the
+        # DMA and install a mixture of two experts.  The idle-boundary protocol
+        # permits this bounded synchronization, and exact byte parity is a
+        # stronger commit check than pointer stability alone.
+        torch.cuda.current_stream(w13.device).synchronize()
+        copied_tensors = (
+            ("w13", w13[gpu_slot].transpose(-2, -1), staging.device_w13),
+            (
+                "w13_scale",
+                w13_scale[gpu_slot].transpose(-2, -1),
+                staging.device_w13_scale_e8m0,
+            ),
+            ("w2", w2[gpu_slot].transpose(-2, -1), staging.device_w2),
+            (
+                "w2_scale",
+                w2_scale[gpu_slot].transpose(-2, -1),
+                staging.device_w2_scale_e8m0,
+            ),
+        )
+        mismatched = [
+            name
+            for name, destination, source in copied_tensors
+            if not torch.equal(destination.view(torch.uint8), source.view(torch.uint8))
+        ]
+        if mismatched:
+            raise RuntimeError(
+                "Hotspot MXFP4 byte verification failed: "
+                f"layer={self.kt_config.layer_idx} expert={global_expert_id} "
+                f"slot={gpu_slot} tensors={mismatched}"
+            )
+        return sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in (
+                staging.device_w13,
+                staging.device_w13_scale_e8m0,
+                staging.device_w2,
+                staging.device_w2_scale_e8m0,
+            )
+        )
+
+    def commit_hotspot_slots(
+        self,
+        slot_experts: tuple[int, ...],
+        *,
+        force_reload: bool = False,
+    ) -> int:
+        """Commit one layer placement without changing captured pointers.
+
+        ``force_reload`` is the transaction rollback path.  A failed commit can
+        overwrite some slot bytes before it updates ``gpu_index_to_logical``;
+        comparing only the mapping would then incorrectly treat restoration as
+        a no-op.  Forced restoration re-exports every old expert into its slot
+        before restoring all routing tables.
+        """
+
+        self.validate_hotspot_slots(slot_experts)
+        layer = self._hotspot_layer()
+        current_slots = tuple(
+            int(value) for value in self.gpu_index_to_logical.tolist()
+        )
+        if current_slots == slot_experts and not force_reload:
+            return 0
+
+        w13, w13_scale, w2, w2_scale = self._hotspot_mxfp4_storages(layer)
+        captured_pointers = (
+            w13.data_ptr(),
+            w13_scale.data_ptr(),
+            w2.data_ptr(),
+            w2_scale.data_ptr(),
+            self.gpu_experts_mask_cuda.data_ptr(),
+            self.logical_to_gpu_index_cuda.data_ptr(),
+            self.wrapper.gpu_experts_mask.data_ptr(),
+        )
+        copied_bytes = 0
+        for gpu_slot, (old_expert, new_expert) in enumerate(
+            zip(current_slots, slot_experts, strict=True)
+        ):
+            if old_expert == new_expert and not force_reload:
+                continue
+            copied_bytes += self._promote_hotspot_mxfp4_expert(
+                layer=layer,
+                global_expert_id=new_expert,
+                gpu_slot=gpu_slot,
+            )
+        torch.cuda.synchronize(w13.device)
+
+        selected = torch.tensor(slot_experts, dtype=torch.int64, device=w13.device)
+        new_mask, new_logical_to_gpu, new_gpu_to_logical = update_gpu_expert_mappings(
+            selected_experts=selected,
+            num_experts=self.global_num_experts,
+            device=w13.device,
+        )
+        self.gpu_experts_mask.copy_(new_mask)
+        self.gpu_experts_mask_cuda.copy_(new_mask)
+        self.logical_to_gpu_index = new_logical_to_gpu.cpu()
+        self.logical_to_gpu_index_cuda.copy_(new_logical_to_gpu)
+        self.gpu_index_to_logical = new_gpu_to_logical
+        native_mask = new_mask[self.cpu_expert_ids]
+        update_kt_wrapper_masks(self.wrapper, native_mask)
+        torch.cuda.synchronize(w13.device)
+
+        current_pointers = (
+            w13.data_ptr(),
+            w13_scale.data_ptr(),
+            w2.data_ptr(),
+            w2_scale.data_ptr(),
+            self.gpu_experts_mask_cuda.data_ptr(),
+            self.logical_to_gpu_index_cuda.data_ptr(),
+            self.wrapper.gpu_experts_mask.data_ptr(),
+        )
+        if current_pointers != captured_pointers:
+            raise RuntimeError(
+                "Hotspot update changed a CUDA-graph-captured storage address"
+            )
+        logger.info(
+            "Committed MXFP4 hotspot placement layer=%d swaps=%d "
+            "force_reload=%s bytes=%d slots=%s",
+            self.kt_config.layer_idx,
+            sum(old != new for old, new in zip(current_slots, slot_experts)),
+            force_reload,
+            copied_bytes,
+            slot_experts,
+        )
+        return copied_bytes
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
     ):
@@ -3422,6 +5403,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 3. The combined output (GPU + CPU) would have inconsistent scaling
         # 4. routed_scaling_factor is applied uniformly in deepseek_v2.py forward_normal
         # So we disable it in GPU method to avoid double scaling on GPU part.
+        # The standard dispatcher normally translates global expert IDs to a
+        # contiguous EP shard.  KT supports arbitrary profile-guided shards and
+        # performs that translation inside _submit_cpu_forward, so retain the
+        # global IDs until they reach this wrapper.
+        moe_runner_config.kt_global_to_local_expert_mapping = torch.arange(
+            self.global_num_experts, dtype=torch.int32, device="cpu"
+        )
+
         gpu_runner_config = replace(moe_runner_config, routed_scaling_factor=None)
         if self.override_num_local_experts:
             gpu_runner_config = replace(
@@ -3699,6 +5688,63 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         return self._sync_cpu_forward(staged_hidden_states)
 
+    def _use_caller_owned_moe_output(
+        self,
+        layer: torch.nn.Module,
+        remote_pending: Optional[_KTRemotePending],
+    ) -> bool:
+        """Resolve the narrow, default-off V4 hybrid in-place experiment."""
+        if os.environ.get(_DSV4_KT_INPLACE_MOE_OUTPUT_ENV) != "1":
+            return False
+
+        # All-CPU draft layers and GPU methods without the V4 caller-output
+        # adapter share this wrapper.  They retain the ordinary allocation
+        # path; the opt-in applies only where every capability is present.
+        capability_requirements = (
+            bool(getattr(self.gpu_method, "_kt_compact_ids", False)),
+            bool(getattr(layer, "_v4_tk_path", False)),
+            bool(getattr(self.gpu_method, "_supports_caller_owned_output", False)),
+            callable(getattr(self.gpu_method, "apply_with_output", None)),
+        )
+        if self.num_gpu_experts == 0 or not all(capability_requirements):
+            return False
+
+        cpu_expert_ids = self.cpu_expert_ids
+        requirements = {
+            "rank-local hybrid expert sharding": self.rank_local_logical_expert_ids,
+            "a local CPU expert shard": cpu_expert_ids is not None
+            and cpu_expert_ids.numel() > 0,
+            "the CPU staging stream": self.tp_rank == 0
+            and self._cpu_stream is not None,
+            "the MoE input-mutation contract": bool(
+                getattr(getattr(layer, "moe_runner_config", None), "inplace", False)
+            ),
+            "no deferred pre-combine input consumer": getattr(
+                getattr(layer, "dispatcher", None), "_pre_combine_hooks", None
+            )
+            is None,
+            "no alternate-stream shared-expert input consumer": not bool(
+                getattr(
+                    layer,
+                    "_has_alt_stream_shared_expert_input_consumer",
+                    False,
+                )
+            ),
+            "the GPU MoE path is not bypassed": os.environ.get(
+                "SGLANG_KT_BYPASS_GPU_MOE"
+            )
+            != "1",
+            "no remote expert sidecar": remote_pending is None
+            and not self.remote_clients
+            and self.remote_expert_id_tiers is None,
+        }
+        missing = [name for name, satisfied in requirements.items() if not satisfied]
+        if missing:
+            raise RuntimeError(
+                f"{_DSV4_KT_INPLACE_MOE_OUTPUT_ENV}=1 requires " + ", ".join(missing)
+            )
+        return True
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -3735,10 +5781,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
-        _kt_timing = (
-            os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
-            and self.tp_rank == 0
-            and getattr(self.kt_config, "layer_idx", None) in (0, 5, 20, 35)
+        _kt_timing_enabled = os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
+        if _kt_timing_enabled:
+            self._kt_timing_step = getattr(self, "_kt_timing_step", 0) + 1
+        _kt_timing_step = getattr(self, "_kt_timing_step", 0)
+        _kt_timing = _kt_timing_enabled and _should_sample_kt_hybrid_timing(
+            _kt_timing_step
+        )
+        _kt_parallel = get_parallel() if _kt_timing else None
+        _kt_start_monotonic_ns = time.monotonic_ns() if _kt_timing else None
+        _kt_process_cpu_start_ns = time.process_time_ns() if _kt_timing else None
+        _kt_rusage_start = (
+            resource.getrusage(resource.RUSAGE_SELF) if _kt_timing else None
         )
         _kt_t_apply_start = time.perf_counter() if _kt_timing else None
         _kt_t_after_submit = None
@@ -3747,6 +5801,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         _kt_t_after_sync = None
         _kt_t_after_merge = None
         _kt_t_cpu_wait_ms = 0.0
+        _kt_cpu_route_stats: dict[str, object] | None = None
+        _kt_cpu_route_stats_error_type: str | None = None
 
         # Check for full GPU fallback. The full-GPU path's _build_full_context →
         # _prepare_weight_{mxfp4,fp8,fp8_channel,bf16,int4} helpers read flat
@@ -3886,6 +5942,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 torch.cuda.synchronize(x.device)
             _kt_t_after_mask = time.perf_counter()
 
+        use_caller_owned_output = self._use_caller_owned_moe_output(
+            layer, remote_pending
+        )
+
         # Step 3: Execute GPU expert computation on main stream
         # No wait needed - staging buffer decouples CPU and GPU data access
         # When num_gpu_experts == 0 the gpu_method's weights have shapes that
@@ -3945,8 +6005,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
                 deepseek_v4_moe_code_path_checker.observed += 1
         else:
-            gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+            if use_caller_owned_output:
+                apply_with_output = getattr(self.gpu_method, "apply_with_output")
+                gpu_combine_input = apply_with_output(
+                    layer,
+                    masked_dispatch_output,
+                    caller_output=x,
+                )
+            else:
+                gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
             output = gpu_combine_input.hidden_states
+            if use_caller_owned_output and output.data_ptr() != x.data_ptr():
+                raise RuntimeError(
+                    "V4 KT in-place MoE output did not retain the input buffer"
+                )
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -3976,7 +6048,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             # Main stream waits for cpu_stream to complete before merging results
             if not _no_cpu_stream:
                 torch.cuda.current_stream(x.device).wait_event(self._sync_done_event)
-            output = output + cpu_output
+            output = _merge_hybrid_expert_outputs(
+                output,
+                cpu_output,
+                inplace=use_caller_owned_output,
+            )
         if remote_pending is not None:
             assert staging_buffer is not None
             self._accumulate_remote(
@@ -4010,28 +6086,71 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 if _kt_t_after_sync is not None
                 else (_kt_t_after_merge - _kt_t_after_gpu) * 1000.0
             )
-            _cls = type(self)
-            if not hasattr(_cls, "_kt_layer_step"):
-                _cls._kt_layer_step = {}
             _li = getattr(self.kt_config, "layer_idx", -1)
-            _cls._kt_layer_step[_li] = _cls._kt_layer_step.get(_li, 0) + 1
-            _step = _cls._kt_layer_step[_li]
-            if _step <= 16 or _step % 16 == 0:
-                logger.debug(
-                    "[kt-time] layer=%s step=%d total=%.2fms submit=%.2f "
-                    "mask=%.2f gpu=%.2f sync=%.2f merge=%.2f "
-                    "cpu_wait=%.2fms num_tokens=%d",
-                    _li,
-                    _step,
-                    _kt_total_ms,
-                    _stage_submit_ms,
-                    _stage_mask_ms,
-                    _stage_gpu_ms,
-                    _stage_sync_ms,
-                    _stage_merge_ms,
-                    _kt_t_cpu_wait_ms,
-                    num_tokens,
+            if self.wrapper is not None:
+                (
+                    _kt_cpu_route_stats,
+                    _kt_cpu_route_stats_error_type,
+                ) = _collect_kt_cpu_route_stats(
+                    self.wrapper,
+                    layer_index=int(_li),
                 )
+
+            assert _kt_parallel is not None
+            assert _kt_start_monotonic_ns is not None
+            assert _kt_process_cpu_start_ns is not None
+            assert _kt_rusage_start is not None
+            _kt_end_monotonic_ns = time.monotonic_ns()
+            _kt_process_cpu_end_ns = time.process_time_ns()
+            _kt_rusage_end = resource.getrusage(resource.RUSAGE_SELF)
+            _kt_receipt: dict[str, object] = {
+                "format": _KT_HYBRID_TIMING_FORMAT,
+                "pid": os.getpid(),
+                "tp_rank": int(_kt_parallel.tp_rank),
+                "pp_rank": int(_kt_parallel.pp_rank),
+                "ep_rank": int(_kt_parallel.moe_ep_rank),
+                "moe_tp_rank": int(self.tp_rank),
+                "layer": int(_li),
+                "step": int(_kt_timing_step),
+                "num_tokens": num_tokens,
+                "start_monotonic_ns": _kt_start_monotonic_ns,
+                "end_monotonic_ns": _kt_end_monotonic_ns,
+                "total_ms": _kt_total_ms,
+                "submit_ms": _stage_submit_ms,
+                "mask_ms": _stage_mask_ms,
+                "gpu_enqueue_ms": _stage_gpu_ms,
+                "sync_ms": _stage_sync_ms,
+                "merge_ms": _stage_merge_ms,
+                "cpu_wait_ms": _kt_t_cpu_wait_ms,
+                "process_cpu_ms": (_kt_process_cpu_end_ns - _kt_process_cpu_start_ns)
+                / 1_000_000.0,
+                "minor_faults": int(
+                    _kt_rusage_end.ru_minflt - _kt_rusage_start.ru_minflt
+                ),
+                "major_faults": int(
+                    _kt_rusage_end.ru_majflt - _kt_rusage_start.ru_majflt
+                ),
+                "voluntary_context_switches": int(
+                    _kt_rusage_end.ru_nvcsw - _kt_rusage_start.ru_nvcsw
+                ),
+                "involuntary_context_switches": int(
+                    _kt_rusage_end.ru_nivcsw - _kt_rusage_start.ru_nivcsw
+                ),
+                "max_rss_kib": int(_kt_rusage_end.ru_maxrss),
+                "configured_numa_nodes": list(self.kt_config.numa_nodes or ()),
+                "deep_cuda_synchronization": (
+                    os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1"
+                ),
+            }
+            if _kt_cpu_route_stats is not None:
+                _kt_receipt.update(_kt_cpu_route_stats)
+            if _kt_cpu_route_stats_error_type is not None:
+                _kt_receipt["cpu_route_stats_error_type"] = (
+                    _kt_cpu_route_stats_error_type
+                )
+            if _li == 0 and os.environ.get("SGLANG_KT_HYBRID_NUMA_SAMPLE") == "1":
+                _kt_receipt["numa_pages_by_node"] = _read_process_numa_pages()
+            _emit_kt_hybrid_timing_receipt(_kt_receipt)
         return StandardCombineInput(hidden_states=output)
 
     def _update_gpu_experts_from_batch(

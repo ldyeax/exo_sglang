@@ -187,6 +187,24 @@ def _copy_output(dst: Any, src: Any) -> Any:
     succeeded, otherwise returns src.
     """
     if torch.is_tensor(dst) and torch.is_tensor(src):
+        # A break function may deliberately write into and return its captured
+        # bridge input.  In that case replay produces a fresh Python view of
+        # the exact same storage, and copy_ would only enqueue a self-copy
+        # kernel.  Require identical logical views before eliding the copy so
+        # overlapping-but-different slices still retain copy_ semantics.
+        if (
+            dst.layout == torch.strided
+            and src.layout == torch.strided
+            and dst.device == src.device
+            and dst.dtype == src.dtype
+            and dst.shape == src.shape
+            and dst.stride() == src.stride()
+            and dst.storage_offset() == src.storage_offset()
+            and dst.is_conj() == src.is_conj()
+            and dst.is_neg() == src.is_neg()
+            and dst.data_ptr() == src.data_ptr()
+        ):
+            return dst
         dst.copy_(src)
         return dst
 
@@ -330,9 +348,9 @@ class BreakableCUDAGraphCapture:
         capture_error_mode: str = "global",
         barrier_fn: Callable[[], None] | None = None,
     ):
-        assert isinstance(
-            cuda_graph, BreakableCUDAGraph
-        ), "cuda_graph must be a BreakableCUDAGraph"
+        assert isinstance(cuda_graph, BreakableCUDAGraph), (
+            "cuda_graph must be a BreakableCUDAGraph"
+        )
         self.cuda_graph = cuda_graph
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream

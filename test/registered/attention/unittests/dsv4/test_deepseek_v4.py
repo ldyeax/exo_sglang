@@ -55,6 +55,35 @@ register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
 
 
+class TestDSV4AmpereMetadata(unittest.TestCase):
+    def test_ampere_does_not_create_unused_flashmla_scheduler_metadata(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend
+
+        with (
+            mock.patch.object(deepseek_v4_backend, "_is_cuda", True),
+            mock.patch.object(deepseek_v4_backend, "_is_xpu", False),
+            mock.patch.object(deepseek_v4_backend, "_is_sm120", False),
+            mock.patch.object(
+                deepseek_v4_backend.torch.cuda,
+                "get_device_capability",
+                return_value=(8, 6),
+            ),
+        ):
+            self.assertIsNone(deepseek_v4_backend._create_flashmla_metadata())
+
+    def test_bf16_indexer_pool_exposes_its_typed_buffer(self):
+        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+            DeepSeekV4IndexerPool,
+        )
+
+        pool = DeepSeekV4IndexerPool.__new__(DeepSeekV4IndexerPool)
+        pool.use_bf16_cache = True
+        expected = torch.empty(1, 64, 128, dtype=torch.bfloat16)
+        pool.index_k_bf16_buffer = [expected]
+
+        self.assertIs(pool.get_index_k_bf16_buffer(0), expected)
+
+
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 @unittest.skipIf(not _FLASH_MLA_AVAILABLE, "flash_mla is required for DSV4 SWA")
 class TestDSV4AttentionBackendCorrectness(CustomTestCase):
@@ -369,6 +398,9 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         metadata.c128_topk_lengths_clamp1 = torch.tensor(
             [base + 39, base + 40], dtype=torch.int32
         )
+        metadata.swa_out_cache_loc = torch.tensor(
+            [base + 41, base + 42], dtype=torch.int32
+        )
         metadata.c1_flashmla_metadata = object()
         metadata.c4_flashmla_metadata = object()
         metadata.c128_flashmla_metadata = object()
@@ -413,6 +445,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             "page_table",
             "swa_page_indices",
             "swa_topk_lengths",
+            "swa_out_cache_loc",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
             "c1_flashmla_metadata",
@@ -460,6 +493,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             "page_table",
             "swa_page_indices",
             "swa_topk_lengths",
+            "swa_out_cache_loc",
             "c128_page_indices",
             "c128_topk_lengths_clamp1",
         ]
@@ -507,6 +541,13 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             return replay_metadata
 
         backend._build_forward_metadata = fake_build_forward_metadata
+        materialized = []
+
+        def fake_init_forward_metadata_in_graph(replay_forward_batch):
+            materialized.append(replay_forward_batch)
+            self.assertIs(backend.forward_metadata, replay_metadata)
+
+        backend.init_forward_metadata_in_graph = fake_init_forward_metadata_in_graph
         forward_batch = SimpleNamespace(name="live")
         static_forward_batch = SimpleNamespace(name="static")
 
@@ -519,12 +560,106 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
         self.assertIs(calls[0][0], static_forward_batch)
         self.assertEqual(calls[0][1], backend.MAX_SEQ_LEN_FOR_CAPTURE)
         self.assertTrue(calls[0][2])
+        self.assertEqual(materialized, [static_forward_batch])
         self.assertIs(backend.forward_metadata, capture_metadata)
         self.assertIsNone(capture_metadata.sparse_prefill_cache)
         self.assertTrue(
             torch.equal(
                 capture_metadata.core_attn_metadata.seq_lens_casual,
                 replay_metadata.core_attn_metadata.seq_lens_casual,
+            )
+        )
+
+    def test_backend_bcg_capture_materializes_raw_metadata(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+
+        raw_metadata = object()
+        full_metadata = DSV4Metadata(
+            self._make_core_metadata(0), indexer_metadata=None
+        )
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        calls = []
+
+        def fake_build_forward_metadata(
+            forward_batch, *, max_seq_len_override, use_prefill_cuda_graph
+        ):
+            calls.append(("build", forward_batch))
+            return raw_metadata
+
+        def fake_init_forward_metadata_in_graph(forward_batch):
+            calls.append(("materialize", forward_batch))
+            self.assertIs(backend.forward_metadata, raw_metadata)
+            backend.forward_metadata = full_metadata
+
+        backend._build_forward_metadata = fake_build_forward_metadata
+        backend.init_forward_metadata_in_graph = fake_init_forward_metadata_in_graph
+        forward_batch = SimpleNamespace(name="capture")
+
+        result = backend.init_forward_metadata_for_breakable_cuda_graph_capture(
+            forward_batch
+        )
+
+        self.assertIs(result, full_metadata)
+        self.assertEqual(
+            calls,
+            [("build", forward_batch), ("materialize", forward_batch)],
+        )
+
+    def test_backend_bcg_replay_materializes_raw_static_metadata(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
+            DSV4Metadata,
+        )
+
+        capture_metadata = DSV4Metadata(
+            self._make_core_metadata(0), indexer_metadata=None
+        )
+        raw_metadata = object()
+        full_metadata = DSV4Metadata(
+            self._make_core_metadata(1000), indexer_metadata=None
+        )
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = 4096
+        calls = []
+
+        def fake_build_forward_metadata(
+            forward_batch, *, max_seq_len_override, use_prefill_cuda_graph
+        ):
+            calls.append(("build", forward_batch))
+            return raw_metadata
+
+        def fake_init_forward_metadata_in_graph(forward_batch):
+            calls.append(("materialize", forward_batch))
+            self.assertIs(backend.forward_metadata, raw_metadata)
+            backend.forward_metadata = full_metadata
+
+        backend._build_forward_metadata = fake_build_forward_metadata
+        backend.init_forward_metadata_in_graph = fake_init_forward_metadata_in_graph
+        forward_batch = SimpleNamespace(name="live")
+        static_forward_batch = SimpleNamespace(name="static")
+
+        backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
+            capture_metadata,
+            forward_batch,
+            static_forward_batch=static_forward_batch,
+        )
+
+        self.assertEqual(
+            calls,
+            [
+                ("build", static_forward_batch),
+                ("materialize", static_forward_batch),
+            ],
+        )
+        self.assertIs(backend.forward_metadata, capture_metadata)
+        self.assertTrue(
+            torch.equal(
+                capture_metadata.core_attn_metadata.seq_lens_casual,
+                full_metadata.core_attn_metadata.seq_lens_casual,
             )
         )
 

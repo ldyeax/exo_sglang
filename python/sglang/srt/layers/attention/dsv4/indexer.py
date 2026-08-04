@@ -61,6 +61,114 @@ FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
 
 
+class _OscarC4LogitsWorkspace:
+    """Reusable scorer output with stable addresses across graph capture.
+
+    One flat allocation is retained per device stream.  Exact 2-D views are
+    carved from its prefix, so every requested shape is contiguous while all
+    layers and smaller batch buckets reuse the same storage.  If an eager call
+    needs to grow a stream's allocation, the previous tensor remains retained:
+    an already captured CUDA graph may still hold its address.
+    """
+
+    def __init__(self) -> None:
+        self._buffers: Dict[Tuple[torch.device, int], torch.Tensor] = {}
+        self._retired_buffers: List[torch.Tensor] = []
+
+    @staticmethod
+    def _stream_identity(device: torch.device) -> int:
+        if device.type != "cuda":
+            return 0
+        return int(torch.cuda.current_stream(device).cuda_stream)
+
+    @staticmethod
+    def _is_capturing(device: torch.device) -> bool:
+        return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+    @staticmethod
+    def _allocation_capacity(required_values: int) -> int:
+        return 1 << (required_values - 1).bit_length()
+
+    def acquire(
+        self,
+        reference: torch.Tensor,
+        *,
+        query_rows: int,
+        max_sequence_length: int,
+    ) -> torch.Tensor:
+        if query_rows <= 0 or max_sequence_length <= 0:
+            raise ValueError("OSCAR C4 logits workspace dimensions must be positive")
+
+        required_values = query_rows * max_sequence_length
+        key = (reference.device, self._stream_identity(reference.device))
+        buffer = self._buffers.get(key)
+        if buffer is None or buffer.numel() < required_values:
+            if self._is_capturing(reference.device):
+                raise RuntimeError(
+                    "OSCAR C4 logits workspace must be warmed before CUDA graph capture"
+                )
+            if buffer is not None:
+                self._retired_buffers.append(buffer)
+            buffer = torch.empty(
+                self._allocation_capacity(required_values),
+                dtype=torch.float32,
+                device=reference.device,
+            )
+            self._buffers[key] = buffer
+
+        return buffer[:required_values].view(query_rows, max_sequence_length)
+
+
+class _OscarC4RotatedQueryWorkspace:
+    """Stable BF16 query-rotation storage shared by C4 layers on one stream."""
+
+    def __init__(self) -> None:
+        self._buffers: Dict[Tuple[torch.device, int], torch.Tensor] = {}
+        self._retired_buffers: List[torch.Tensor] = []
+
+    def acquire(
+        self,
+        reference: torch.Tensor,
+        *,
+        query_rows: int,
+    ) -> torch.Tensor:
+        if (
+            reference.dtype != torch.bfloat16
+            or reference.ndim != 4
+            or reference.shape[1] != 1
+            or query_rows <= 0
+        ):
+            raise ValueError(
+                "OSCAR C4 rotated-query workspace requires BF16 [B, 1, H, D]"
+            )
+        num_heads = reference.shape[2]
+        head_dim = reference.shape[3]
+        required_values = query_rows * num_heads * head_dim
+        key = (
+            reference.device,
+            _OscarC4LogitsWorkspace._stream_identity(reference.device),
+        )
+        buffer = self._buffers.get(key)
+        if buffer is None or buffer.numel() < required_values:
+            if _OscarC4LogitsWorkspace._is_capturing(reference.device):
+                raise RuntimeError(
+                    "OSCAR C4 rotated-query workspace must be warmed before "
+                    "CUDA graph capture"
+                )
+            if buffer is not None:
+                # A graph captured with the prior address can remain live after
+                # a later eager bucket grows this stream's workspace.
+                self._retired_buffers.append(buffer)
+            buffer = torch.empty(
+                _OscarC4LogitsWorkspace._allocation_capacity(required_values),
+                dtype=torch.bfloat16,
+                device=reference.device,
+            )
+            self._buffers[key] = buffer
+
+        return buffer[:required_values].view(query_rows, num_heads, head_dim)
+
+
 _arange_cache = {}
 
 
@@ -206,9 +314,9 @@ def fp8_paged_mqa_logits_torch_sm120(
         )
 
     assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
-    assert (
-        block_size == 64
-    ), "Vectorized torch impl hardcodes block_size=64 cache layout"
+    assert block_size == 64, (
+        "Vectorized torch impl hardcodes block_size=64 cache layout"
+    )
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
@@ -505,9 +613,7 @@ def bf16_direct_paged_mqa_logits_tilelang(
     assert head_dim == 128
     assert block_size == 64
     assert clean_logits is False
-    q_bf16 = q_bf16.squeeze(1).to(torch.bfloat16).view(
-        batch_size, num_heads, head_dim
-    )
+    q_bf16 = q_bf16.squeeze(1).to(torch.bfloat16).view(batch_size, num_heads, head_dim)
     logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
     kernel = _get_bf16_direct_indexer_module(head_dim, num_heads, block_size)
     kernel(
@@ -526,6 +632,8 @@ class C4IndexerBackendMixin:
         super().__init__()
         self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
+        self._oscar_c4_logits_workspace = _OscarC4LogitsWorkspace()
+        self._oscar_c4_rotated_query_workspace = _OscarC4RotatedQueryWorkspace()
 
     def _forward_prepare_multi_stream(
         self,
@@ -568,7 +676,12 @@ class C4IndexerBackendMixin:
             if q_lora_ready is not None:
                 stream_q.wait_event(q_lora_ready)
             stream_q.wait_event(weights_ready)
-            q, weights = c4_indexer.compute_q(q_lora, positions, weights)
+            q, weights = c4_indexer.compute_q(
+                q_lora,
+                positions,
+                weights,
+                forward_batch=forward_batch,
+            )
 
         current_stream.wait_stream(stream_q)
         return q, weights
@@ -586,7 +699,12 @@ class C4IndexerBackendMixin:
             assert isinstance(self, CompressorBackendMixin)
 
         weights = c4_indexer.compute_weights(x, skip_scale=True)
-        q, weights = c4_indexer.compute_q(q_lora, positions, weights)
+        q, weights = c4_indexer.compute_q(
+            q_lora,
+            positions,
+            weights,
+            forward_batch=forward_batch,
+        )
         if not skip_compressor:
             self.forward_indexer_compressor(
                 x=x,
@@ -604,6 +722,27 @@ class C4IndexerBackendMixin:
         indexer_metadata: PagedIndexerMetadata,
     ) -> bool:
         if not envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get():
+            return False
+
+        token_to_kv_pool = getattr(self, "token_to_kv_pool", None)
+        if token_to_kv_pool is None:
+            return False
+        indexer_pool = getattr(token_to_kv_pool, "c4_indexer_kv_pool", None)
+        if indexer_pool is None:
+            return False
+        if any(
+            getattr(indexer_pool, feature_flag, None) is not False
+            for feature_flag in (
+                "use_int4_cache",
+                "use_oscar_int2_cache",
+                "use_ampere_fp8_storage",
+            )
+        ):
+            # The nonpaged CUDA DeepGEMM path consumes native FP8 tensors.
+            # SM86's packed cache is raw byte storage and must stay on the
+            # software-decode paged scorer. Missing feature flags are also
+            # rejected so a partially initialized pool cannot silently select
+            # the incompatible native-FP8 path.
             return False
         # This path calls CUDA DeepGEMM and assumes the CUDA FP8+FP32 packed
         # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
@@ -808,6 +947,19 @@ class C4IndexerBackendMixin:
         use_fp4_indexer = c4_indexer.use_fp4_indexer
 
         device_capability = torch.cuda.get_device_capability()
+        indexer_pool = token_to_kv_pool.c4_indexer_kv_pool
+        use_int4_indexer_storage = indexer_pool.use_int4_cache
+        use_oscar_int2_indexer_storage = indexer_pool.use_oscar_int2_cache
+        use_ampere_fp8_storage = indexer_pool.use_ampere_fp8_storage
+        if (
+            use_int4_indexer_storage
+            or use_oscar_int2_indexer_storage
+            or use_ampere_fp8_storage
+        ) and use_fp4_indexer:
+            raise RuntimeError(
+                "DeepSeek V4's SM86 software-decode indexer is mutually "
+                "exclusive with the FP4 indexer; disable the FP4 indexer."
+            )
         if use_fp4_indexer:
             q_fp4, q_sf = q_indexer
             assert len(q_fp4.shape) == 3
@@ -819,7 +971,19 @@ class C4IndexerBackendMixin:
 
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        if device_capability < (8, 9):
+        if use_oscar_int2_indexer_storage:
+            from sglang.kernels.ops.attention.dsv4.oscar_int2_c4_indexer import (
+                oscar_int2_c4_paged_mqa_logits_triton as fn,
+            )
+        elif use_int4_indexer_storage:
+            from sglang.kernels.ops.attention.dsv4.int4_c4_indexer_poc import (
+                int4_c4_paged_mqa_logits_triton as fn,
+            )
+        elif use_ampere_fp8_storage:
+            from sglang.kernels.ops.attention.dsv4.fp8_storage_indexer import (
+                fp8_storage_paged_mqa_logits_triton as fn,
+            )
+        elif device_capability < (8, 9):
             fn = bf16_direct_paged_mqa_logits_tilelang
         elif use_fp4_indexer:
             weights = weights.float()
@@ -864,10 +1028,22 @@ class C4IndexerBackendMixin:
         )
         _use_tilelang = (
             envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
-            or device_capability < (8, 9)
+            or (
+                device_capability < (8, 9)
+                and not use_ampere_fp8_storage
+                and not use_int4_indexer_storage
+                and not use_oscar_int2_indexer_storage
+            )
         ) and not use_fp4_indexer
         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
-        if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
+        if (
+            _c4sl.dim() == 1
+            and not _use_tilelang
+            and not _use_aiter
+            and not use_ampere_fp8_storage
+            and not use_int4_indexer_storage
+            and not use_oscar_int2_indexer_storage
+        ):
             _c4sl = _c4sl.unsqueeze(-1)
         nonpaged_plan = self._get_nonpaged_indexer_plan(
             c4_indexer=c4_indexer,
@@ -890,7 +1066,19 @@ class C4IndexerBackendMixin:
             c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
                 layer_id=c4_indexer.layer_id,
             )
-            if device_capability < (8, 9):
+            if use_oscar_int2_indexer_storage:
+                assert c4_indexer_kv_cache.dim() == 2
+                assert c4_indexer_kv_cache.dtype == torch.uint8
+                assert c4_indexer_kv_cache.shape[1] == 64 * 40
+            elif use_int4_indexer_storage:
+                assert c4_indexer_kv_cache.dim() == 2
+                assert c4_indexer_kv_cache.dtype == torch.uint8
+                assert c4_indexer_kv_cache.shape[1] == 64 * 72
+            elif use_ampere_fp8_storage:
+                assert c4_indexer_kv_cache.dim() == 2
+                assert c4_indexer_kv_cache.dtype == torch.uint8
+                assert c4_indexer_kv_cache.shape[1] == 64 * (128 + 4)
+            elif device_capability < (8, 9):
                 assert c4_indexer_kv_cache.shape[1:] == (64, 128)
             else:
                 assert c4_indexer_kv_cache.dim() == 2
@@ -898,16 +1086,43 @@ class C4IndexerBackendMixin:
                 c4_indexer_kv_cache = c4_indexer_kv_cache.view(
                     c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
                 )
-            logits = fn(
-                q,
-                c4_indexer_kv_cache,
-                weights,
-                _c4sl,
-                page_table,
-                indexer_metadata.deep_gemm_metadata,
-                indexer_metadata.max_c4_seq_len,
-                False,
-            )
+            if use_oscar_int2_indexer_storage:
+                logits_out = self._oscar_c4_logits_workspace.acquire(
+                    q,
+                    query_rows=query_rows,
+                    max_sequence_length=indexer_metadata.max_c4_seq_len,
+                )
+                rotated_query_out = self._oscar_c4_rotated_query_workspace.acquire(
+                    q,
+                    query_rows=query_rows,
+                )
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    _c4sl,
+                    page_table,
+                    indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                    calibration=token_to_kv_pool.get_oscar_c4_calibration(
+                        c4_indexer.layer_id
+                    ),
+                    out=logits_out,
+                    rotated_query_out=rotated_query_out,
+                    page_size=indexer_metadata.c4_page_size,
+                )
+            else:
+                logits = fn(
+                    q,
+                    c4_indexer_kv_cache,
+                    weights,
+                    _c4sl,
+                    page_table,
+                    indexer_metadata.deep_gemm_metadata,
+                    indexer_metadata.max_c4_seq_len,
+                    False,
+                )
 
         assert indexer_metadata.page_table is core_metadata.page_table
         if self.debug_use_external_c4_sparse_indices:
@@ -1058,9 +1273,46 @@ class C4Indexer(nn.Module):
         q_lora: torch.Tensor,
         positions: torch.Tensor,
         weight: torch.Tensor,
+        *,
+        forward_batch: ForwardBatch,
     ) -> Tuple[IndexerQuery, torch.Tensor]:
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        from sglang.srt.layers.attention.dsv4.oscar_int2_capture import (
+            capture_configured,
+            maybe_capture_c4_scorer_query,
+        )
+
+        if capture_configured():
+            parallel = get_parallel()
+            maybe_capture_c4_scorer_query(
+                layer_id=self.layer_id,
+                query_before_rope=q,
+                head_weight=weight,
+                weight_scale=self.weight_scale,
+                positions=positions,
+                freqs_cis=self.freqs_cis,
+                forward_batch=forward_batch,
+                target_model=getattr(self, "_dsv4_oscar_capture_target", False),
+                tp_rank=parallel.attn_tp_rank,
+                tp_size=parallel.attn_tp_size,
+            )
+        if envs.SGLANG_DSV4_OSCAR_INT2_KV_STORAGE.get():
+            if self.use_fp4_indexer:
+                raise RuntimeError("OSCAR C4 scoring is incompatible with FP4")
+            from sglang.kernels.ops.attention.dsv4.elementwise import (
+                fused_rope_inplace,
+            )
+
+            q = q.contiguous()
+            fused_rope_inplace(
+                q[..., -self.rope_head_dim :],
+                None,
+                self.freqs_cis,
+                positions,
+            )
+            effective_weights = weight.float().mul_(self.weight_scale).unsqueeze(-1)
+            return q, effective_weights
         if self.use_fp4_indexer:
             return fused_q_indexer_rope_hadamard_fp4_quant(
                 q.contiguous(), weight, self.weight_scale, self.freqs_cis, positions

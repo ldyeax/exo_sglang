@@ -19,6 +19,7 @@ This file implements HTTP APIs for the inference engine via fastapi.
 
 import asyncio
 import dataclasses
+import hashlib
 import logging
 import os
 import ssl
@@ -43,6 +44,7 @@ from typing import (
 import aiohttp
 import numpy as np
 import requests
+import torch
 import uvicorn
 import uvloop
 from fastapi import (
@@ -125,6 +127,7 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    KTExpertHotspotReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -226,9 +229,9 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args: PortArgs
 
     # API key authentication is not supported in multi-tokenizer mode
-    assert (
-        server_args.api_key is None
-    ), "API key is not supported in multi-tokenizer mode"
+    assert server_args.api_key is None, (
+        "API key is not supported in multi-tokenizer mode"
+    )
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -748,15 +751,1405 @@ async def get_server_info():
     return await server_info()
 
 
+def _summarize_dsv4_sm86_small_batch_gemm(
+    internal_states: List[Dict[Any, Any]],
+    configured: bool,
+    expected_worker_count: int,
+) -> Dict[str, Any]:
+    """Aggregate worker-local patch/selection proof for `/server_info`."""
+
+    gathered_worker_telemetry: List[Dict[str, Any]] = []
+    for state in internal_states:
+        if not isinstance(state, dict):
+            continue
+        gathered = state.get("dsv4_sm86_small_batch_gemm_workers")
+        if isinstance(gathered, list):
+            gathered_worker_telemetry.extend(
+                dict(telemetry) for telemetry in gathered if isinstance(telemetry, dict)
+            )
+            continue
+        # Compatibility with a single-rank runtime, or a worker predating the
+        # TP all-gather field. It cannot prove TP2 by itself because the
+        # topology-derived expected count below remains two.
+        telemetry = state.get("dsv4_sm86_small_batch_gemm")
+        if isinstance(telemetry, dict):
+            gathered_worker_telemetry.append(dict(telemetry))
+
+    telemetry_by_rank = {
+        (
+            telemetry.get("dp_rank"),
+            telemetry.get("pp_rank"),
+            telemetry.get("tp_rank"),
+        ): telemetry
+        for telemetry in gathered_worker_telemetry
+    }
+    worker_telemetry = list(telemetry_by_rank.values())
+
+    def rank_sort_key(telemetry: Dict[str, Any]) -> tuple[int, int, int]:
+        return (
+            -1 if telemetry.get("dp_rank") is None else int(telemetry["dp_rank"]),
+            -1 if telemetry.get("pp_rank") is None else int(telemetry["pp_rank"]),
+            -1 if telemetry.get("tp_rank") is None else int(telemetry["tp_rank"]),
+        )
+
+    worker_telemetry.sort(key=rank_sort_key)
+    active_worker_count = sum(
+        telemetry.get("patch_state") == "installed"
+        and telemetry.get("patch_installed") is True
+        and int(telemetry.get("selection_count", 0)) > 0
+        for telemetry in worker_telemetry
+    )
+    return {
+        "dsv4_sm86_small_batch_gemm_worker_telemetry": worker_telemetry,
+        "dsv4_sm86_small_batch_gemm_expected_worker_count": expected_worker_count,
+        "dsv4_sm86_small_batch_gemm_reporting_worker_count": len(worker_telemetry),
+        "dsv4_sm86_small_batch_gemm_active_worker_count": active_worker_count,
+        "dsv4_sm86_small_batch_gemm_all_workers_active": (
+            configured
+            and expected_worker_count > 0
+            and len(worker_telemetry) == expected_worker_count
+            and active_worker_count == expected_worker_count
+        ),
+    }
+
+
+_KT_TASK_QUEUE_AFFINITY_WORKER_KEYS = frozenset(
+    {
+        "pid",
+        "gpu_id",
+        "tp_rank",
+        "pp_rank",
+        "dp_rank",
+        "moe_ep_rank",
+        "moe_dp_rank",
+        "telemetry",
+        "validation_error",
+    }
+)
+_KT_TASK_QUEUE_AFFINITY_NATIVE_KEYS = frozenset(
+    {
+        "environment_enabled",
+        "eligible_single_numa_subpool",
+        "requested",
+        "active",
+        "status",
+        "numa_id",
+        "cpu_id",
+        "native_thread_id",
+    }
+)
+_KT_TASK_QUEUE_AFFINITY_TELEMETRY_KEYS = frozenset(
+    {
+        "environment_enabled",
+        "eligible_single_numa_subpool",
+        "requested",
+        "active",
+        "status",
+        "numa_id",
+        "cpu_id",
+        "native_thread_id",
+        "expected_numa_id",
+        "live_cpu_affinity",
+        "cpu_in_expected_numa",
+        "singleton_instance_count",
+        "registered_configuration_count",
+    }
+)
+_KT_SINGLE_NUMA_INLINE_DISPATCH_TELEMETRY_KEYS = frozenset(
+    {
+        "environment_enabled",
+        "expected_numa_id",
+        "required_worker_count",
+        "singleton_instance_count",
+        "registered_configuration_count",
+        "dispatch_count_before_startup_probe",
+        "dispatch_count_after_startup_probe",
+        "startup_probe_advanced_dispatch_count",
+        "task_queue_affinity",
+        "single_numa_inline_dispatch",
+        "worker_pool_affinity",
+        "startup_probe",
+        "task_queue_live_cpu_affinity",
+        "worker_live_cpu_affinities",
+        "all_live_worker_affinities_exact",
+        "all_worker_cpus_in_expected_numa",
+    }
+)
+_KT_SINGLE_NUMA_INLINE_NATIVE_KEYS = frozenset(
+    {
+        "environment_enabled",
+        "eligible_single_numa_subpool",
+        "requested",
+        "active",
+        "status",
+        "physical_numa_id",
+        "configured_worker_count",
+        "distributor_worker_count",
+        "distributor_thread_elided",
+        "dispatch_count",
+        "exception_count",
+        "last_native_thread_id",
+        "last_cpu_id",
+        "last_worker_pool_thread_id",
+        "task_queue_native_thread_id",
+        "task_queue_cpu_id",
+        "task_queue_affinity_active",
+        "last_dispatch_on_task_queue_thread",
+        "last_dispatch_on_task_queue_cpu",
+        "logical_worker_zero_proven",
+        "collision_free_worker_zero",
+    }
+)
+_KT_WORKER_POOL_AFFINITY_NATIVE_KEYS = frozenset(
+    {
+        "subpool_count",
+        "configured_worker_count",
+        "subpools",
+        "all_worker_bindings_active",
+        "all_worker_cpu_ids_unique",
+        "all_workers_on_expected_numa",
+    }
+)
+_KT_WORKER_POOL_SUBPOOL_NATIVE_KEYS = frozenset(
+    {
+        "logical_subpool_index",
+        "physical_numa_id",
+        "configured_worker_count",
+        "active_worker_count",
+        "worker_cpu_ids",
+        "worker_native_thread_ids",
+        "worker_affinity_statuses",
+        "worker_roles",
+        "last_caller_native_thread_id",
+        "last_caller_cpu_id",
+    }
+)
+_KT_SINGLE_NUMA_INLINE_PROBE_KEYS = frozenset(
+    {
+        "executed_task_count",
+        "worker_native_thread_ids",
+        "worker_cpu_ids",
+    }
+)
+_KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT = 56
+_KT_MXFP4_AVX_SCALE_FOLD_NATIVE_KEYS = frozenset(
+    {
+        "schema_version",
+        "requested_mode",
+        "configuration_valid",
+        "architecture_supported",
+        "execution_mode",
+        "n_block",
+        "fold_safe_minimum",
+        "fold_safe_maximum",
+        "lut_identity",
+        "lut_hash_algorithm",
+        "lut_hash",
+        "lut_bytes",
+        "buffers_constructed",
+        "buffers_finalized",
+        "buffers_admitted",
+        "buffers_rejected",
+        "whole_buffer_domain_finalized",
+        "whole_buffer_domain_admitted",
+        "scale_bytes_audited",
+        "unsafe_scale_bytes",
+        "nan_scale_bytes",
+        "invalid_mode_requests",
+        "observed_scale_minimum",
+        "observed_scale_maximum",
+        "decode_dispatch_count",
+        "prefill_dispatch_count",
+        "real_dispatch_count",
+        "scale_fold_dispatch_count",
+        "lut_decode_dispatch_count",
+        "lut_prefill_dispatch_count",
+        "exponent_decode_dispatch_count",
+        "exponent_prefill_dispatch_count",
+        "fallback_dispatch_count",
+        "fallback_decode_dispatch_count",
+        "fallback_prefill_dispatch_count",
+        "zero_invalid_or_fallback_counts",
+    }
+)
+_KT_MXFP4_AVX_SCALE_FOLD_MODES = frozenset({"lut-v1", "exponent-v1"})
+_KT_MXFP4_AVX_SCALE_FOLD_N_BLOCK = 128
+_KT_MXFP4_AVX_SCALE_FOLD_OBSERVED_MINIMUM = 118
+_KT_MXFP4_AVX_SCALE_FOLD_OBSERVED_MAXIMUM = 126
+
+
+def _kt_qualified_two_worker_topology(server_args: Any) -> Optional[str]:
+    """Name the qualified local two-worker topology, or fail closed."""
+
+    topology = (
+        int(server_args.tp_size),
+        int(server_args.ep_size),
+        int(server_args.pp_size),
+        int(server_args.dp_size),
+        int(getattr(server_args, "moe_dp_size", 1)),
+    )
+    if topology == (2, 2, 1, 1, 1):
+        return "tp2-ep2"
+    if topology == (1, 1, 2, 1, 1):
+        return "pp2-ep1"
+    return None
+
+
+def _kt_expected_two_worker_identities(
+    topology: Optional[str],
+) -> set[tuple[int, int, int, int, int]]:
+    """Return (dp, pp, tp, moe_ep, gpu) identities for one topology."""
+
+    if topology == "tp2-ep2":
+        return {(0, 0, 0, 0, 0), (0, 0, 1, 1, 1)}
+    if topology == "pp2-ep1":
+        return {(0, 0, 0, 0, 0), (0, 1, 0, 0, 1)}
+    return set()
+
+
+def _kt_normalized_worker_identity(
+    record: Dict[str, Any],
+) -> Optional[tuple[int, int, int, int, int]]:
+    dp_rank = record.get("dp_rank")
+    if dp_rank is None:
+        dp_rank = 0
+    values = (
+        dp_rank,
+        record.get("pp_rank"),
+        record.get("tp_rank"),
+        record.get("moe_ep_rank"),
+        record.get("gpu_id"),
+    )
+    if any(type(value) is not int for value in values):
+        return None
+    return (values[0], values[1], values[2], values[3], values[4])
+
+
+def _kt_mxfp4_avx_scale_fold_telemetry_is_admitted(
+    telemetry: Any,
+    requested_mode: str,
+) -> bool:
+    """Validate one immutable native scale-buffer snapshot fail closed."""
+
+    if (
+        requested_mode not in _KT_MXFP4_AVX_SCALE_FOLD_MODES
+        or not isinstance(telemetry, dict)
+        or set(telemetry) != _KT_MXFP4_AVX_SCALE_FOLD_NATIVE_KEYS
+    ):
+        return False
+    boolean_keys = (
+        "configuration_valid",
+        "architecture_supported",
+        "whole_buffer_domain_finalized",
+        "whole_buffer_domain_admitted",
+        "zero_invalid_or_fallback_counts",
+    )
+    integer_keys = (
+        "schema_version",
+        "n_block",
+        "fold_safe_minimum",
+        "fold_safe_maximum",
+        "lut_bytes",
+        "buffers_constructed",
+        "buffers_finalized",
+        "buffers_admitted",
+        "buffers_rejected",
+        "scale_bytes_audited",
+        "unsafe_scale_bytes",
+        "nan_scale_bytes",
+        "invalid_mode_requests",
+        "observed_scale_minimum",
+        "observed_scale_maximum",
+        "decode_dispatch_count",
+        "prefill_dispatch_count",
+        "real_dispatch_count",
+        "scale_fold_dispatch_count",
+        "lut_decode_dispatch_count",
+        "lut_prefill_dispatch_count",
+        "exponent_decode_dispatch_count",
+        "exponent_prefill_dispatch_count",
+        "fallback_dispatch_count",
+        "fallback_decode_dispatch_count",
+        "fallback_prefill_dispatch_count",
+    )
+    string_keys = (
+        "requested_mode",
+        "execution_mode",
+        "lut_identity",
+        "lut_hash_algorithm",
+        "lut_hash",
+    )
+    if (
+        any(type(telemetry[key]) is not bool for key in boolean_keys)
+        or any(type(telemetry[key]) is not int for key in integer_keys)
+        or any(type(telemetry[key]) is not str for key in string_keys)
+        or min(telemetry[key] for key in integer_keys) < 0
+    ):
+        return False
+    exact_contract = {
+        "schema_version": 1,
+        "requested_mode": requested_mode,
+        "configuration_valid": True,
+        "architecture_supported": True,
+        "n_block": _KT_MXFP4_AVX_SCALE_FOLD_N_BLOCK,
+        "fold_safe_minimum": 2,
+        "fold_safe_maximum": 252,
+        "lut_identity": "mxfp4-e2m1-bf16-ue8m0-lut-v1",
+        "lut_hash_algorithm": "fnv1a64-le",
+        "lut_hash": "06d1a83dbf20f545",
+        "lut_bytes": 16_384,
+        "whole_buffer_domain_finalized": True,
+        "whole_buffer_domain_admitted": True,
+        "buffers_rejected": 0,
+        "unsafe_scale_bytes": 0,
+        "nan_scale_bytes": 0,
+        "invalid_mode_requests": 0,
+        "fallback_dispatch_count": 0,
+        "fallback_decode_dispatch_count": 0,
+        "fallback_prefill_dispatch_count": 0,
+        "zero_invalid_or_fallback_counts": True,
+    }
+    if any(telemetry[key] != expected for key, expected in exact_contract.items()):
+        return False
+    constructed = telemetry["buffers_constructed"]
+    if (
+        constructed <= 0
+        or telemetry["buffers_finalized"] != constructed
+        or telemetry["buffers_admitted"] != constructed
+        or telemetry["scale_bytes_audited"] <= 0
+        or not (
+            _KT_MXFP4_AVX_SCALE_FOLD_OBSERVED_MINIMUM
+            <= telemetry["observed_scale_minimum"]
+            <= telemetry["observed_scale_maximum"]
+            <= _KT_MXFP4_AVX_SCALE_FOLD_OBSERVED_MAXIMUM
+        )
+    ):
+        return False
+
+    decode_dispatches = telemetry["decode_dispatch_count"]
+    prefill_dispatches = telemetry["prefill_dispatch_count"]
+    real_dispatches = telemetry["real_dispatch_count"]
+    selected_prefix = "lut" if requested_mode == "lut-v1" else "exponent"
+    other_prefix = "exponent" if selected_prefix == "lut" else "lut"
+    expected_execution_mode = "not-executed" if real_dispatches == 0 else requested_mode
+    return (
+        real_dispatches == decode_dispatches + prefill_dispatches
+        and telemetry[f"{selected_prefix}_decode_dispatch_count"] == decode_dispatches
+        and telemetry[f"{selected_prefix}_prefill_dispatch_count"] == prefill_dispatches
+        and telemetry[f"{other_prefix}_decode_dispatch_count"] == 0
+        and telemetry[f"{other_prefix}_prefill_dispatch_count"] == 0
+        and telemetry["scale_fold_dispatch_count"] == real_dispatches
+        and telemetry["execution_mode"] == expected_execution_mode
+    )
+
+
+def _kt_mxfp4_avx_scale_fold_record_is_active(
+    record: Dict[str, Any],
+    requested_mode: str,
+    server_args: Any,
+) -> bool:
+    """Validate one rank-tagged admission for qualified EP2 or PP2."""
+
+    if set(record) != _KT_TASK_QUEUE_AFFINITY_WORKER_KEYS:
+        return False
+    topology = _kt_qualified_two_worker_topology(server_args)
+    expected_identities = _kt_expected_two_worker_identities(topology)
+    if not expected_identities:
+        return False
+    if any(
+        type(record.get(key)) is not int
+        for key in ("pid", "gpu_id", "tp_rank", "pp_rank", "moe_ep_rank")
+    ):
+        return False
+    if (
+        record["pid"] <= 0
+        or _kt_normalized_worker_identity(record) not in expected_identities
+        or record["dp_rank"] not in (None, 0)
+        or record["moe_dp_rank"] not in (None, 0)
+        or record["validation_error"] is not None
+    ):
+        return False
+    return _kt_mxfp4_avx_scale_fold_telemetry_is_admitted(
+        record["telemetry"], requested_mode
+    )
+
+
+def _expected_kt_task_queue_numa_id(
+    record: Dict[str, Any], server_args: Any
+) -> Optional[int]:
+    """Resolve the rank-local NUMA node using the KT placement contract."""
+
+    numa_nodes = getattr(server_args, "kt_numa_nodes", None)
+    if not isinstance(numa_nodes, list) or any(
+        type(numa_id) is not int or numa_id < 0 for numa_id in numa_nodes
+    ):
+        return None
+
+    ep_size = int(server_args.ep_size)
+    pp_size = int(server_args.pp_size)
+    tp_size = int(server_args.tp_size)
+    if ep_size > 1:
+        moe_ep_rank = record.get("moe_ep_rank")
+        if (
+            len(numa_nodes) != ep_size
+            or type(moe_ep_rank) is not int
+            or not 0 <= moe_ep_rank < ep_size
+        ):
+            return None
+        return numa_nodes[moe_ep_rank]
+    if pp_size > 1 and tp_size == 1:
+        pp_rank = record.get("pp_rank")
+        if (
+            len(numa_nodes) != pp_size
+            or type(pp_rank) is not int
+            or not 0 <= pp_rank < pp_size
+        ):
+            return None
+        return numa_nodes[pp_rank]
+    if len(numa_nodes) != 1:
+        return None
+    return numa_nodes[0]
+
+
+def _kt_task_queue_affinity_record_is_active(
+    record: Dict[str, Any], server_args: Any
+) -> bool:
+    """Validate one serialized native readback without trusting truthiness."""
+
+    if set(record) != _KT_TASK_QUEUE_AFFINITY_WORKER_KEYS:
+        return False
+    integer_rank_fields = ("pid", "gpu_id", "tp_rank", "pp_rank", "moe_ep_rank")
+    if any(type(record.get(key)) is not int for key in integer_rank_fields):
+        return False
+    if record["pid"] <= 0 or record["gpu_id"] < 0:
+        return False
+    if not 0 <= record["tp_rank"] < int(server_args.tp_size):
+        return False
+    if not 0 <= record["pp_rank"] < int(server_args.pp_size):
+        return False
+    if not 0 <= record["moe_ep_rank"] < int(server_args.ep_size):
+        return False
+    dp_rank = record["dp_rank"]
+    if int(server_args.dp_size) == 1:
+        if dp_rank is not None and (type(dp_rank) is not int or dp_rank != 0):
+            return False
+    elif type(dp_rank) is not int or not 0 <= dp_rank < int(server_args.dp_size):
+        return False
+    moe_dp_rank = record["moe_dp_rank"]
+    if moe_dp_rank is not None and (
+        type(moe_dp_rank) is not int
+        or not 0 <= moe_dp_rank < int(server_args.moe_dp_size)
+    ):
+        return False
+    if record["validation_error"] is not None:
+        return False
+
+    telemetry = record["telemetry"]
+    if not isinstance(telemetry, dict):
+        return False
+    if set(telemetry) != _KT_TASK_QUEUE_AFFINITY_TELEMETRY_KEYS:
+        return False
+    for key in (
+        "environment_enabled",
+        "eligible_single_numa_subpool",
+        "requested",
+        "active",
+        "cpu_in_expected_numa",
+    ):
+        if type(telemetry[key]) is not bool:
+            return False
+    for key in (
+        "numa_id",
+        "cpu_id",
+        "native_thread_id",
+        "expected_numa_id",
+        "singleton_instance_count",
+        "registered_configuration_count",
+    ):
+        if type(telemetry[key]) is not int:
+            return False
+    if type(telemetry["status"]) is not str:
+        return False
+    if (
+        telemetry["environment_enabled"] is not True
+        or telemetry["eligible_single_numa_subpool"] is not True
+        or telemetry["requested"] is not True
+        or telemetry["active"] is not True
+        or telemetry["status"] != "active"
+        or telemetry["cpu_in_expected_numa"] is not True
+        or telemetry["singleton_instance_count"] != 1
+        or telemetry["registered_configuration_count"] != 1
+        or telemetry["cpu_id"] < 0
+        or telemetry["native_thread_id"] <= 0
+    ):
+        return False
+    expected_numa_id = _expected_kt_task_queue_numa_id(record, server_args)
+    if (
+        expected_numa_id is None
+        or telemetry["expected_numa_id"] != expected_numa_id
+        or telemetry["numa_id"] != expected_numa_id
+    ):
+        return False
+    live_cpu_affinity = telemetry["live_cpu_affinity"]
+    return (
+        isinstance(live_cpu_affinity, list)
+        and len(live_cpu_affinity) == 1
+        and type(live_cpu_affinity[0]) is int
+        and live_cpu_affinity[0] == telemetry["cpu_id"]
+    )
+
+
+def _kt_single_numa_inline_dispatch_record_is_active(
+    record: Dict[str, Any], server_args: Any
+) -> bool:
+    """Validate one complete 56-worker proof for qualified EP2 or PP2."""
+
+    if set(record) != _KT_TASK_QUEUE_AFFINITY_WORKER_KEYS:
+        return False
+    topology = _kt_qualified_two_worker_topology(server_args)
+    expected_identities = _kt_expected_two_worker_identities(topology)
+    if not expected_identities:
+        return False
+    integer_rank_fields = ("pid", "gpu_id", "tp_rank", "pp_rank", "moe_ep_rank")
+    if any(type(record.get(key)) is not int for key in integer_rank_fields):
+        return False
+    if (
+        record["pid"] <= 0
+        or record["gpu_id"] < 0
+        or _kt_normalized_worker_identity(record) not in expected_identities
+    ):
+        return False
+    if record["dp_rank"] not in (None, 0) or record["moe_dp_rank"] not in (None, 0):
+        return False
+    if record["validation_error"] is not None:
+        return False
+
+    telemetry = record["telemetry"]
+    if (
+        not isinstance(telemetry, dict)
+        or set(telemetry) != _KT_SINGLE_NUMA_INLINE_DISPATCH_TELEMETRY_KEYS
+    ):
+        return False
+    boolean_telemetry_keys = (
+        "environment_enabled",
+        "startup_probe_advanced_dispatch_count",
+        "all_live_worker_affinities_exact",
+        "all_worker_cpus_in_expected_numa",
+    )
+    integer_telemetry_keys = (
+        "expected_numa_id",
+        "required_worker_count",
+        "singleton_instance_count",
+        "registered_configuration_count",
+        "dispatch_count_before_startup_probe",
+        "dispatch_count_after_startup_probe",
+    )
+    if any(type(telemetry[key]) is not bool for key in boolean_telemetry_keys):
+        return False
+    if any(type(telemetry[key]) is not int for key in integer_telemetry_keys):
+        return False
+    expected_numa_id = _expected_kt_task_queue_numa_id(record, server_args)
+    before_dispatch_count = telemetry["dispatch_count_before_startup_probe"]
+    after_dispatch_count = telemetry["dispatch_count_after_startup_probe"]
+    if (
+        telemetry["environment_enabled"] is not True
+        or expected_numa_id is None
+        or telemetry["expected_numa_id"] != expected_numa_id
+        or telemetry["required_worker_count"]
+        != _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT
+        or telemetry["singleton_instance_count"] != 1
+        or telemetry["registered_configuration_count"] != 1
+        or before_dispatch_count < 0
+        or after_dispatch_count <= before_dispatch_count
+        or telemetry["startup_probe_advanced_dispatch_count"] is not True
+        or telemetry["all_live_worker_affinities_exact"] is not True
+        or telemetry["all_worker_cpus_in_expected_numa"] is not True
+    ):
+        return False
+
+    task_queue = telemetry["task_queue_affinity"]
+    if (
+        not isinstance(task_queue, dict)
+        or set(task_queue) != _KT_TASK_QUEUE_AFFINITY_NATIVE_KEYS
+    ):
+        return False
+    for key in (
+        "environment_enabled",
+        "eligible_single_numa_subpool",
+        "requested",
+        "active",
+    ):
+        if type(task_queue[key]) is not bool:
+            return False
+    for key in ("numa_id", "cpu_id", "native_thread_id"):
+        if type(task_queue[key]) is not int:
+            return False
+    if type(task_queue["status"]) is not str:
+        return False
+    if (
+        task_queue["environment_enabled"] is not True
+        or task_queue["eligible_single_numa_subpool"] is not True
+        or task_queue["requested"] is not True
+        or task_queue["active"] is not True
+        or task_queue["status"] != "active"
+        or task_queue["numa_id"] != expected_numa_id
+        or task_queue["cpu_id"] < 0
+        or task_queue["native_thread_id"] <= 0
+    ):
+        return False
+    task_queue_cpu_id = task_queue["cpu_id"]
+    task_queue_native_thread_id = task_queue["native_thread_id"]
+
+    inline = telemetry["single_numa_inline_dispatch"]
+    if (
+        not isinstance(inline, dict)
+        or set(inline) != _KT_SINGLE_NUMA_INLINE_NATIVE_KEYS
+    ):
+        return False
+    inline_boolean_keys = (
+        "environment_enabled",
+        "eligible_single_numa_subpool",
+        "requested",
+        "active",
+        "distributor_thread_elided",
+        "task_queue_affinity_active",
+        "last_dispatch_on_task_queue_thread",
+        "last_dispatch_on_task_queue_cpu",
+        "logical_worker_zero_proven",
+        "collision_free_worker_zero",
+    )
+    inline_integer_keys = (
+        "physical_numa_id",
+        "configured_worker_count",
+        "distributor_worker_count",
+        "dispatch_count",
+        "exception_count",
+        "last_native_thread_id",
+        "last_cpu_id",
+        "last_worker_pool_thread_id",
+        "task_queue_native_thread_id",
+        "task_queue_cpu_id",
+    )
+    if any(type(inline[key]) is not bool for key in inline_boolean_keys):
+        return False
+    if any(type(inline[key]) is not int for key in inline_integer_keys):
+        return False
+    if type(inline["status"]) is not str:
+        return False
+    required_inline_values = {
+        "environment_enabled": True,
+        "eligible_single_numa_subpool": True,
+        "requested": True,
+        "active": True,
+        "status": "active",
+        "physical_numa_id": expected_numa_id,
+        "configured_worker_count": _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT,
+        "distributor_worker_count": 0,
+        "distributor_thread_elided": True,
+        "dispatch_count": after_dispatch_count,
+        "exception_count": 0,
+        "last_native_thread_id": task_queue_native_thread_id,
+        "last_cpu_id": task_queue_cpu_id,
+        "last_worker_pool_thread_id": 0,
+        "task_queue_native_thread_id": task_queue_native_thread_id,
+        "task_queue_cpu_id": task_queue_cpu_id,
+        "task_queue_affinity_active": True,
+        "last_dispatch_on_task_queue_thread": True,
+        "last_dispatch_on_task_queue_cpu": True,
+        "logical_worker_zero_proven": True,
+        "collision_free_worker_zero": True,
+    }
+    if any(inline[key] != expected for key, expected in required_inline_values.items()):
+        return False
+    if inline["dispatch_count"] <= 0:
+        return False
+
+    worker_pool = telemetry["worker_pool_affinity"]
+    if (
+        not isinstance(worker_pool, dict)
+        or set(worker_pool) != _KT_WORKER_POOL_AFFINITY_NATIVE_KEYS
+    ):
+        return False
+    for key in ("subpool_count", "configured_worker_count"):
+        if type(worker_pool[key]) is not int:
+            return False
+    for key in (
+        "all_worker_bindings_active",
+        "all_worker_cpu_ids_unique",
+        "all_workers_on_expected_numa",
+    ):
+        if type(worker_pool[key]) is not bool:
+            return False
+    if (
+        worker_pool["subpool_count"] != 1
+        or worker_pool["configured_worker_count"]
+        != _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT
+        or worker_pool["all_worker_bindings_active"] is not True
+        or worker_pool["all_worker_cpu_ids_unique"] is not True
+        or worker_pool["all_workers_on_expected_numa"] is not True
+    ):
+        return False
+    subpools = worker_pool["subpools"]
+    if not isinstance(subpools, list) or len(subpools) != 1:
+        return False
+    subpool = subpools[0]
+    if (
+        not isinstance(subpool, dict)
+        or set(subpool) != _KT_WORKER_POOL_SUBPOOL_NATIVE_KEYS
+    ):
+        return False
+    for key in (
+        "logical_subpool_index",
+        "physical_numa_id",
+        "configured_worker_count",
+        "active_worker_count",
+        "last_caller_native_thread_id",
+        "last_caller_cpu_id",
+    ):
+        if type(subpool[key]) is not int:
+            return False
+    required_subpool_values = {
+        "logical_subpool_index": 0,
+        "physical_numa_id": expected_numa_id,
+        "configured_worker_count": _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT,
+        "active_worker_count": _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT,
+        "last_caller_native_thread_id": task_queue_native_thread_id,
+        "last_caller_cpu_id": task_queue_cpu_id,
+    }
+    if any(
+        subpool[key] != expected for key, expected in required_subpool_values.items()
+    ):
+        return False
+    worker_cpu_ids = subpool["worker_cpu_ids"]
+    worker_native_thread_ids = subpool["worker_native_thread_ids"]
+    worker_affinity_statuses = subpool["worker_affinity_statuses"]
+    worker_roles = subpool["worker_roles"]
+    required_worker_count = _KT_SINGLE_NUMA_INLINE_REQUIRED_WORKER_COUNT
+    if any(
+        not isinstance(values, list) or len(values) != required_worker_count
+        for values in (
+            worker_cpu_ids,
+            worker_native_thread_ids,
+            worker_affinity_statuses,
+            worker_roles,
+        )
+    ):
+        return False
+    if (
+        any(type(cpu_id) is not int or cpu_id < 0 for cpu_id in worker_cpu_ids)
+        or any(
+            type(native_thread_id) is not int or native_thread_id <= 0
+            for native_thread_id in worker_native_thread_ids
+        )
+        or len(set(worker_cpu_ids)) != required_worker_count
+        or len(set(worker_native_thread_ids)) != required_worker_count
+        or worker_affinity_statuses != ["active"] * required_worker_count
+        or worker_roles
+        != ["inline_task_queue_worker0"]
+        + ["background_worker"] * (required_worker_count - 1)
+        or worker_cpu_ids[0] != task_queue_cpu_id
+        or worker_native_thread_ids[0] != task_queue_native_thread_id
+    ):
+        return False
+
+    startup_probe = telemetry["startup_probe"]
+    if (
+        not isinstance(startup_probe, dict)
+        or set(startup_probe) != _KT_SINGLE_NUMA_INLINE_PROBE_KEYS
+        or type(startup_probe["executed_task_count"]) is not int
+        or startup_probe["executed_task_count"] != required_worker_count
+        or startup_probe["worker_native_thread_ids"] != worker_native_thread_ids
+        or startup_probe["worker_cpu_ids"] != worker_cpu_ids
+    ):
+        return False
+
+    task_queue_live_cpu_affinity = telemetry["task_queue_live_cpu_affinity"]
+    worker_live_cpu_affinities = telemetry["worker_live_cpu_affinities"]
+    if task_queue_live_cpu_affinity != [task_queue_cpu_id]:
+        return False
+    if (
+        not isinstance(worker_live_cpu_affinities, list)
+        or len(worker_live_cpu_affinities) != required_worker_count
+    ):
+        return False
+    return all(
+        isinstance(live_affinity, list) and live_affinity == [cpu_id]
+        for live_affinity, cpu_id in zip(
+            worker_live_cpu_affinities,
+            worker_cpu_ids,
+            strict=True,
+        )
+    )
+
+
+def _summarize_kt_task_queue_affinity(
+    internal_states: List[Dict[Any, Any]],
+    configured: bool,
+    server_args: Any,
+) -> Dict[str, Any]:
+    """Aggregate CPUInfer affinity proof across local TP/EP/PP/DP workers."""
+
+    expected_worker_count = (
+        int(server_args.tp_size) * int(server_args.pp_size) * int(server_args.dp_size)
+    )
+    if not configured:
+        return {
+            "kt_task_queue_affinity_worker_telemetry": [],
+            "kt_task_queue_affinity_expected_worker_count": expected_worker_count,
+            "kt_task_queue_affinity_reporting_worker_count": 0,
+            "kt_task_queue_affinity_active_worker_count": 0,
+            "kt_task_queue_affinity_invalid_worker_count": 0,
+            "kt_task_queue_affinity_duplicate_worker_count": 0,
+            "kt_task_queue_affinity_rank_coverage_valid": False,
+            "kt_task_queue_affinity_all_workers_active": False,
+        }
+
+    gathered_records: List[Dict[str, Any]] = []
+    malformed_record_count = 0
+    for state in internal_states:
+        if not isinstance(state, dict):
+            malformed_record_count += 1
+            continue
+        gathered = state.get("kt_task_queue_affinity_workers")
+        if isinstance(gathered, list):
+            for record in gathered:
+                if isinstance(record, dict):
+                    gathered_records.append(dict(record))
+                else:
+                    malformed_record_count += 1
+            continue
+        local_record = state.get("kt_task_queue_affinity")
+        if isinstance(local_record, dict):
+            gathered_records.append(dict(local_record))
+        else:
+            malformed_record_count += 1
+
+    worker_records_by_rank: Dict[tuple[Any, Any, Any], Dict[str, Any]] = {}
+    duplicate_worker_count = 0
+    for record_index, record in enumerate(gathered_records):
+        rank_values = (
+            record.get("dp_rank"),
+            record.get("pp_rank"),
+            record.get("tp_rank"),
+        )
+        identity = (
+            rank_values
+            if all(value is None or type(value) is int for value in rank_values)
+            else ("malformed", record_index, None)
+        )
+        if identity in worker_records_by_rank:
+            duplicate_worker_count += 1
+            continue
+        worker_records_by_rank[identity] = record
+    worker_records = list(worker_records_by_rank.values())
+
+    def rank_sort_key(record: Dict[str, Any]) -> tuple[int, int, int]:
+        def integer_or_negative_one(value: Any) -> int:
+            return value if type(value) is int else -1
+
+        return (
+            integer_or_negative_one(record.get("dp_rank")),
+            integer_or_negative_one(record.get("pp_rank")),
+            integer_or_negative_one(record.get("tp_rank")),
+        )
+
+    worker_records.sort(key=rank_sort_key)
+    active_worker_count = sum(
+        _kt_task_queue_affinity_record_is_active(record, server_args)
+        for record in worker_records
+    )
+    rank_fields_are_valid = all(
+        (record.get("dp_rank") is None or type(record.get("dp_rank")) is int)
+        and type(record.get("pp_rank")) is int
+        and type(record.get("tp_rank")) is int
+        for record in worker_records
+    )
+    normalized_rank_coverage = (
+        {
+            (
+                0 if record.get("dp_rank") is None else record.get("dp_rank"),
+                record.get("pp_rank"),
+                record.get("tp_rank"),
+            )
+            for record in worker_records
+        }
+        if rank_fields_are_valid
+        else set()
+    )
+    expected_rank_coverage = {
+        (dp_rank, pp_rank, tp_rank)
+        for dp_rank in range(int(server_args.dp_size))
+        for pp_rank in range(int(server_args.pp_size))
+        for tp_rank in range(int(server_args.tp_size))
+    }
+    rank_coverage_valid = (
+        malformed_record_count == 0
+        and duplicate_worker_count == 0
+        and rank_fields_are_valid
+        and normalized_rank_coverage == expected_rank_coverage
+    )
+    reporting_worker_count = len(worker_records)
+    invalid_worker_count = (
+        reporting_worker_count
+        - active_worker_count
+        + malformed_record_count
+        + duplicate_worker_count
+    )
+    return {
+        "kt_task_queue_affinity_worker_telemetry": worker_records,
+        "kt_task_queue_affinity_expected_worker_count": expected_worker_count,
+        "kt_task_queue_affinity_reporting_worker_count": reporting_worker_count,
+        "kt_task_queue_affinity_active_worker_count": active_worker_count,
+        "kt_task_queue_affinity_invalid_worker_count": invalid_worker_count,
+        "kt_task_queue_affinity_duplicate_worker_count": duplicate_worker_count,
+        "kt_task_queue_affinity_rank_coverage_valid": rank_coverage_valid,
+        "kt_task_queue_affinity_all_workers_active": (
+            expected_worker_count > 0
+            and reporting_worker_count == expected_worker_count
+            and active_worker_count == expected_worker_count
+            and rank_coverage_valid
+        ),
+    }
+
+
+def _summarize_kt_single_numa_inline_dispatch(
+    internal_states: List[Dict[Any, Any]],
+    configured: bool,
+    server_args: Any,
+) -> Dict[str, Any]:
+    """Aggregate an exact, fail-closed two-worker inline-dispatch proof."""
+
+    expected_worker_count = 2
+    numa_nodes = getattr(server_args, "kt_numa_nodes", None)
+    topology = _kt_qualified_two_worker_topology(server_args)
+    expected_identities = _kt_expected_two_worker_identities(topology)
+    supported_topology_valid = (
+        bool(expected_identities)
+        and isinstance(numa_nodes, list)
+        and len(numa_nodes) == 2
+        and all(type(numa_id) is int and numa_id >= 0 for numa_id in numa_nodes)
+        and len(set(numa_nodes)) == 2
+    )
+    empty_summary = {
+        "kt_single_numa_inline_dispatch_worker_telemetry": [],
+        "kt_single_numa_inline_dispatch_expected_worker_count": (expected_worker_count),
+        "kt_single_numa_inline_dispatch_reporting_worker_count": 0,
+        "kt_single_numa_inline_dispatch_active_worker_count": 0,
+        "kt_single_numa_inline_dispatch_invalid_worker_count": 0,
+        "kt_single_numa_inline_dispatch_duplicate_worker_count": 0,
+        "kt_single_numa_inline_dispatch_rank_coverage_valid": False,
+        "kt_single_numa_inline_dispatch_topology": topology,
+        "kt_single_numa_inline_dispatch_supported_topology_valid": (
+            supported_topology_valid
+        ),
+        "kt_single_numa_inline_dispatch_ep2_topology_valid": (
+            topology == "tp2-ep2" and supported_topology_valid
+        ),
+        "kt_single_numa_inline_dispatch_all_workers_active": False,
+    }
+    if not configured:
+        return empty_summary
+
+    gathered_records: List[Dict[str, Any]] = []
+    malformed_record_count = 0
+    for state in internal_states:
+        if not isinstance(state, dict):
+            malformed_record_count += 1
+            continue
+        gathered = state.get("kt_single_numa_inline_dispatch_workers")
+        if isinstance(gathered, list):
+            for record in gathered:
+                if isinstance(record, dict):
+                    gathered_records.append(dict(record))
+                else:
+                    malformed_record_count += 1
+            continue
+        local_record = state.get("kt_single_numa_inline_dispatch")
+        if isinstance(local_record, dict):
+            gathered_records.append(dict(local_record))
+        else:
+            malformed_record_count += 1
+
+    worker_records_by_rank: Dict[tuple[Any, Any, Any], Dict[str, Any]] = {}
+    duplicate_worker_count = 0
+    for record_index, record in enumerate(gathered_records):
+        rank_values = (
+            record.get("dp_rank"),
+            record.get("pp_rank"),
+            record.get("tp_rank"),
+        )
+        identity = (
+            rank_values
+            if all(value is None or type(value) is int for value in rank_values)
+            else ("malformed", record_index, None)
+        )
+        if identity in worker_records_by_rank:
+            duplicate_worker_count += 1
+            continue
+        worker_records_by_rank[identity] = record
+    worker_records = list(worker_records_by_rank.values())
+
+    def rank_sort_key(record: Dict[str, Any]) -> tuple[int, int, int]:
+        def integer_or_negative_one(value: Any) -> int:
+            return value if type(value) is int else -1
+
+        return (
+            integer_or_negative_one(record.get("dp_rank")),
+            integer_or_negative_one(record.get("pp_rank")),
+            integer_or_negative_one(record.get("tp_rank")),
+        )
+
+    worker_records.sort(key=rank_sort_key)
+    active_worker_count = sum(
+        _kt_single_numa_inline_dispatch_record_is_active(record, server_args)
+        for record in worker_records
+    )
+    rank_fields_are_valid = all(
+        _kt_normalized_worker_identity(record) is not None
+        for record in worker_records
+    )
+    normalized_rank_coverage = (
+        {
+            _kt_normalized_worker_identity(record)
+            for record in worker_records
+        }
+        if rank_fields_are_valid
+        else set()
+    )
+    rank_coverage_valid = (
+        supported_topology_valid
+        and malformed_record_count == 0
+        and duplicate_worker_count == 0
+        and rank_fields_are_valid
+        and normalized_rank_coverage == expected_identities
+    )
+    reporting_worker_count = len(worker_records)
+    invalid_worker_count = (
+        reporting_worker_count
+        - active_worker_count
+        + malformed_record_count
+        + duplicate_worker_count
+    )
+    return {
+        "kt_single_numa_inline_dispatch_worker_telemetry": worker_records,
+        "kt_single_numa_inline_dispatch_expected_worker_count": (expected_worker_count),
+        "kt_single_numa_inline_dispatch_reporting_worker_count": (
+            reporting_worker_count
+        ),
+        "kt_single_numa_inline_dispatch_active_worker_count": active_worker_count,
+        "kt_single_numa_inline_dispatch_invalid_worker_count": (invalid_worker_count),
+        "kt_single_numa_inline_dispatch_duplicate_worker_count": (
+            duplicate_worker_count
+        ),
+        "kt_single_numa_inline_dispatch_rank_coverage_valid": rank_coverage_valid,
+        "kt_single_numa_inline_dispatch_topology": topology,
+        "kt_single_numa_inline_dispatch_supported_topology_valid": (
+            supported_topology_valid
+        ),
+        "kt_single_numa_inline_dispatch_ep2_topology_valid": (
+            topology == "tp2-ep2" and supported_topology_valid
+        ),
+        "kt_single_numa_inline_dispatch_all_workers_active": (
+            configured
+            and supported_topology_valid
+            and reporting_worker_count == expected_worker_count
+            and active_worker_count == expected_worker_count
+            and rank_coverage_valid
+        ),
+    }
+
+
+def _summarize_kt_mxfp4_avx_scale_fold(
+    internal_states: List[Dict[Any, Any]],
+    requested_mode: str,
+    server_args: Any,
+) -> Dict[str, Any]:
+    """Aggregate the cached, startup-only MXFP4 scale-buffer admission."""
+
+    configured = requested_mode in _KT_MXFP4_AVX_SCALE_FOLD_MODES
+    expected_worker_count = 2
+    topology = _kt_qualified_two_worker_topology(server_args)
+    expected_identities = _kt_expected_two_worker_identities(topology)
+    supported_topology_valid = bool(expected_identities)
+    empty_summary = {
+        "kt_mxfp4_avx_scale_fold_requested_mode": requested_mode,
+        "kt_mxfp4_avx_scale_fold_expected_n_block": (_KT_MXFP4_AVX_SCALE_FOLD_N_BLOCK),
+        "kt_mxfp4_avx_scale_fold_worker_telemetry": [],
+        "kt_mxfp4_avx_scale_fold_expected_worker_count": expected_worker_count,
+        "kt_mxfp4_avx_scale_fold_reporting_worker_count": 0,
+        "kt_mxfp4_avx_scale_fold_active_worker_count": 0,
+        "kt_mxfp4_avx_scale_fold_invalid_worker_count": 0,
+        "kt_mxfp4_avx_scale_fold_duplicate_worker_count": 0,
+        "kt_mxfp4_avx_scale_fold_rank_coverage_valid": False,
+        "kt_mxfp4_avx_scale_fold_topology": topology,
+        "kt_mxfp4_avx_scale_fold_supported_topology_valid": (
+            supported_topology_valid
+        ),
+        "kt_mxfp4_avx_scale_fold_ep2_topology_valid": topology == "tp2-ep2",
+        "kt_mxfp4_avx_scale_fold_all_workers_active": False,
+    }
+    if not configured:
+        return empty_summary
+
+    gathered_records: List[Dict[str, Any]] = []
+    malformed_record_count = 0
+    for state in internal_states:
+        if not isinstance(state, dict):
+            malformed_record_count += 1
+            continue
+        gathered = state.get("kt_mxfp4_avx_scale_fold_workers")
+        if isinstance(gathered, list):
+            for record in gathered:
+                if isinstance(record, dict):
+                    gathered_records.append(dict(record))
+                else:
+                    malformed_record_count += 1
+            continue
+        local_record = state.get("kt_mxfp4_avx_scale_fold")
+        if isinstance(local_record, dict):
+            gathered_records.append(dict(local_record))
+        else:
+            malformed_record_count += 1
+
+    worker_records_by_rank: Dict[tuple[Any, Any, Any], Dict[str, Any]] = {}
+    duplicate_worker_count = 0
+    for record_index, record in enumerate(gathered_records):
+        rank_values = (
+            record.get("dp_rank"),
+            record.get("pp_rank"),
+            record.get("tp_rank"),
+        )
+        identity = (
+            rank_values
+            if all(value is None or type(value) is int for value in rank_values)
+            else ("malformed", record_index, None)
+        )
+        if identity in worker_records_by_rank:
+            duplicate_worker_count += 1
+            continue
+        worker_records_by_rank[identity] = record
+    worker_records = list(worker_records_by_rank.values())
+
+    def rank_sort_key(record: Dict[str, Any]) -> tuple[int, int, int]:
+        def integer_or_negative_one(value: Any) -> int:
+            return value if type(value) is int else -1
+
+        return (
+            integer_or_negative_one(record.get("dp_rank")),
+            integer_or_negative_one(record.get("pp_rank")),
+            integer_or_negative_one(record.get("tp_rank")),
+        )
+
+    worker_records.sort(key=rank_sort_key)
+    active_worker_count = sum(
+        _kt_mxfp4_avx_scale_fold_record_is_active(record, requested_mode, server_args)
+        for record in worker_records
+    )
+    rank_fields_are_valid = all(
+        _kt_normalized_worker_identity(record) is not None
+        for record in worker_records
+    )
+    normalized_rank_coverage = (
+        {
+            _kt_normalized_worker_identity(record)
+            for record in worker_records
+        }
+        if rank_fields_are_valid
+        else set()
+    )
+    worker_pids = {
+        record.get("pid")
+        for record in worker_records
+        if type(record.get("pid")) is int and record.get("pid", 0) > 0
+    }
+    rank_coverage_valid = (
+        supported_topology_valid
+        and malformed_record_count == 0
+        and duplicate_worker_count == 0
+        and rank_fields_are_valid
+        and normalized_rank_coverage == expected_identities
+        and len(worker_pids) == expected_worker_count
+    )
+    reporting_worker_count = len(worker_records)
+    invalid_worker_count = (
+        reporting_worker_count
+        - active_worker_count
+        + malformed_record_count
+        + duplicate_worker_count
+    )
+    return {
+        **empty_summary,
+        "kt_mxfp4_avx_scale_fold_worker_telemetry": worker_records,
+        "kt_mxfp4_avx_scale_fold_reporting_worker_count": reporting_worker_count,
+        "kt_mxfp4_avx_scale_fold_active_worker_count": active_worker_count,
+        "kt_mxfp4_avx_scale_fold_invalid_worker_count": invalid_worker_count,
+        "kt_mxfp4_avx_scale_fold_duplicate_worker_count": duplicate_worker_count,
+        "kt_mxfp4_avx_scale_fold_rank_coverage_valid": rank_coverage_valid,
+        "kt_mxfp4_avx_scale_fold_topology": topology,
+        "kt_mxfp4_avx_scale_fold_supported_topology_valid": (
+            supported_topology_valid
+        ),
+        "kt_mxfp4_avx_scale_fold_ep2_topology_valid": topology == "tp2-ep2",
+        "kt_mxfp4_avx_scale_fold_all_workers_active": (
+            configured
+            and supported_topology_valid
+            and reporting_worker_count == expected_worker_count
+            and active_worker_count == expected_worker_count
+            and rank_coverage_valid
+        ),
+    }
+
+
 @app.get("/server_info")
 async def server_info():
     """Get the server information."""
     # Returns internal states per DP.
-    internal_states: List[Dict[Any, Any]] = (
-        await _global_state.tokenizer_manager.get_internal_state()
-    )
+    internal_states: List[
+        Dict[Any, Any]
+    ] = await _global_state.tokenizer_manager.get_internal_state()
 
     server_args = _global_state.tokenizer_manager.server_args
+
+    hybrid_plan_info: Dict[str, Any] = {}
+    hybrid_plan_path = os.environ.get("SGLANG_KT_HYBRID_EXPERT_SHARD_PLAN")
+    if hybrid_plan_path:
+        real_plan_path = os.path.realpath(hybrid_plan_path)
+
+        def plan_sha256() -> str:
+            digest = hashlib.sha256()
+            with open(real_plan_path, "rb") as plan_file:
+                for chunk in iter(lambda: plan_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        before_sha256 = plan_sha256()
+        expected_sha256 = os.environ.get("SGLANG_KT_HYBRID_EXPERT_PLAN_SHA256")
+        if expected_sha256 is not None and before_sha256 != expected_sha256:
+            raise RuntimeError(
+                "live KTransformers hybrid plan no longer matches its "
+                "launcher-admitted SHA-256"
+            )
+        loaded_plan = torch.load(real_plan_path, map_location="cpu", weights_only=True)
+        if plan_sha256() != before_sha256:
+            raise RuntimeError(
+                "live KTransformers hybrid plan changed while reading server info"
+            )
+        if not isinstance(loaded_plan, dict) or not isinstance(
+            (gpu_masks := loaded_plan.get("gpu_experts_mask_by_rank")),
+            torch.Tensor,
+        ):
+            raise RuntimeError("live KTransformers hybrid plan is malformed")
+        gpu_counts = gpu_masks.to(device="cpu", dtype=torch.bool).sum(dim=2)
+        hybrid_plan_info = {
+            "kt_hybrid_expert_plan_format": loaded_plan.get("format"),
+            "kt_hybrid_placement_semantics_sha256": loaded_plan.get(
+                "placement_semantics_sha256"
+            ),
+            "kt_hybrid_gpu_rank_counts_by_layer": gpu_counts.tolist(),
+            "kt_hybrid_min_gpu_experts_per_rank_per_layer": int(
+                gpu_counts.min().item()
+            ),
+            "kt_hybrid_max_gpu_experts_per_rank_per_layer": int(
+                gpu_counts.max().item()
+            ),
+            "kt_hybrid_total_gpu_expert_layers_by_rank": gpu_counts.sum(dim=1).tolist(),
+        }
+
+    draft_hybrid_plan_info: Dict[str, Any] = {}
+    draft_hybrid_plan_path = os.environ.get("SGLANG_KT_DRAFT_HYBRID_EXPERT_SHARD_PLAN")
+    if draft_hybrid_plan_path:
+        real_draft_plan_path = os.path.realpath(draft_hybrid_plan_path)
+
+        def draft_plan_sha256() -> str:
+            digest = hashlib.sha256()
+            with open(real_draft_plan_path, "rb") as plan_file:
+                for chunk in iter(lambda: plan_file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        draft_before_sha256 = draft_plan_sha256()
+        expected_draft_sha256 = os.environ.get(
+            "SGLANG_KT_DRAFT_HYBRID_EXPERT_PLAN_SHA256"
+        )
+        if (
+            expected_draft_sha256 is not None
+            and draft_before_sha256 != expected_draft_sha256
+        ):
+            raise RuntimeError(
+                "live KTransformers draft hybrid plan no longer matches its "
+                "launcher-admitted SHA-256"
+            )
+        loaded_draft_plan = torch.load(
+            real_draft_plan_path, map_location="cpu", weights_only=True
+        )
+        if draft_plan_sha256() != draft_before_sha256:
+            raise RuntimeError(
+                "live KTransformers draft hybrid plan changed while reading server info"
+            )
+        if not isinstance(loaded_draft_plan, dict) or not isinstance(
+            (draft_gpu_masks := loaded_draft_plan.get("gpu_experts_mask_by_rank")),
+            torch.Tensor,
+        ):
+            raise RuntimeError("live KTransformers draft hybrid plan is malformed")
+        draft_gpu_counts = draft_gpu_masks.to(device="cpu", dtype=torch.bool).sum(dim=2)
+        draft_hybrid_plan_info = {
+            "kt_draft_hybrid_expert_plan_sha256": draft_before_sha256,
+            "kt_draft_hybrid_expert_plan_format": loaded_draft_plan.get("format"),
+            "kt_draft_hybrid_gpu_rank_counts_by_layer": draft_gpu_counts.tolist(),
+            "kt_draft_hybrid_min_gpu_experts_per_rank_per_layer": int(
+                draft_gpu_counts.min().item()
+            ),
+            "kt_draft_hybrid_max_gpu_experts_per_rank_per_layer": int(
+                draft_gpu_counts.max().item()
+            ),
+            "kt_draft_hybrid_total_gpu_expert_layers_by_rank": (
+                draft_gpu_counts.sum(dim=1).tolist()
+            ),
+            "kt_draft_hybrid_source_profile_sha256": loaded_draft_plan.get(
+                "source_profile_sha256"
+            ),
+            "kt_draft_hybrid_source_ordering_sha256": loaded_draft_plan.get(
+                "source_ordering_sha256"
+            ),
+            "kt_draft_hybrid_gpu_selection_strategy": loaded_draft_plan.get(
+                "gpu_selection_strategy"
+            ),
+        }
+
+    sm86_small_batch_gemm_configured = (
+        os.environ.get("SGLANG_V4_MXFP4_SM86_SMALL_BATCH_GEMM", "0") == "1"
+    )
+    sm86_small_batch_gemm_info = _summarize_dsv4_sm86_small_batch_gemm(
+        internal_states,
+        sm86_small_batch_gemm_configured,
+        int(server_args.tp_size) * int(server_args.pp_size) * int(server_args.dp_size),
+    )
+    kt_task_queue_affinity_configured = (
+        os.environ.get("KT_TASK_QUEUE_PIN_FIRST_CORE") == "1"
+    )
+    kt_task_queue_affinity_info = _summarize_kt_task_queue_affinity(
+        internal_states,
+        kt_task_queue_affinity_configured,
+        server_args,
+    )
+    kt_single_numa_inline_dispatch_configured = (
+        os.environ.get("KT_SINGLE_NUMA_INLINE_DISPATCH") == "1"
+    )
+    kt_single_numa_inline_dispatch_info = _summarize_kt_single_numa_inline_dispatch(
+        internal_states,
+        kt_single_numa_inline_dispatch_configured,
+        server_args,
+    )
+    kt_mxfp4_avx_scale_fold_mode = os.environ.get("KT_MXFP4_AVX_SCALE_FOLD_MODE", "off")
+    kt_mxfp4_avx_scale_fold_configured = kt_mxfp4_avx_scale_fold_mode not in (
+        "",
+        "off",
+    )
+    kt_mxfp4_avx_scale_fold_info = _summarize_kt_mxfp4_avx_scale_fold(
+        internal_states,
+        kt_mxfp4_avx_scale_fold_mode,
+        server_args,
+    )
 
     # server_args.model_config is not serializable but should be excluded by asdict.
     return msgspec_to_builtins(
@@ -765,6 +2158,44 @@ async def server_info():
             **_global_state.scheduler_info,
             "internal_states": internal_states,
             "version": __version__,
+            # The launcher computes this digest and the KT loader rejects a
+            # file mismatch or mid-load mutation before model admission. This
+            # lets benchmark receipts bind caller provenance to the placement
+            # actually accepted by every local model worker.
+            "kt_hybrid_expert_plan_sha256": os.environ.get(
+                "SGLANG_KT_HYBRID_EXPERT_PLAN_SHA256"
+            ),
+            **hybrid_plan_info,
+            **draft_hybrid_plan_info,
+            "kt_gpu_expert_admission_ceiling": server_args.kt_num_gpu_experts,
+            "dsv4_small_row_routing_configured": os.environ.get(
+                "SGLANG_V4_MXFP4_SMALL_ROW_ROUTING", "0"
+            )
+            == "1",
+            "dsv4_sm86_small_batch_gemm_configured": (sm86_small_batch_gemm_configured),
+            **sm86_small_batch_gemm_info,
+            "kt_task_queue_affinity_configured": (kt_task_queue_affinity_configured),
+            **kt_task_queue_affinity_info,
+            "kt_single_numa_inline_dispatch_configured": (
+                kt_single_numa_inline_dispatch_configured
+            ),
+            **kt_single_numa_inline_dispatch_info,
+            "kt_mxfp4_avx_scale_fold_configured": (kt_mxfp4_avx_scale_fold_configured),
+            **kt_mxfp4_avx_scale_fold_info,
+            "dsv4_custom_all_reduce_v2_configured": os.environ.get(
+                "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2", "0"
+            )
+            == "1",
+            "kt_amx_fine_grained_decode_configured": os.environ.get(
+                "KT_AMX_FINE_GRAINED_DECODE", "0"
+            )
+            == "1",
+            "kt_mxfp4_amx_min_expert_tokens": int(
+                os.environ.get("KT_MXFP4_AMX_MIN_EXPERT_TOKENS", "0")
+            ),
+            "kt_mxfp4_avx_tiled_min_expert_tokens": int(
+                os.environ.get("KT_MXFP4_AVX_TILED_MIN_EXPERT_TOKENS", "0")
+            ),
             # Structured KV-event publisher descriptor for KV-aware routers.
             # `None` when publishing is disabled or misconfigured; see
             # `ServerArgs.describe_kv_events_publisher` for the precise contract.
@@ -925,6 +2356,29 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     return Response(
         content=content,
         status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
+@app.api_route("/kt_expert_hotspot", methods=["POST", "PUT"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def kt_expert_hotspot(
+    obj: Annotated[KTExpertHotspotReqInput, Body()], request: Request
+):
+    """Validate or commit an idle-boundary, CUDA-graph-safe expert plan."""
+
+    results = await _global_state.tokenizer_manager.kt_expert_hotspot(obj)
+    failures = [result.message for result in results if not result.success]
+    if failures:
+        return ORJSONResponse(
+            status_code=HTTPStatus.BAD_REQUEST,
+            content={"success": False, "errors": failures},
+        )
+    return ORJSONResponse(
+        status_code=HTTPStatus.OK,
+        content={
+            "success": True,
+            "receipts": [result.receipt for result in results],
+        },
     )
 
 
@@ -1456,9 +2910,12 @@ async def check_weights(
 ):
     if obj is None:
         obj = CheckWeightsReqInput()
-    success, message, ranks, per_engine_checksum = (
-        await _global_state.tokenizer_manager.check_weights(obj, request)
-    )
+    (
+        success,
+        message,
+        ranks,
+        per_engine_checksum,
+    ) = await _global_state.tokenizer_manager.check_weights(obj, request)
     body = {"success": success, "message": message}
     if ranks is not None:
         body["ranks"] = ranks
@@ -2252,9 +3709,9 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             # TODO: @rainj-me fix this when Rust server supports disaggregation
-            assert (
-                not envs.SGLANG_RUST_SERVER.get()
-            ), "Rust server is not supported for disaggregation warmup for now"
+            assert not envs.SGLANG_RUST_SERVER.get(), (
+                "Rust server is not supported for disaggregation warmup for now"
+            )
             logger.info(f"Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(
                 _send_disaggregation_warmup_requests(
@@ -2302,8 +3759,7 @@ def _wait_and_warmup(
     skip_elastic_joiner_warmup = server_args.is_ep_scale_joiner
     if skip_elastic_joiner_warmup:
         logger.debug(
-            "[Elastic EP] Skipping server warmup for elastic joiner "
-            "(ep_join_mode=%s)",
+            "[Elastic EP] Skipping server warmup for elastic joiner (ep_join_mode=%s)",
             server_args.ep_join_mode,
         )
 

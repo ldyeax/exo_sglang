@@ -71,7 +71,23 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
 class TestDSV4NonPagedIndexer(CustomTestCase):
     def _is_eligible(self, **overrides):
+        indexer_pool_flags = {
+            "use_int4_cache": overrides.get("int4", False),
+            "use_oscar_int2_cache": overrides.get("oscar_int2", False),
+            "use_ampere_fp8_storage": overrides.get("ampere_fp8", False),
+        }
+        missing_cache_flag = overrides.get("missing_cache_flag")
+        if missing_cache_flag is not None:
+            indexer_pool_flags.pop(missing_cache_flag)
+
         backend = SimpleNamespace(hisparse_coordinator=None)
+        if not overrides.get("missing_token_pool", False):
+            token_to_kv_pool = SimpleNamespace()
+            if not overrides.get("missing_c4_pool", False):
+                token_to_kv_pool.c4_indexer_kv_pool = SimpleNamespace(
+                    **indexer_pool_flags
+                )
+            backend.token_to_kv_pool = token_to_kv_pool
         c4_indexer = SimpleNamespace(use_fp4_indexer=overrides.get("fp4", False))
         forward_batch = SimpleNamespace(
             forward_mode=overrides.get("mode", ForwardMode.EXTEND),
@@ -122,9 +138,24 @@ class TestDSV4NonPagedIndexer(CustomTestCase):
             {"prefill_graph": True},
             {"piecewise_graph": True},
             {"fp4": True},
+            {"int4": True},
+            {"oscar_int2": True},
+            {"ampere_fp8": True},
+            {"missing_token_pool": True},
+            {"missing_c4_pool": True},
         ):
             with self.subTest(case=case):
                 self.assertFalse(self._is_eligible(**case))
+
+        for missing_cache_flag in (
+            "use_int4_cache",
+            "use_oscar_int2_cache",
+            "use_ampere_fp8_storage",
+        ):
+            with self.subTest(missing_cache_flag=missing_cache_flag):
+                self.assertFalse(
+                    self._is_eligible(missing_cache_flag=missing_cache_flag)
+                )
 
     def test_single_request_plan_contract(self):
         backend = SimpleNamespace(_can_use_nonpaged_indexer=lambda **_: True)

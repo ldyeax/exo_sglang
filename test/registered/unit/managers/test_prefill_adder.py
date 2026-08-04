@@ -634,6 +634,44 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(adder._swa_new_tokens(req), expected)
 
+    def test_ignore_eos_hybrid_swa_shrinks_first_chunk(self):
+        # DSV4 benchmark geometry: the 2,048-token configured chunk cannot fit
+        # in the 1,024-token SWA pool, but a 512-token first chunk can. The
+        # ignore-EOS path must use the same SWA chunk-cap escape hatch as the
+        # normal path instead of leaving the request queued forever.
+        page_size = 256
+        prompt_tokens = 2_694
+        self.mock_token_allocator.swa_available_size.return_value = 1_024
+        self.mock_token_allocator.full_available_size.return_value = 8_192
+        self.mock_token_allocator.available_size.return_value = 1_024
+        self.mock_tree_cache.sliding_window_size = 128
+        self.mock_tree_cache.disable = True
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=page_size,
+            rem_chunk_tokens=2_048,
+        )
+        adder.is_hybrid_swa = True
+
+        req = self.create_mock_req("dsv4", priority=0, max_new_tokens=64)
+        req.origin_input_ids = list(range(prompt_tokens))
+        req.full_untruncated_fill_ids = list(range(prompt_tokens))
+        req.sampling_params.ignore_eos = True
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+
+        result = adder.add_one_req(
+            req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIs(result, AddReqResult.CONTINUE)
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(req.extend_range, Range(0, 512))
+
     def test_delayer_not_consulted_when_kv_budget_rejects(self):
         """A rank whose first candidate fails the KV-budget gate must NOT
         report local_prefillable=True: add_one_req returns NO_TOKEN before

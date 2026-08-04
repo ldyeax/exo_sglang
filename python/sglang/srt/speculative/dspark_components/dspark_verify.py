@@ -5,7 +5,6 @@ from typing import Optional
 
 import msgspec
 import torch
-
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     AcceptSampling,
@@ -45,6 +44,18 @@ from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
 _VERIFY_DRAFT_PROBS = Invariant("dspark.verify.draft_probs", Bucket.GUARD, NotNaN())
 
 
+def greedy_bonus_at_accept_len(
+    *,
+    target_logits: torch.Tensor,
+    correct_len: torch.Tensor,
+    verify_num_draft_tokens: int,
+) -> torch.Tensor:
+    batch_size = correct_len.shape[0]
+    logits = target_logits.view(batch_size, verify_num_draft_tokens, -1)
+    request_indices = torch.arange(batch_size, device=target_logits.device)
+    return torch.argmax(logits[request_indices, correct_len.to(torch.long)], dim=-1)
+
+
 def verify_logits_adjustments_are_noop(sampling_info) -> bool:
     if sampling_info is None:
         return True
@@ -57,9 +68,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
         return False
     if getattr(sampling_info, "grammar_mask", None) is not None:
         return False
-    if getattr(sampling_info, "logit_bias", None) is not None:
-        return False
-    return True
+    return getattr(sampling_info, "logit_bias", None) is None
 
 
 class TargetVerifyResult(msgspec.Struct, frozen=True):
@@ -128,6 +137,16 @@ class TargetVerifyExecutor:
             correct_len = self._simulated_correct_len(
                 bs=bs, dtype=correct_len.dtype, device=correct_len.device
             )
+            if sampling_info is None or sampling_info.is_all_greedy:
+                if target_logits is None:
+                    raise RuntimeError(
+                        "Simulated DSpark greedy acceptance requires target logits."
+                    )
+                bonus = greedy_bonus_at_accept_len(
+                    target_logits=target_logits,
+                    correct_len=correct_len,
+                    verify_num_draft_tokens=self.verify_num_draft_tokens,
+                )
 
         finalized = FinalizeAcceptLens.execute(
             correct_len=correct_len,
@@ -274,9 +293,7 @@ class TargetVerifyExecutor:
     ) -> TargetVerifyResult:
         model_runner = self.target_worker.model_runner
         graph_runner = model_runner.decode_cuda_graph_runner
-        force_eager_target = (
-            os.environ.get("SGLANG_DSV4_TARGET_VERIFY_EAGER") == "1"
-        )
+        force_eager_target = os.environ.get("SGLANG_DSV4_TARGET_VERIFY_EAGER") == "1"
         if force_eager_target:
             model_runner.decode_cuda_graph_runner = model_runner.eager_runner
         try:
@@ -302,9 +319,7 @@ class TargetVerifyExecutor:
         return TargetVerifyResult(
             logits_output=target_out.logits_output,
             can_run_cuda_graph=target_out.can_run_cuda_graph,
-            pp_hidden_states_proxy_tensors=(
-                target_out.pp_hidden_states_proxy_tensors
-            ),
+            pp_hidden_states_proxy_tensors=(target_out.pp_hidden_states_proxy_tensors),
         )
 
     def commit_hidden(
@@ -469,11 +484,11 @@ class TargetVerifyExecutor:
 
 
 class CommitInjectCtx(msgspec.Struct):
-
     draft_model: object
     block_pos_offsets: torch.Tensor
     resolve_pool: object
     resolve_req_to_token: object
+    tp_size: int = 1
 
 
 class AcceptOuts(msgspec.Struct):
@@ -486,7 +501,6 @@ class AcceptOuts(msgspec.Struct):
 
 
 class DsparkVerifyEpilogue:
-
     def __init__(
         self,
         *,
@@ -566,6 +580,14 @@ class DsparkVerifyEpilogue:
     @property
     def folds_commit(self) -> bool:
         if self.commit_ctx is None:
+            return False
+        # Greedy acceptance is computed independently on every TP rank inside
+        # the verify graph.  Rank 0 becomes authoritative only after replay,
+        # when DSparkWorkerV2 broadcasts the accept buffers.  Folding this
+        # write for TP>1 would therefore commit rank-local KV rows before that
+        # synchronization.  Keep accept/scatter in-graph, but defer the KV
+        # write to commit_hidden(), which runs after the broadcast.
+        if self.commit_ctx.tp_size > 1:
             return False
         pool = self.commit_ctx.resolve_pool()
         return hasattr(pool, "set_swa_key_buffer_radix_fused_norm_rope")

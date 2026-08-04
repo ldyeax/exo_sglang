@@ -36,6 +36,18 @@ SGL_DEVICE uint8_t quant_fp4_e2m1(float x) {
   return idx;
 }
 
+SGL_DEVICE uint8_t quant_int4_symmetric(float x, float inv_scale) {
+  const float scaled = x * inv_scale;
+  int32_t q = scaled >= 0.0f ? static_cast<int32_t>(floorf(scaled + 0.5f))
+                             : static_cast<int32_t>(ceilf(scaled - 0.5f));
+  q = q < -7 ? -7 : (q > 7 ? 7 : q);
+  return static_cast<uint8_t>(q) & 0x0f;
+}
+
+SGL_DEVICE uint8_t pack_int4_symmetric(float x, float y, float inv_scale) {
+  return quant_int4_symmetric(x, inv_scale) | (quant_int4_symmetric(y, inv_scale) << 4);
+}
+
 constexpr uint32_t kBlockSize = 256;
 constexpr uint32_t kNumWarps = kBlockSize / device::kWarpThreads;
 
@@ -70,7 +82,8 @@ template <
     int32_t kPageBits,
     bool kUsePDL,
     int32_t kPreshuffleSize = 0,
-    bool kBf16Store = false>
+    bool kBf16Store = false,
+    bool kInt4Store = false>
 INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
@@ -79,7 +92,8 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
   constexpr int64_t kRopeDim = 64;
   constexpr int64_t kVecSize = 4;
   constexpr uint32_t kRopeSize = kRopeDim / kVecSize;
-  constexpr int64_t kPageBytes = (kBf16Store ? 256ll : 132ll) << kPageBits;
+  static_assert(!(kBf16Store && kInt4Store));
+  constexpr int64_t kPageBytes = (kBf16Store ? 256ll : (kInt4Store ? 72ll : 132ll)) << kPageBits;
   static_assert(kHeadDim == kWarpThreads * kVecSize);
   static_assert(kRopeDim == kWarpThreads * 2);
   static_assert(kRopeSize <= kWarpThreads);
@@ -208,6 +222,31 @@ INDEXER_KERNEL void fused_norm_rope_indexer(const __grid_constant__ FusedNormRop
     for (int i = 0; i < kVecSize; ++i) result[i] = cast<bf16_t>(data[i]);
     PDLTriggerSecondary<kUsePDL>();
     result.store(value_ptr, lane_id);
+  } else if constexpr (kInt4Store) {
+    float local_max = math::abs(data[0]);
+#pragma unroll
+    for (int i = 1; i < kVecSize; ++i) {
+      local_max = math::max(local_max, math::abs(data[i]));
+    }
+    // Four independent 32-value groups occupy eight lanes apiece.  The
+    // subgroup reduction and one BF16 scale per subgroup exactly match the
+    // production 64 packed bytes + 8 scale bytes token layout.
+    const auto abs_max = warp::reduce_max<8>(local_max);
+    const auto scale_bf16 = cast<bf16_t>(abs_max == 0.0f ? 1.0f : abs_max / 7.0f);
+    const auto inv_scale = 1.0f / cast<float>(scale_bf16);
+    const int64_t page = out_loc >> kPageBits;
+    const int64_t offset = out_loc & ((1 << kPageBits) - 1);
+    const auto page_ptr = params.kvcache + page * kPageBytes;
+    const auto value_ptr = page_ptr + offset * 64;
+    const auto scale_ptr = page_ptr + (64 << kPageBits) + offset * 8;
+    const uint16_t packed =
+        static_cast<uint16_t>(pack_int4_symmetric(data[0], data[1], inv_scale)) |
+        (static_cast<uint16_t>(pack_int4_symmetric(data[2], data[3], inv_scale)) << 8);
+    PDLTriggerSecondary<kUsePDL>();
+    reinterpret_cast<uint16_t*>(value_ptr)[lane_id] = packed;
+    if ((lane_id & 7) == 0) {
+      reinterpret_cast<bf16_t*>(scale_ptr)[lane_id >> 3] = scale_bf16;
+    }
   } else {
     using OutStorage = AlignedVector<fp8x2_e4m3_t, 2>;
     float local_max = math::abs(data[0]);
@@ -394,7 +433,13 @@ INDEXER_KERNEL void fused_norm_rope_indexer_fp4(const __grid_constant__ FusedNor
 // Each thread loads kVecSize=2 BF16, so 256 threads cover the full 512 elems.
 // Cache layout: 584 bytes/token = 448 fp8 nope + 64 (=32 bf16x2) rope + 8 scale.
 // ----------------------------------------------------------------------------
-template <typename DType, ForwardMode kMode, int32_t kPageBits, bool kUsePDL, bool kBf16Store = false>
+template <
+    typename DType,
+    ForwardMode kMode,
+    int32_t kPageBits,
+    bool kUsePDL,
+    bool kBf16Store = false,
+    bool kInt4Store = false>
 FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormRopeStoreParams params) {
   using namespace device;
   using enum ForwardMode;
@@ -407,10 +452,11 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   constexpr uint32_t kRopeWarp = kNumWarps - 1;
   // kBf16Store: write the whole head_dim as plain BF16 (no fp8 / no scale) into a
   // [num_slots, head_dim] bf16 cache (page_size==1) at row out_loc
+  static_assert(!(kBf16Store && kInt4Store));
   constexpr int64_t kPageBytes =
-      kBf16Store
-          ? host::div_ceil((kHeadDim * 2ll) << kPageBits, 576) * 576
-          : host::div_ceil(584ll << kPageBits, 576) * 576;
+      kBf16Store ? ((kHeadDim * 2ll) << kPageBits)
+                  : kInt4Store ? (368ll << kPageBits)
+                               : host::div_ceil(584ll << kPageBits, 576) * 576;
   static_assert(kHeadDim == kBlockSize * kVecSize);
   static_assert(kRopeDim == kWarpThreads * kVecSize);
   static_assert(kHeadDim - kRopeDim == kRopeWarp * kWarpThreads * kVecSize);
@@ -481,7 +527,8 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
   const int64_t page = out_loc >> kPageBits;
   const int64_t offset = out_loc & ((1 << kPageBits) - 1);
   const auto page_ptr = params.kvcache + page * kPageBytes;
-  const auto value_ptr = page_ptr + offset * (kBf16Store ? (kHeadDim * 2) : 576);
+  const auto value_ptr =
+      page_ptr + offset * (kBf16Store ? (kHeadDim * 2) : (kInt4Store ? 368 : 576));
 
   PDLTriggerSecondary<kUsePDL>();
 
@@ -507,8 +554,16 @@ FLASHMLA_KERNEL void fused_norm_rope_flashmla(const __grid_constant__ FusedNormR
     data[0] = x_real * freq_real - x_imag * freq_imag;
     data[1] = x_real * freq_imag + x_imag * freq_real;
     const auto result = cast<bf16x2_t>(fp32x2_t{data[0], data[1]});
-    const auto rope_ptr = value_ptr + 448;
+    const auto rope_ptr = value_ptr + (kInt4Store ? 224 : 448);
     reinterpret_cast<bf16x2_t*>(rope_ptr)[lane_id] = result;
+  } else if constexpr (kInt4Store) {
+    const auto x = cast<float>(cast<bf16_t>(data[0]));
+    const auto y = cast<float>(cast<bf16_t>(data[1]));
+    const auto abs_max = warp::reduce_max(fmaxf(fabs(x), fabs(y)));
+    const auto scale_bf16 = cast<bf16_t>(abs_max == 0.0f ? 1.0f : abs_max / 7.0f);
+    const auto inv_scale = 1.0f / cast<float>(scale_bf16);
+    static_cast<uint8_t*>(value_ptr)[tx] = pack_int4_symmetric(x, y, inv_scale);
+    if (lane_id == 0) reinterpret_cast<bf16_t*>(value_ptr + 352)[warp_id] = scale_bf16;
   } else {
     // Non-rope warp: per-warp UE8M0 group (64 elems -> 64 fp8 + 1 scale byte).
     // BF16 round-trip to match the precision of the non-fused path
@@ -534,16 +589,18 @@ template <
     uint32_t kPageSize,
     bool kUsePDL,
     int32_t kPreshuffleSize = 0,
-    bool kBf16Store = false>
+    bool kBf16Store = false,
+    bool kInt4Store = false>
 struct FusedNormRopeKernel {
   static constexpr int32_t kLogPageSize = std::countr_zero(kPageSize);
   static constexpr bool kIsIndexer = (kHeadDim == 128);
   static constexpr int64_t kIndexerBytes = 132 * kPageSize;
   static constexpr int64_t kFlashMLABytes = host::div_ceil(584 * kPageSize, 576) * 576;
-  static constexpr int64_t kBf16Bytes =
-      kIsIndexer ? kHeadDim * 2 * kPageSize
-                 : host::div_ceil(kHeadDim * 2 * kPageSize, 576) * 576;
-  static constexpr int64_t kPageBytes = kBf16Store ? kBf16Bytes : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
+  static constexpr int64_t kInt4Bytes = (kIsIndexer ? 72 : 368) * kPageSize;
+  static constexpr int64_t kBf16Bytes = kHeadDim * 2 * kPageSize;
+  static_assert(!(kBf16Store && kInt4Store));
+  static constexpr int64_t kPageBytes =
+      kBf16Store ? kBf16Bytes : kInt4Store ? kInt4Bytes : (kIsIndexer ? kIndexerBytes : kFlashMLABytes);
 
   /// TODO: Let's fix the config for now.
   static_assert(kRopeDim == 64 && (kHeadDim == 128 || kHeadDim == 512));
@@ -552,9 +609,10 @@ struct FusedNormRopeKernel {
   template <ForwardMode kMode>
   static constexpr auto select_kernel() {
     if constexpr (kIsIndexer) {
-      return fused_norm_rope_indexer<DType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize, kBf16Store>;
+      return fused_norm_rope_indexer<
+          DType, kMode, kLogPageSize, kUsePDL, kPreshuffleSize, kBf16Store, kInt4Store>;
     } else {
-      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store>;
+      return fused_norm_rope_flashmla<DType, kMode, kLogPageSize, kUsePDL, kBf16Store, kInt4Store>;
     }
   }
 

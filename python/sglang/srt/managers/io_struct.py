@@ -1500,6 +1500,20 @@ class FlushCacheReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class KTExpertHotspotReqInput(BaseReq, kw_only=True):
+    """Apply a graph-safe hybrid expert placement at an idle boundary."""
+
+    plan_path: str
+    generation: int
+    dry_run: bool = True
+
+
+class KTExpertHotspotReqOutput(BaseReq, kw_only=True):
+    success: bool
+    receipt: Dict[str, Any] = msgspec.field(default_factory=dict)
+    message: str = ""
+
+
 class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None
@@ -1922,8 +1936,9 @@ class GetInternalStateReqOutput(BaseReq, kw_only=True):
 
 
 class SetInternalStateReq(BaseReq, kw_only=True):
-    # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
-    server_args: Dict[str, Union[int, float]]
+    # Scheduler controls include nullable diagnostic overrides and a boolean
+    # trace-clear command (see Scheduler.set_internal_state).
+    server_args: Dict[str, Optional[Union[bool, int, float]]]
 
 
 class SetInternalStateReqOutput(BaseReq, kw_only=True):

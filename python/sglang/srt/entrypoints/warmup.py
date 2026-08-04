@@ -16,6 +16,9 @@ logger = logging.getLogger(__file__)
 
 _warmup_registry = {}
 
+DSV4_OPENCODE_WARMUP_INPUT_TOKENS = 2694
+DSV4_OPENCODE_WARMUP_OUTPUT_TOKENS = 8
+
 
 def warmup(name: str):
     def decorator(fn):
@@ -36,6 +39,44 @@ async def execute_warmups(
             continue
         logger.info(f"Running warmup {warmup_name}")
         await _warmup_registry[warmup_name](disaggregation_mode, tokenizer_manager)
+
+
+@warmup("dsv4_opencode_2694")
+async def dsv4_opencode_2694(
+    disaggregation_mode: str, tokenizer_manager: TokenizerManager
+):
+    """Prime the served DeepSeek V4 OpenCode prefill/decode shape.
+
+    The generic three-token HTTP warmup reaches the 256-token graph bucket but
+    does not exercise the production 1,024 + 1,024 + remainder chunk sequence.
+    On SM86 that left a live Triton specialization for the first agent request,
+    pushing an otherwise valid 2,694-token request past the seven-second TTFT
+    gate.  This opt-in warmup runs internally while the ASGI application is
+    still starting, so the endpoint cannot advertise readiness early.
+
+    Input IDs are deterministic, varied, and kept in a conservative vocabulary
+    range. ``ignore_eos`` is appropriate here because this is compilation work,
+    not a performance or quality receipt, and all eight decode steps must run.
+    """
+
+    input_ids = [
+        10 + (index * 7919) % 64000
+        for index in range(DSV4_OPENCODE_WARMUP_INPUT_TOKENS)
+    ]
+    request = GenerateReqInput(
+        input_ids=input_ids,
+        sampling_params={
+            "max_new_tokens": DSV4_OPENCODE_WARMUP_OUTPUT_TOKENS,
+            "temperature": 0.0,
+            "ignore_eos": True,
+        },
+    )
+    if disaggregation_mode != "null":
+        request.bootstrap_room = 0
+        request.bootstrap_host = FAKE_BOOTSTRAP_HOST
+
+    async for _ in tokenizer_manager.generate_request(request, None):
+        pass
 
 
 @warmup("whisper_autodetect")

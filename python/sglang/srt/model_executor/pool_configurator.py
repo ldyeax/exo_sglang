@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
-
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import (
     get_dsa_index_head_dim,
@@ -32,6 +31,15 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
+from sglang.srt.mem_cache.dsv4_kv_cache_dtype import (
+    dsv4_kv_cache_dtype_name,
+    dsv4_supports_int4_kv_storage,
+    dsv4_supports_oscar_int2_kv_storage,
+    dsv4_supports_selective_c128_bf16_storage,
+    format_dsv4_device_capability,
+    get_dsv4_device_capability,
+    resolve_dsv4_kv_cache_dtype,
+)
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
@@ -47,9 +55,9 @@ class MemoryPoolConfig:
     """Resolved memory pool config, shared between target and draft workers."""
 
     max_total_num_tokens: int
-    max_running_requests: Optional[int] = None
-    full_max_total_num_tokens: Optional[int] = None
-    swa_max_total_num_tokens: Optional[int] = None
+    max_running_requests: int | None = None
+    full_max_total_num_tokens: int | None = None
+    swa_max_total_num_tokens: int | None = None
 
     # DSV4 compressed-attention pool sizes (target only; draft workers leave at 0).
     c4_max_total_num_tokens: int = 0
@@ -57,7 +65,7 @@ class MemoryPoolConfig:
     c4_state_pool_size: int = 0
     c128_state_pool_size: int = 0
 
-    mem_fraction_static: Optional[float] = None
+    mem_fraction_static: float | None = None
 
     def __post_init__(self):
         if self.max_total_num_tokens <= 0:
@@ -348,9 +356,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)
-        assert (
-            self._swa_layers_num > 0
-        ), "Hybrid SWA model must have at least one SWA layer"
+        assert self._swa_layers_num > 0, (
+            "Hybrid SWA model must have at least one SWA layer"
+        )
 
         self._swa_full_tokens_ratio = kvc.server_args.swa_full_tokens_ratio
         self._sliding_window_size = kvc.sliding_window_size
@@ -617,7 +625,111 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
-        self.use_bf16_cache = self.kv_cache_dtype_str in {"bf16", "bfloat16"}
+        requested_kv_cache_dtype = kvc.kv_cache_dtype
+        device_capability = get_dsv4_device_capability(
+            kvc.device, device_index=kvc.gpu_id
+        )
+        effective_kv_cache_dtype = resolve_dsv4_kv_cache_dtype(
+            requested_kv_cache_dtype,
+            device_capability=device_capability,
+        )
+        self.use_bf16_cache = effective_kv_cache_dtype == torch.bfloat16
+        self.use_int4_storage = envs.SGLANG_DSV4_INT4_KV_STORAGE.get()
+        self.use_int4_indexer_storage = envs.SGLANG_DSV4_INT4_C4_INDEXER_STORAGE.get()
+        self.use_oscar_int2_storage = envs.SGLANG_DSV4_OSCAR_INT2_KV_STORAGE.get()
+        self.use_selective_c128_bf16_storage = (
+            envs.SGLANG_DSV4_SM86_C128_BF16_STORAGE.get()
+        )
+        if self.use_oscar_int2_storage:
+            if not dsv4_supports_oscar_int2_kv_storage(device_capability):
+                raise ValueError(
+                    "SGLANG_DSV4_OSCAR_INT2_KV_STORAGE is implemented only "
+                    "for exact SM86, got "
+                    f"{format_dsv4_device_capability(device_capability)}"
+                )
+            if self.use_bf16_cache:
+                raise ValueError(
+                    "SGLANG_DSV4_OSCAR_INT2_KV_STORAGE requires fp8_e4m3 as "
+                    "its raw-byte configuration carrier"
+                )
+            if self.use_int4_storage or self.use_int4_indexer_storage:
+                raise ValueError(
+                    "OSCAR-INT2 is incompatible with the non-OSCAR DSV4 "
+                    "INT4 cache prototypes"
+                )
+            if self.use_selective_c128_bf16_storage:
+                raise ValueError(
+                    "OSCAR-INT2 owns the C128 layout and is incompatible with "
+                    "SGLANG_DSV4_SM86_C128_BF16_STORAGE"
+                )
+            if kvc.server_args.enable_hisparse:
+                raise ValueError("DSV4 OSCAR-INT2 is incompatible with HiSparse")
+            if getattr(
+                kvc.server_args, "enable_deepseek_v4_fp4_indexer", False
+            ):
+                raise ValueError(
+                    "DSV4 OSCAR-INT2 C4 storage is incompatible with the "
+                    "DeepSeek V4 FP4 indexer"
+                )
+        if self.use_int4_storage or self.use_int4_indexer_storage:
+            if not dsv4_supports_int4_kv_storage(device_capability):
+                raise ValueError(
+                    "SGLANG_DSV4_INT4_KV_STORAGE is implemented only for exact "
+                    f"SM86, got {format_dsv4_device_capability(device_capability)}"
+                )
+            if self.use_bf16_cache:
+                raise ValueError(
+                    "SGLANG_DSV4_INT4_KV_STORAGE requires fp8_e4m3 as its "
+                    "raw-byte configuration carrier"
+                )
+            if kvc.server_args.enable_hisparse and self.use_int4_storage:
+                raise ValueError(
+                    "SGLANG_DSV4_INT4_KV_STORAGE is incompatible with HiSparse"
+                )
+            if self.use_int4_indexer_storage and getattr(
+                kvc.server_args, "enable_deepseek_v4_fp4_indexer", False
+            ):
+                raise ValueError(
+                    "SGLANG_DSV4_INT4_C4_INDEXER_STORAGE is incompatible with "
+                    "the DeepSeek V4 FP4 indexer"
+                )
+        if self.use_selective_c128_bf16_storage:
+            if not dsv4_supports_selective_c128_bf16_storage(device_capability):
+                raise ValueError(
+                    "SGLANG_DSV4_SM86_C128_BF16_STORAGE is implemented only "
+                    "for exact SM86, got "
+                    f"{format_dsv4_device_capability(device_capability)}"
+                )
+            if self.use_bf16_cache:
+                raise ValueError(
+                    "SGLANG_DSV4_SM86_C128_BF16_STORAGE requires fp8_e4m3 "
+                    "as the SWA/C4 byte-storage carrier"
+                )
+            if self.use_int4_storage:
+                raise ValueError(
+                    "SGLANG_DSV4_SM86_C128_BF16_STORAGE is incompatible with "
+                    "SGLANG_DSV4_INT4_KV_STORAGE"
+                )
+        logger.info(
+            "DSV4 memory planner KV cache storage: requested=%s, effective=%s, "
+            "device=%s, physical_layout=%s",
+            dsv4_kv_cache_dtype_name(requested_kv_cache_dtype),
+            dsv4_kv_cache_dtype_name(effective_kv_cache_dtype),
+            format_dsv4_device_capability(device_capability),
+            (
+                "oscar-int2-shared-latent"
+                if self.use_oscar_int2_storage
+                else "latent-int4,indexer-int4"
+                if self.use_int4_storage and self.use_int4_indexer_storage
+                else "latent-int4"
+                if self.use_int4_storage
+                else "indexer-int4"
+                if self.use_int4_indexer_storage
+                else "fp8-swa-c4,bf16-c128"
+                if self.use_selective_c128_bf16_storage
+                else "dtype-default"
+            ),
+        )
         cfg = kvc.model_config
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
@@ -634,6 +746,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 f"local={len(self.compression_ratios)}/{len(cfg.compress_ratios)}"
             )
         self.swa_page_size = cfg.window_size
+        self.page_size = kvc.page_size
         self.swa_ratio = kvc.server_args.swa_full_tokens_ratio
         self.is_speculative = kvc.server_args.speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = (
@@ -708,16 +821,72 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
 
     def _get_bytes_per_full_token(self) -> float:
-        if self.use_bf16_cache:
-            kv_bytes = self.qk_nope_head_dim * 2 + self.qk_rope_head_dim * 2
+        bf16_kv_bytes = self.qk_nope_head_dim * 2 + self.qk_rope_head_dim * 2
+        if self.use_oscar_int2_storage:
+            # 448 asymmetric INT2 codes (112 B), exact BF16 RoPE (128 B),
+            # seven BF16 scale/zero pairs (28 B), padded to 16-byte alignment.
+            logical_kv_bytes = 272
+        elif self.use_int4_storage:
+            logical_kv_bytes = 368
+        elif self.use_bf16_cache:
+            logical_kv_bytes = bf16_kv_bytes
+        else:
+            logical_kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+
+        if self.use_oscar_int2_storage:
+            # One asymmetric G128 OSCAR group: 128 packed uint2 codes (32 B)
+            # plus one FP32 scale/zero pair (8 B).  This layout belongs only
+            # to OSCAR; generic packed FP8 and experimental INT4 stay separate.
+            indexer_bytes = 40
+        elif self.use_int4_indexer_storage:
+            indexer_bytes = 72
+        elif self.use_bf16_cache:
             indexer_bytes = self.indexer_head_dim * 2
         else:
-            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
             quant_block_size = 128
             indexer_bytes = (
-                self.indexer_head_dim
-                + self.indexer_head_dim // quant_block_size * 4
+                self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
             )
+
+        # Only the FP8 value+scale layout needs a 576-byte outer-page pad.
+        # BF16 and INT4 rows are naturally token-major and are allocated
+        # without padding.  This distinction matters most for two-token C128
+        # pages (FP8: 1728 bytes/page; selective BF16: 2048 bytes/page).
+        def physical_kv_bytes_per_token(
+            pool_page_size: int,
+            *,
+            logical_bytes: int,
+            unpadded: bool,
+        ) -> float:
+            if unpadded:
+                return float(logical_bytes)
+            return ceil_div(pool_page_size * logical_bytes, 576) * 576 / pool_page_size
+
+        base_unpadded = (
+            self.use_oscar_int2_storage or self.use_int4_storage or self.use_bf16_cache
+        )
+        swa_kv_bytes = physical_kv_bytes_per_token(
+            self.swa_page_size,
+            # The DSV4 SWA ring is OSCAR's protected recent window.  It is
+            # rotated by the same calibrated matrix but remains high precision.
+            logical_bytes=(
+                bf16_kv_bytes if self.use_oscar_int2_storage else logical_kv_bytes
+            ),
+            unpadded=base_unpadded,
+        )
+        c4_kv_bytes = physical_kv_bytes_per_token(
+            self.page_size // 4,
+            logical_bytes=logical_kv_bytes,
+            unpadded=base_unpadded,
+        )
+        c128_logical_bytes = (
+            bf16_kv_bytes if self.use_selective_c128_bf16_storage else logical_kv_bytes
+        )
+        c128_kv_bytes = physical_kv_bytes_per_token(
+            self.page_size // 128,
+            logical_bytes=c128_logical_bytes,
+            unpadded=base_unpadded or self.use_selective_c128_bf16_storage,
+        )
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         c4_state_dtype_size, c128_state_dtype_size = (
@@ -741,9 +910,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
         c4_frac = 1 / (4 * self.c4_shrink_factor)
         return (
-            self.swa_ratio * kv_bytes * self.num_layers_total
-            + c4_frac * kv_bytes * self.num_layers_ca4
-            + 1 / 128 * kv_bytes * self.num_layers_ca128
+            self.swa_ratio * swa_kv_bytes * self.num_layers_total
+            + c4_frac * c4_kv_bytes * self.num_layers_ca4
+            + 1 / 128 * c128_kv_bytes * self.num_layers_ca128
             + 1 / 4 * indexer_bytes * self.num_layers_ca4
             + self.swa_ratio * c4_state_ratio * c4_state_bytes * self.num_layers_ca4
             + c128_state_ratio * c128_state_bytes * self.num_layers_ca128
@@ -839,9 +1008,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
 
         if self.requested_max_running_requests_per_worker is not None:
             c128_state_fixed_bytes = self._get_c128_state_fixed_bytes(
@@ -870,9 +1039,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes_from_max_tokens(
         self, max_total_num_tokens: int, page_size: int
     ) -> MemoryPoolConfig:
-        assert (
-            page_size % 128 == 0
-        ), "page_size must be multiple of 128 for compressed attention"
+        assert page_size % 128 == 0, (
+            "page_size must be multiple of 128 for compressed attention"
+        )
         sizes = self._compute_dsv4_sizes(max_total_num_tokens, page_size)
         return self._to_config(sizes)
 

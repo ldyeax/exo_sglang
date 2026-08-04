@@ -254,6 +254,7 @@ class BuildPageTablePositions:
         max_seq_len: int,
         page_size: int,
         swa_window: int,
+        active_prefix_only: bool = False,
     ) -> PageTablePositionsResult:
         return build_page_table_positions(
             req_to_token=req_to_token,
@@ -262,6 +263,7 @@ class BuildPageTablePositions:
             max_seq_len=max_seq_len,
             page_size=page_size,
             swa_window=swa_window,
+            active_prefix_only=active_prefix_only,
         )
 
     @classmethod
@@ -274,6 +276,7 @@ class BuildPageTablePositions:
         max_seq_len: int,
         page_size: int,
         swa_window: int,
+        active_prefix_only: bool = False,
     ) -> PageTablePositionsResult:
         return build_page_table_positions_triton(
             req_to_token=req_to_token,
@@ -282,6 +285,7 @@ class BuildPageTablePositions:
             max_seq_len=max_seq_len,
             page_size=page_size,
             swa_window=swa_window,
+            active_prefix_only=active_prefix_only,
         )
 
 
@@ -293,7 +297,11 @@ def build_page_table_positions(
     max_seq_len: int,
     page_size: int,
     swa_window: int,
+    active_prefix_only: bool = False,
 ) -> PageTablePositionsResult:
+    # The reference materializes the full table. In active-prefix mode only
+    # the per-row live prefix is part of the optimized Triton contract.
+    _ = active_prefix_only
     seq_lens_casual = seq_lens_casual.to(torch.int32)
     positions_casual = seq_lens_casual - 1
     page_table = req_to_token[
@@ -323,6 +331,7 @@ def _page_table_positions_kernel(
     page_size,
     swa_window,
     BLOCK_P: tl.constexpr,
+    ACTIVE_PREFIX_ONLY: tl.constexpr,
 ):
     row = tl.program_id(0)
     seq_len = tl.load(seq_lens_ptr + row).to(tl.int32)
@@ -333,9 +342,17 @@ def _page_table_positions_kernel(
     rp = tl.load(req_pool_ptr + row).to(tl.int64)
     base = req_to_token_ptr + rp * rt_stride
     out_base = page_table_ptr + row.to(tl.int64) * num_pages
-    for p0 in range(0, num_pages, BLOCK_P):
+    # Ampere's native BF16 indexer is length-bounded, so it can retain static
+    # 524K graph storage while refreshing only the live prefix. Generic/SM120
+    # indexers can still gather the full table before masking, so the default
+    # path keeps materializing every entry for those consumers.
+    if ACTIVE_PREFIX_ONLY:
+        work_pages = tl.minimum(tl.cdiv(seq_len, page_size), num_pages)
+    else:
+        work_pages = num_pages
+    for p0 in tl.range(0, work_pages, BLOCK_P):
         p = p0 + tl.arange(0, BLOCK_P)
-        pmask = p < num_pages
+        pmask = p < work_pages
         tok = tl.load(base + p.to(tl.int64) * page_size, mask=pmask, other=0).to(
             tl.int32
         )
@@ -350,6 +367,7 @@ def build_page_table_positions_triton(
     max_seq_len: int,
     page_size: int,
     swa_window: int,
+    active_prefix_only: bool = False,
 ) -> PageTablePositionsResult:
     num_q = seq_lens_casual.shape[0]
     num_pages = (max_seq_len + page_size - 1) // page_size
@@ -373,6 +391,7 @@ def build_page_table_positions_triton(
         page_size,
         swa_window,
         BLOCK_P=BLOCK_P,
+        ACTIVE_PREFIX_ONLY=active_prefix_only,
     )
     return PageTablePositionsResult(
         seq_lens_casual=seq_lens_out,

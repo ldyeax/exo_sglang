@@ -26,6 +26,7 @@ def _init_compressed_attn_metadata_kernel(
     c128_page_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     COMPUTE_PAGE_INDICES: tl.constexpr,
+    ACTIVE_PREFIX_ONLY: tl.constexpr,
 ):
     batch_id = tl.program_id(0)
     if batch_id >= bs:
@@ -59,14 +60,23 @@ def _init_compressed_attn_metadata_kernel(
 
     if COMPUTE_PAGE_INDICES:
         page_indices_base = batch_id * c128_cur_max_seq_len
-        for block_start in tl.range(0, c128_cur_max_seq_len, BLOCK_SIZE):
+        # Opted-in attention consumers are length-bounded, so they can retain
+        # static graph capacity while only refreshing the live prefix. The HIP
+        # unified-prefill consumer still scans the full row for nonnegative
+        # entries, so the shared default must keep clearing the inactive tail.
+        if ACTIVE_PREFIX_ONLY:
+            work_c128_seq_len = tl.minimum(c128_seq_lens_clamp1, c128_cur_max_seq_len)
+        else:
+            work_c128_seq_len = c128_cur_max_seq_len
+        for block_start in tl.range(0, work_c128_seq_len, BLOCK_SIZE):
             offsets = block_start + tl.arange(0, BLOCK_SIZE)
-            mask = offsets < c128_cur_max_seq_len
+            mask = offsets < work_c128_seq_len
 
             page_idx = offsets // c128_page_size
             offset_in_page = offsets % c128_page_size
 
-            page_mask = mask & (page_idx < max_pages)
+            valid_mask = offsets < c128_seq_lens_raw
+            page_mask = valid_mask & (page_idx < max_pages)
             page_table_vals = tl.load(
                 page_table_ptr + batch_id * max_pages + page_idx,
                 mask=page_mask,
@@ -75,7 +85,6 @@ def _init_compressed_attn_metadata_kernel(
 
             c_page_indices_vals = page_table_vals * c128_page_size + offset_in_page
 
-            valid_mask = offsets < c128_seq_lens_raw
             c_page_indices_vals = tl.where(valid_mask, c_page_indices_vals, -1)
 
             tl.store(
@@ -92,6 +101,7 @@ def _init_compressed_attn_metadata_triton(
     page_table: Optional[torch.Tensor] = None,
     page_size: int = 0,
     compute_page_indices: bool = True,
+    active_prefix_only: bool = False,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -117,12 +127,12 @@ def _init_compressed_attn_metadata_triton(
     c128_seq_lens_clamp1 = torch.empty(bs, dtype=torch.int32, device=device)
 
     if compute_page_indices:
-        assert (
-            page_table is not None
-        ), "page_table required when compute_page_indices=True"
-        assert (
-            page_size >= 128 and page_size % 128 == 0
-        ), "page_size must be a multiple of 128 when compute_page_indices=True"
+        assert page_table is not None, (
+            "page_table required when compute_page_indices=True"
+        )
+        assert page_size >= 128 and page_size % 128 == 0, (
+            "page_size must be a multiple of 128 when compute_page_indices=True"
+        )
         max_pages = page_table.shape[1]
         c128_page_size = page_size // 128
         c128_cur_max_seq_len = c128_page_size * max_pages
@@ -164,6 +174,7 @@ def _init_compressed_attn_metadata_triton(
         c128_page_size,
         BLOCK_SIZE,
         compute_page_indices,
+        active_prefix_only,
     )
 
     return (
@@ -186,6 +197,7 @@ def init_compression_metadata(
     page_table: Optional[torch.Tensor] = None,
     page_size: int = 0,
     compute_page_indices: bool = True,
+    active_prefix_only: bool = False,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -204,4 +216,5 @@ def init_compression_metadata(
         page_table,
         page_size,
         compute_page_indices,
+        active_prefix_only,
     )

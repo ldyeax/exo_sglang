@@ -57,6 +57,7 @@ MIGRATED_OPTIONS = frozenset(
         "--data-parallel-size",
         "--dp-size",
         "--load-balance-method",
+        "--speculative-dspark-fixed-verify-len",
     }
 )
 
@@ -149,6 +150,8 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
                 "total_tokens",
                 "--tp-size",
                 "4",
+                "--speculative-dspark-fixed-verify-len",
+                "4",
             ]
         )
         server_args = ServerArgs.from_cli_args(args)
@@ -159,6 +162,7 @@ class TestServerArgsMigratedCliMetadata(CustomTestCase):
         self.assertEqual(server_args.dp_size, 2)
         self.assertEqual(server_args.load_balance_method, "total_tokens")
         self.assertEqual(server_args.tp_size, 4)
+        self.assertEqual(server_args.speculative_dspark_fixed_verify_len, 4)
 
 
 if __name__ == "__main__":

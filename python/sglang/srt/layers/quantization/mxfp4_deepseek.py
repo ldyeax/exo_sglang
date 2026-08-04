@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import logging
@@ -85,8 +84,25 @@ def _trtllm_fp4_supported() -> bool:
     return torch.cuda.get_device_capability() in _TRTLLM_FP4_CAPS
 
 
-class PackTopkIds:
+def map_mxfp4_expert_ids_for_ep(
+    topk_ids: torch.Tensor,
+    *,
+    moe_ep_rank: int,
+    num_local_experts: int,
+    already_compact: bool,
+) -> torch.Tensor:
+    """Translate local EP IDs unless KT already produced compact GPU slots."""
+    if already_compact:
+        return topk_ids
+    local_expert_offset = moe_ep_rank * num_local_experts
+    return torch.where(
+        topk_ids >= 0,
+        topk_ids + local_expert_offset,
+        topk_ids,
+    )
 
+
+class PackTopkIds:
     @classmethod
     def execute(
         cls, topk_ids: torch.Tensor, topk_weights: torch.Tensor
@@ -104,17 +120,17 @@ class PackTopkIds:
 
     @classmethod
     def triton(cls, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
-        assert (
-            topk_ids.shape == topk_weights.shape
-        ), f"shape mismatch: {topk_ids.shape=} vs {topk_weights.shape=}"
+        assert topk_ids.shape == topk_weights.shape, (
+            f"shape mismatch: {topk_ids.shape=} vs {topk_weights.shape=}"
+        )
         assert topk_ids.ndim >= 1, f"expected >=1D, got {topk_ids.shape=}"
 
-        assert (
-            topk_ids.dtype == torch.int32
-        ), f"topk_ids must be int32, got {topk_ids.dtype}"
-        assert (
-            topk_weights.dtype == torch.float32
-        ), f"topk_weights must be float32, got {topk_weights.dtype}"
+        assert topk_ids.dtype == torch.int32, (
+            f"topk_ids must be int32, got {topk_ids.dtype}"
+        )
+        assert topk_weights.dtype == torch.float32, (
+            f"topk_weights must be float32, got {topk_weights.dtype}"
+        )
 
         assert topk_ids.is_contiguous(), "topk_ids must be contiguous"
         assert topk_weights.is_contiguous(), "topk_weights must be contiguous"
@@ -167,6 +183,7 @@ class DeepSeekMxfp4MoEMethod:
     # regardless of whether it was constructed via the registry or directly
     # from Fp8Config.get_quant_method.
     _quant_wrapper_id = "mxfp4_deepseek"
+    _supports_caller_owned_output = True
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
@@ -177,9 +194,16 @@ class DeepSeekMxfp4MoEMethod:
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
+        configured_local_experts = moe_runner_config.num_local_experts
+        if configured_local_experts is None:
+            raise ValueError("MXFP4 MoE runner requires num_local_experts")
+        self._num_local_experts = int(configured_local_experts)
+        self._kt_compact_ids = (
+            moe_runner_config.kt_global_to_local_expert_mapping is not None
+        )
 
         swiglu_limit = moe_runner_config.swiglu_limit
-        is_2604b = os.environ.get('SGLANG_DSV4_2604_SUBMODE', '') == "2604B"
+        is_2604b = os.environ.get("SGLANG_DSV4_2604_SUBMODE", "") == "2604B"
         assert is_2604b == (swiglu_limit is not None), (
             f"swiglu_limit must be non-None iff submode=2604B "
             f"(got submode={os.environ.get('SGLANG_DSV4_2604_SUBMODE', '')!r}, "
@@ -187,7 +211,7 @@ class DeepSeekMxfp4MoEMethod:
         )
         self._gemm1_clamp_limit_tensor = (
             torch.full(
-                (layer.num_local_experts,),
+                (self._num_local_experts,),
                 swiglu_limit,
                 dtype=torch.float32,
                 device=layer.w13_weight.device,
@@ -295,9 +319,8 @@ class DeepSeekMxfp4MoEMethod:
 
         _force_tk = use_v4_triton_kernels()
         _force_trtllm = force_disable_v4_triton_kernels()
-        _take_tk_path = (
-            convert_v4_weights_to_triton_kernels is not None
-            and (_force_tk or (not _force_trtllm and not _trtllm_fp4_supported()))
+        _take_tk_path = convert_v4_weights_to_triton_kernels is not None and (
+            _force_tk or (not _force_trtllm and not _trtllm_fp4_supported())
         )
         if _take_tk_path:
             w13_raw = layer.w13_weight.data
@@ -313,12 +336,15 @@ class DeepSeekMxfp4MoEMethod:
             intermediate_size_tk = w2_raw.shape[2] * 2
             log_info_on_rank0(
                 logger,
-                f'[v4-triton-kernels] Swizzling V4 MXFP4 weights for matmul_ogs '
-                f'(layer: {self.prefix}, hidden_size={hidden_size_tk}, '
-                f'intermediate_size={intermediate_size_tk})...',
+                f"[v4-triton-kernels] Swizzling V4 MXFP4 weights for matmul_ogs "
+                f"(layer: {self.prefix}, hidden_size={hidden_size_tk}, "
+                f"intermediate_size={intermediate_size_tk})...",
             )
             w13_swiz, w13_pcg, w2_swiz, w2_pcg = convert_v4_weights_to_triton_kernels(
-                w13_raw, w13_scale_raw, w2_raw, w2_scale_raw,
+                w13_raw,
+                w13_scale_raw,
+                w2_raw,
+                w2_scale_raw,
             )
             # Free raw tensors; the triton_kernels Tensor objects keep their
             # own swizzled storage. The kt_ep_wrapper's full-GPU prefill
@@ -327,7 +353,8 @@ class DeepSeekMxfp4MoEMethod:
             # the gate fires, so opt-in keep them in that mode. Origin: sglang
             # 本身 (V4-Flash full-GPU prefill fallback compat).
             _keep_raw_for_full_gpu_fallback = (
-                getattr(get_global_server_args(), "kt_gpu_prefill_token_threshold", 0) or 0
+                getattr(get_global_server_args(), "kt_gpu_prefill_token_threshold", 0)
+                or 0
             ) > 0 or int(
                 os.environ.get("SGLANG_KT_GPU_PREFILL_TOKEN_THRESHOLD", "0")
             ) > 0
@@ -451,7 +478,11 @@ class DeepSeekMxfp4MoEMethod:
         ):
             layer.register_buffer(
                 name,
-                torch.ones(layer.num_local_experts, device=device, dtype=torch.float32),
+                torch.ones(
+                    self._num_local_experts,
+                    device=device,
+                    dtype=torch.float32,
+                ),
                 persistent=False,
             )
 
@@ -459,6 +490,30 @@ class DeepSeekMxfp4MoEMethod:
         self,
         layer: Module,
         dispatch_output: DispatchOutput,
+    ) -> CombineInput:
+        return self._apply(layer, dispatch_output, caller_output=None)
+
+    def apply_with_output(
+        self,
+        layer: Module,
+        dispatch_output: DispatchOutput,
+        *,
+        caller_output: torch.Tensor,
+    ) -> CombineInput:
+        """Apply the V4 Triton-kernels MoE into caller-owned storage.
+
+        This is intentionally separate from the generic FusedMoEMethodBase
+        interface.  KTEPWrapperMethod calls it only for its opt-in compact-ID
+        hybrid path, after staging the input for the CPU experts.
+        """
+        return self._apply(layer, dispatch_output, caller_output=caller_output)
+
+    def _apply(
+        self,
+        layer: Module,
+        dispatch_output: DispatchOutput,
+        *,
+        caller_output: torch.Tensor | None,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -473,9 +528,11 @@ class DeepSeekMxfp4MoEMethod:
             from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
                 apply_v4_triton_kernels_moe,
             )
+
             # Extract topk_ids/weights from topk_output (mirror the trtllm
             # extraction below, which happens after this dispatch).
             from sglang.srt.layers.moe.topk import TopKOutputChecker
+
             if TopKOutputChecker.format_is_standard(topk_output):
                 topk_ids = topk_output.topk_ids
                 topk_weights = topk_output.topk_weights
@@ -484,14 +541,16 @@ class DeepSeekMxfp4MoEMethod:
                 topk_weights = topk_output.topk_weights
             else:
                 raise NotImplementedError(
-                    f'triton_kernels V4 path: unsupported topk format {topk_output.format}'
+                    f"triton_kernels V4 path: unsupported topk format {topk_output.format}"
                 )
-            if not get_bool_env_var("SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING", default="false"):
-                local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
-                topk_ids = torch.where(
-                    topk_ids >= 0,
-                    topk_ids + local_expert_offset,
+            if not get_bool_env_var(
+                "SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING", default="false"
+            ):
+                topk_ids = map_mxfp4_expert_ids_for_ep(
                     topk_ids,
+                    moe_ep_rank=layer.moe_ep_rank,
+                    num_local_experts=layer.num_local_experts,
+                    already_compact=self._kt_compact_ids,
                 )
             rsf = layer.moe_runner_config.routed_scaling_factor
             # 2604B SwiGLU clamp: thread swiglu_limit through so the triton-
@@ -512,17 +571,25 @@ class DeepSeekMxfp4MoEMethod:
                 num_experts=layer._v4_tk_num_experts,
                 routed_scaling_factor=1.0,
                 swiglu_limit=layer.moe_runner_config.swiglu_limit,
+                caller_output=caller_output,
             )
             # rsf handled here (not inside kernel) to mirror the trtllm path
             # (line ~638) and avoid double-apply with FUSE_RSF_SHARED_ADD.
-            if not get_bool_env_var("SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD", default="false"):
+            if not get_bool_env_var(
+                "SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD", default="false"
+            ):
                 if rsf is not None and rsf != 1.0:
                     output.mul_(rsf)
-            if os.environ.get('SGLANG_DSV4_2604_SUBMODE', '') == '2604B' and (
+            if os.environ.get("SGLANG_DSV4_2604_SUBMODE", "") == "2604B" and (
                 self._gemm1_clamp_limit_tensor is not None
             ):
                 deepseek_v4_moe_code_path_checker.observed += 1
             return StandardCombineInput(hidden_states=output)
+
+        if caller_output is not None:
+            raise RuntimeError(
+                "caller-owned MXFP4 output requires the V4 triton_kernels path"
+            )
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight
@@ -532,7 +599,7 @@ class DeepSeekMxfp4MoEMethod:
         intermediate_size = w2.shape[2] * 2 if w2.dtype == torch.uint8 else w2.shape[2]
         hidden_size = w13.shape[2] * 2 if w13.dtype == torch.uint8 else w13.shape[2]
 
-        num_local_experts = layer.num_local_experts
+        num_local_experts = self._num_local_experts
         if w13_scale.dim() == 2:
             w13_scale = w13_scale.reshape(num_local_experts, 2 * intermediate_size, -1)
         if w2_scale.dim() == 2:
@@ -548,12 +615,14 @@ class DeepSeekMxfp4MoEMethod:
         else:
             raise ValueError(f"Unsupported topk output format: {topk_output.format}")
 
-        if not get_bool_env_var("SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING", default="false"):
-            local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
-            topk_ids = torch.where(
-                topk_ids >= 0,
-                topk_ids + local_expert_offset,
+        if not get_bool_env_var(
+            "SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING", default="false"
+        ):
+            topk_ids = map_mxfp4_expert_ids_for_ep(
                 topk_ids,
+                moe_ep_rank=layer.moe_ep_rank,
+                num_local_experts=layer.num_local_experts,
+                already_compact=self._kt_compact_ids,
             )
 
         packed_topk = PackTopkIds.execute(topk_ids, topk_weights)
@@ -594,7 +663,7 @@ class DeepSeekMxfp4MoEMethod:
                 num_tokens, out_hidden_size, dtype=torch.bfloat16, device=x_quant.device
             )
 
-        if os.environ.get('SGLANG_DSV4_2604_SUBMODE', '') == "2604B" and (
+        if os.environ.get("SGLANG_DSV4_2604_SUBMODE", "") == "2604B" and (
             self._gemm1_clamp_limit_tensor is not None
         ):
             deepseek_v4_moe_code_path_checker.observed += 1
@@ -615,31 +684,43 @@ class DeepSeekMxfp4MoEMethod:
             gemm2_bias=None,
             output1_scale_scalar=(
                 layer.output1_scale_scalar
-                if get_bool_env_var("SGLANG_OPT_MXFP4_STATIC_SCALE_ONES", default="false")
+                if get_bool_env_var(
+                    "SGLANG_OPT_MXFP4_STATIC_SCALE_ONES", default="false"
+                )
                 else torch.ones(
                     num_local_experts, device=x_quant.device, dtype=torch.float32
                 )
             ),
             output1_scale_gate_scalar=(
                 layer.output1_scale_gate_scalar
-                if get_bool_env_var("SGLANG_OPT_MXFP4_STATIC_SCALE_ONES", default="false")
+                if get_bool_env_var(
+                    "SGLANG_OPT_MXFP4_STATIC_SCALE_ONES", default="false"
+                )
                 else torch.ones(
                     num_local_experts, device=x_quant.device, dtype=torch.float32
                 )
             ),
             output2_scale_scalar=(
                 layer.output2_scale_scalar
-                if get_bool_env_var("SGLANG_OPT_MXFP4_STATIC_SCALE_ONES", default="false")
+                if get_bool_env_var(
+                    "SGLANG_OPT_MXFP4_STATIC_SCALE_ONES", default="false"
+                )
                 else torch.ones(
                     num_local_experts, device=x_quant.device, dtype=torch.float32
                 )
             ),
-            num_experts=layer.num_experts,
+            num_experts=(
+                num_local_experts if self._kt_compact_ids else layer.num_experts
+            ),
             top_k=packed_topk.shape[1],
             n_group=1,
             topk_group=1,
             intermediate_size=intermediate_size,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            local_expert_offset=(
+                0
+                if self._kt_compact_ids
+                else layer.moe_ep_rank * layer.num_local_experts
+            ),
             local_num_experts=num_local_experts,
             routed_scaling_factor=1.0,
             routing_method_type=int(RoutingMethodType.TopK),
@@ -648,7 +729,9 @@ class DeepSeekMxfp4MoEMethod:
             output=symm_output,
         )[0]
 
-        if not get_bool_env_var("SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD", default="false"):
+        if not get_bool_env_var(
+            "SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD", default="false"
+        ):
             rsf = layer.moe_runner_config.routed_scaling_factor
             if rsf is not None and rsf != 1.0:
                 output.mul_(rsf)

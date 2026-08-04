@@ -4,7 +4,20 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsv4.fp8_storage import (
+    get_e4m3fn_decode_lut,
+)
+from sglang.kernels.ops.attention.dsv4.int4_storage import (
+    GROUP_SIZE as INT4_GROUP_SIZE,
+    NUM_GROUPS as INT4_NUM_GROUPS,
+    ROPE_OFFSET_BYTES as INT4_ROPE_OFFSET_BYTES,
+    SCALE_OFFSET_BYTES as INT4_SCALE_OFFSET_BYTES,
+    STORAGE_BYTES_PER_TOKEN as INT4_STORAGE_BYTES_PER_TOKEN,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.mem_cache.dsv4_kv_cache_dtype import (
+    dsv4_uses_ampere_fp8_kv_storage,
+)
 
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
@@ -27,6 +40,7 @@ def dequantize_k_cache_paged(
     page_size: int,
     out: Optional[torch.Tensor] = None,
     is_bf16: bool = False,
+    is_int4: bool = False,
 ) -> torch.Tensor:
     """Dequantize the DeepSeek v4 paged KV cache for a list of token IDs.
 
@@ -43,6 +57,8 @@ def dequantize_k_cache_paged(
     """
     assert quant_k_cache.is_contiguous()
     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
+    if is_bf16 and is_int4:
+        raise ValueError("BF16 and INT4 DSV4 cache layouts are mutually exclusive")
 
     # The buffer's dtype is whatever the pool exposes (often bf16); the
     # underlying storage is uint8. Reinterpret to byte-space first.
@@ -71,6 +87,52 @@ def dequantize_k_cache_paged(
             PAGE_SIZE=page_size,
             TOKEN_ELEMS=DIM_NOPE + DIM_ROPE,
             BLOCK_SIZE=512,
+        )
+        return out
+
+    if is_int4:
+        expected_page_bytes = page_size * INT4_STORAGE_BYTES_PER_TOKEN
+        if bytes_per_page != expected_page_bytes:
+            raise ValueError(
+                f"INT4 page has {bytes_per_page} bytes, expected {expected_page_bytes}"
+            )
+        _dequantize_k_cache_paged_int4_kernel[(num_tokens,)](
+            out,
+            quant_k_cache_u8.reshape(-1),
+            quant_k_cache_u8.view(torch.bfloat16).reshape(-1),
+            page_table_1_flattened,
+            out.stride(0),
+            BYTES_PER_PAGE=bytes_per_page,
+            PAGE_SIZE=page_size,
+            DIM_NOPE=DIM_NOPE,
+            DIM_ROPE=DIM_ROPE,
+            GROUP_SIZE=INT4_GROUP_SIZE,
+            NUM_GROUPS=INT4_NUM_GROUPS,
+            TOKEN_BYTES=INT4_STORAGE_BYTES_PER_TOKEN,
+            ROPE_OFFSET_BYTES=INT4_ROPE_OFFSET_BYTES,
+            SCALE_OFFSET_BYTES=INT4_SCALE_OFFSET_BYTES,
+        )
+        return out
+
+    device_capability = torch.cuda.get_device_capability(quant_k_cache.device)
+    if dsv4_uses_ampere_fp8_kv_storage(device_capability):
+        lut = get_e4m3fn_decode_lut(quant_k_cache.device)
+        _dequantize_k_cache_paged_byte_kernel[(num_tokens,)](
+            out,
+            quant_k_cache_u8.reshape(-1),
+            quant_k_cache_u8.view(torch.bfloat16).reshape(-1),
+            page_table_1_flattened,
+            lut,
+            out.stride(0),
+            BYTES_PER_PAGE=bytes_per_page,
+            PAGE_SIZE=page_size,
+            DIM_NOPE=DIM_NOPE,
+            DIM_ROPE=DIM_ROPE,
+            TILE_SIZE=TILE_SIZE,
+            NUM_SCALE_TILES=NUM_SCALE_TILES,
+            NOPE_ROPE_BYTES=NOPE_ROPE_BYTES,
+            PADDED_SCALE_PER_TOKEN=PADDED_SCALE_PER_TOKEN,
+            S_OFFSET_BYTES=s_offset_bytes,
         )
         return out
 
@@ -173,6 +235,115 @@ def _dequantize_k_cache_paged_kernel(
     tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
 
 
+@triton.jit
+def _dequantize_k_cache_paged_byte_kernel(
+    output_ptr,
+    buf_uint8_ptr,
+    buf_bf16_ptr,
+    page_table_ptr,
+    lut_ptr,
+    output_stride_0,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    NUM_SCALE_TILES: tl.constexpr,
+    NOPE_ROPE_BYTES: tl.constexpr,
+    PADDED_SCALE_PER_TOKEN: tl.constexpr,
+    S_OFFSET_BYTES: tl.constexpr,
+):
+    """SM86 byte-storage decoder; contains no native FP8 Triton IR."""
+    token_id = tl.program_id(0)
+    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
+    page_idx = loc // PAGE_SIZE
+    in_page = loc % PAGE_SIZE
+    page_byte_base = page_idx * BYTES_PER_PAGE
+    token_data_base = page_byte_base + in_page * NOPE_ROPE_BYTES
+    token_scale_base = (
+        page_byte_base + S_OFFSET_BYTES + in_page * PADDED_SCALE_PER_TOKEN
+    )
+    out_row_base = token_id * output_stride_0
+
+    nope_offs = tl.arange(0, TILE_SIZE)
+    for tile_id in tl.static_range(NUM_SCALE_TILES):
+        fp8_off = token_data_base + tile_id * TILE_SIZE + nope_offs
+        raw = tl.load(buf_uint8_ptr + fp8_off)
+        lut_index = raw.to(tl.uint32).to(tl.int32)
+        fp8_vals = tl.load(lut_ptr + lut_index).to(tl.float32)
+
+        scale_u8 = tl.load(buf_uint8_ptr + token_scale_base + tile_id).to(tl.int32)
+        scale_pow2 = tl.exp2((scale_u8 - 127).to(tl.float32))
+
+        out_off = out_row_base + tile_id * TILE_SIZE + nope_offs
+        tl.store(
+            output_ptr + out_off,
+            (fp8_vals * scale_pow2).to(output_ptr.dtype.element_ty),
+        )
+
+    rope_offs = tl.arange(0, DIM_ROPE)
+    bf16_off = (token_data_base + DIM_NOPE) // 2 + rope_offs
+    rope_data = tl.load(buf_bf16_ptr + bf16_off)
+    tl.store(output_ptr + out_row_base + DIM_NOPE + rope_offs, rope_data)
+
+
+@triton.jit
+def _dequantize_k_cache_paged_int4_kernel(
+    output_ptr,
+    buf_uint8_ptr,
+    buf_bf16_ptr,
+    page_table_ptr,
+    output_stride_0,
+    BYTES_PER_PAGE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    DIM_NOPE: tl.constexpr,
+    DIM_ROPE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    TOKEN_BYTES: tl.constexpr,
+    ROPE_OFFSET_BYTES: tl.constexpr,
+    SCALE_OFFSET_BYTES: tl.constexpr,
+):
+    """Gather signed-INT4 keys directly into a caller-owned BF16 workspace."""
+    token_id = tl.program_id(0)
+    location = tl.load(page_table_ptr + token_id).to(tl.int64)
+    page = location // PAGE_SIZE
+    in_page = location - page * PAGE_SIZE
+    token_base = page * BYTES_PER_PAGE + in_page * TOKEN_BYTES
+    output_base = token_id * output_stride_0
+    pair_offsets = tl.arange(0, GROUP_SIZE // 2)
+
+    for group_id in tl.static_range(NUM_GROUPS):
+        packed = tl.load(
+            buf_uint8_ptr
+            + token_base
+            + group_id * (GROUP_SIZE // 2)
+            + pair_offsets
+        ).to(tl.int32)
+        low = packed & 0x0F
+        high = (packed >> 4) & 0x0F
+        low = tl.where(low < 8, low, low - 16).to(tl.float32)
+        high = tl.where(high < 8, high, high - 16).to(tl.float32)
+        scale = tl.load(
+            buf_bf16_ptr + (token_base + SCALE_OFFSET_BYTES) // 2 + group_id
+        ).to(tl.float32)
+        group_base = output_base + group_id * GROUP_SIZE
+        tl.store(
+            output_ptr + group_base + pair_offsets * 2,
+            (low * scale).to(tl.bfloat16),
+        )
+        tl.store(
+            output_ptr + group_base + pair_offsets * 2 + 1,
+            (high * scale).to(tl.bfloat16),
+        )
+
+    rope_offsets = tl.arange(0, DIM_ROPE)
+    rope = tl.load(
+        buf_bf16_ptr + (token_base + ROPE_OFFSET_BYTES) // 2 + rope_offsets
+    )
+    tl.store(output_ptr + output_base + DIM_NOPE + rope_offsets, rope)
+
+
 def dequantize_k_cache_paged_ref(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
@@ -190,7 +361,6 @@ def dequantize_k_cache_paged_ref(
     s_offset_bytes = page_size * NOPE_ROPE_BYTES
 
     flat_u8 = u8.reshape(-1)
-    flat_fp8 = u8.view(fp8_dtype).reshape(-1)
     flat_bf16 = u8.view(torch.bfloat16).reshape(-1)
 
     loc = page_table_1_flattened.to(torch.int64)
@@ -206,7 +376,8 @@ def dequantize_k_cache_paged_ref(
     nope_byte = (
         token_data_base[:, None] + torch.arange(DIM_NOPE, device=device)[None, :]
     )
-    nope_fp8 = flat_fp8[nope_byte].to(torch.float32)
+    decode_lut = get_e4m3fn_decode_lut(quant_k_cache.device)
+    nope_fp8 = decode_lut[flat_u8[nope_byte].long()].to(torch.float32)
     scale_byte = (
         token_scale_base[:, None]
         + torch.arange(NUM_SCALE_TILES, device=device)[None, :]

@@ -49,6 +49,33 @@ def _extract_positions_from_plan(
     return positions
 
 
+def _oscar_store_locations_and_mask(
+    plan: CompressMetadata,
+    out_loc: torch.Tensor,
+    compress_ratio: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map compressor rows to safe locations and mask every invalid row.
+
+    Prefill and target-verify plans are padded with ``CompressPlan::invalid``
+    rows whose signed sequence length is ``-1`` and whose ragged id bits are
+    not a valid index.  The generic fused store rejects those rows internally;
+    OSCAR's separate writer must carry the same validity predicate explicitly.
+    """
+
+    plan_raw = plan[1].view(torch.int32)
+    sequence_lengths = plan_raw[:, 0]
+    if plan.is_decode:
+        valid = (sequence_lengths >= compress_ratio) & (
+            sequence_lengths % compress_ratio == 0
+        )
+        return out_loc, valid.contiguous()
+
+    valid = sequence_lengths >= compress_ratio
+    ragged_ids = plan_raw[:, 1].to(torch.int32) & 0xFFFF
+    safe_ragged_ids = torch.where(valid, ragged_ids, torch.zeros_like(ragged_ids))
+    return out_loc[safe_ragged_ids.long()], valid.contiguous()
+
+
 def _compress_forward_c128_fallback(
     kv_score_buffer: torch.Tensor,
     kv_score_input: torch.Tensor,
@@ -154,8 +181,12 @@ class CompressorBackendMixin:
         compress_ratio: int,
         page_size: int,
         out_loc: torch.Tensor,
+        capture_layer_id: int,
+        capture_forward_batch: ForwardBatch,
+        capture_target_model: bool,
         use_fp4_indexer: bool = False,
         bf16_store: bool = False,
+        int4_store: bool = False,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -163,6 +194,12 @@ class CompressorBackendMixin:
             assert is_indexer
             assert compress_ratio == 4
             assert head_dim == 128
+        if bf16_store and int4_store:
+            raise ValueError("BF16 and INT4 DSV4 cache stores are mutually exclusive")
+        if use_fp4_indexer and int4_store:
+            raise ValueError(
+                "FP4 and signed-INT4 C4 indexer stores are mutually exclusive"
+            )
 
         plan = self._get_paged_compress_metadata(compress_ratio)
         is_online = _use_online_compress(compress_ratio)
@@ -185,6 +222,59 @@ class CompressorBackendMixin:
             is_online=is_online,
         )
 
+        # The production store fuses norm, RoPE, optional fixed Hadamard, and
+        # quantization.  OSCAR needs observations immediately before its own
+        # learned rotation (and before the indexer's legacy Hadamard), so make
+        # one bounded capture-only clone while retaining the untouched tensor
+        # for the baseline fused store.
+        from sglang.srt.layers.attention.dsv4.oscar_int2_capture import (
+            capture_configured,
+            capture_should_materialize,
+        )
+
+        if capture_configured():
+            from sglang.srt.runtime_context import get_parallel
+
+            parallel = get_parallel()
+        else:
+            parallel = None
+        if (
+            parallel is not None
+            and parallel.attn_tp_rank == 0
+            and (
+                capture_should_materialize(
+                    capture_forward_batch, target_model=capture_target_model
+                )
+                and kv_compressed.shape[0] > 0
+            )
+        ):
+            capture_value = kv_compressed.clone()
+            from sglang.kernels.ops.attention.deepseek_v4_rope import (
+                fused_norm_rope_inplace_triton,
+            )
+
+            positions = _extract_positions_from_plan(plan, compress_ratio)
+            fused_norm_rope_inplace_triton(
+                capture_value,
+                norm.weight,
+                norm.variance_epsilon,
+                freqs_cis_cache,
+                positions=positions.clamp(min=0),
+            )
+            from sglang.srt.layers.attention.dsv4.oscar_int2_capture import (
+                maybe_capture_compressed_domain,
+            )
+
+            maybe_capture_compressed_domain(
+                layer_id=capture_layer_id,
+                compressed=capture_value,
+                is_indexer=is_indexer,
+                forward_batch=capture_forward_batch,
+                target_model=capture_target_model,
+                tp_rank=parallel.attn_tp_rank,
+                tp_size=parallel.attn_tp_size,
+            )
+
         # Step 2: norm + rope + store
         compress_norm_rope_store(
             kv_compressed,
@@ -197,7 +287,88 @@ class CompressorBackendMixin:
             page_size=page_size,
             use_fp4=use_fp4_indexer,
             bf16_store=bf16_store,
+            int4_store=int4_store,
         )
+
+    def _forward_compress_oscar_int2(
+        self,
+        *,
+        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+        kv_score_buffer: torch.Tensor,
+        kv_score_input: torch.Tensor,
+        compressor: Compressor,
+        layer_id: int,
+    ) -> None:
+        """Create calibrated history and scorer keys in OSCAR INT2 layouts.
+
+        The ordinary CUDA path fuses norm/RoPE with FP8 or signed-INT4 store.
+        OSCAR keeps the compressor output as the sole temporary, applies norm
+        and RoPE in place, then dispatches either the shared-latent writer or
+        the separately calibrated C4 scorer writer.  The legacy indexer
+        Hadamard is deliberately absent: OSCAR's learned C4 rotation replaces
+        it.  A device mask preserves decode/speculative non-boundary slots.
+        """
+
+        if compressor.is_in_indexer and (
+            compressor.ratio != 4 or compressor.head_dim != 128
+        ):
+            raise ValueError("OSCAR C4 scorer compression requires ratio=4, dim=128")
+        plan = self._get_paged_compress_metadata(compressor.ratio)
+        is_online = _use_online_compress(compressor.ratio)
+        if is_online:
+            kv_score_buffer = kv_score_buffer.view(-1, 1, compressor.head_dim * 3)
+        else:
+            coefficient = 2 if is_overlap_compress(compressor.ratio) else 1
+            kv_score_buffer = kv_score_buffer.view(
+                -1,
+                compressor.ratio,
+                2 * compressor.head_dim * coefficient,
+            )
+        kv_compressed = compress_forward(
+            kv_score_buffer=kv_score_buffer,
+            kv_score_input=kv_score_input,
+            ape=compressor.ape.view(-1, compressor.head_dim),
+            plan=plan,
+            compress_ratio=compressor.ratio,
+            head_dim=compressor.head_dim,
+            is_online=is_online,
+        )
+        if kv_compressed.shape[0] == 0:
+            return
+
+        from sglang.kernels.ops.attention.deepseek_v4_rope import (
+            fused_norm_rope_inplace_triton,
+        )
+
+        positions = _extract_positions_from_plan(plan, compressor.ratio)
+        fused_norm_rope_inplace_triton(
+            kv_compressed,
+            compressor.norm.weight,
+            compressor.norm.variance_epsilon,
+            compressor.freqs_cis,
+            positions=positions.clamp(min=0),
+        )
+
+        out_loc_to_store, write_mask = _oscar_store_locations_and_mask(
+            plan,
+            self._get_out_loc(compressor.ratio),
+            compressor.ratio,
+        )
+
+        if compressor.is_in_indexer:
+            token_to_kv_pool.set_index_k_fused(
+                layer_id,
+                out_loc_to_store,
+                kv_compressed.to(torch.bfloat16),
+                write_mask=write_mask,
+            )
+        else:
+            token_to_kv_pool.set_extra_key_buffer_fused(
+                layer_id,
+                out_loc_to_store,
+                kv_compressed.to(torch.bfloat16),
+                write_mask=write_mask,
+            )
 
     def forward_unified(
         self,
@@ -237,6 +408,7 @@ class CompressorBackendMixin:
                 compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
             )
             bf16_store = False
+            int4_store = False
             if compressor.is_in_indexer:
                 if token_to_kv_pool.c4_indexer_kv_pool.use_bf16_cache:
                     kv_cache = token_to_kv_pool.get_index_k_bf16_buffer(
@@ -244,11 +416,10 @@ class CompressorBackendMixin:
                     ).flatten(1)
                     bf16_store = True
                 else:
-                    kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
-                        layer_id
-                    )
+                    kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
                 page_size = token_to_kv_pool.get_index_k_page_size()
                 bf16_store = token_to_kv_pool.c4_indexer_kv_pool.use_bf16_cache
+                int4_store = token_to_kv_pool.c4_indexer_kv_pool.use_int4_cache
             elif is_unified_kv_triton():
                 kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
                 page_size = 1
@@ -257,32 +428,51 @@ class CompressorBackendMixin:
                     f"c{compressor.ratio}_out_loc",
                 )
                 bf16_store = True
+                int4_store = False
             else:
                 _, _, compress_kv_pool = token_to_kv_pool.layer_mapping[layer_id]
                 assert compress_kv_pool is not None
                 kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
                 bf16_store = compress_kv_pool.use_bf16_cache
+                int4_store = compress_kv_pool.use_int4_cache
                 if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
                     out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
                         out_loc
                     )
-            self._forward_compress_all_in_one(
-                kv_score_buffer=state_pool.kv_score_buffer.kv_score,
-                kv_score_input=kv_score_input,
-                ape=compressor.ape,
-                head_dim=compressor.head_dim,
-                norm=compressor.norm,
-                freqs_cis_cache=compressor.freqs_cis,
-                kv_cache=kv_cache.view(dtype=torch.uint8).view(kv_cache.shape[0], -1),
-                is_indexer=compressor.is_in_indexer,
-                rotate=compressor.rotate,
-                compress_ratio=compressor.ratio,
-                page_size=page_size,
-                out_loc=out_loc,
-                use_fp4_indexer=use_fp4_indexer,
-                bf16_store=bf16_store,
-            )
+            if token_to_kv_pool.use_oscar_int2_storage:
+                self._forward_compress_oscar_int2(
+                    token_to_kv_pool=token_to_kv_pool,
+                    kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+                    kv_score_input=kv_score_input,
+                    compressor=compressor,
+                    layer_id=layer_id,
+                )
+            else:
+                self._forward_compress_all_in_one(
+                    kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+                    kv_score_input=kv_score_input,
+                    ape=compressor.ape,
+                    head_dim=compressor.head_dim,
+                    norm=compressor.norm,
+                    freqs_cis_cache=compressor.freqs_cis,
+                    kv_cache=kv_cache.view(dtype=torch.uint8).view(
+                        kv_cache.shape[0], -1
+                    ),
+                    is_indexer=compressor.is_in_indexer,
+                    rotate=compressor.rotate,
+                    compress_ratio=compressor.ratio,
+                    page_size=page_size,
+                    out_loc=out_loc,
+                    use_fp4_indexer=use_fp4_indexer,
+                    bf16_store=bf16_store,
+                    int4_store=int4_store,
+                    capture_layer_id=layer_id,
+                    capture_forward_batch=forward_batch,
+                    capture_target_model=getattr(
+                        compressor, "_dsv4_oscar_capture_target", False
+                    ),
+                )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:
             online_c128_mtp.write_prefix_states(
@@ -379,7 +569,10 @@ class CompressorBackendMixin:
         if kv_to_store.shape[0] == 0:
             return
 
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
+        if (
+            token_to_kv_pool.use_ampere_fp8_storage
+            or envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get()
+        ):
             # fused kernel: BF16 in -> FP8 quant + paged scatter in one launch
             if is_indexer:
                 token_to_kv_pool.set_index_k_fused(

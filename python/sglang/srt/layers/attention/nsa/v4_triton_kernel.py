@@ -8,9 +8,14 @@
 # unavailable (notably SM_120 / RTX 5090).
 """Triton fallback for DeepSeek V4 sparse FP8 MLA decode."""
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
+from sglang.kernels.ops.attention.dsv4.fp8_storage import (
+    get_e4m3fn_decode_lut,
+)
 
 LOG2E = 1.4426950408889634
 
@@ -21,45 +26,27 @@ FP8_DS_MLA_SCALE_BYTES = 8
 FP8_DS_MLA_TOKEN_BYTES = 576
 
 
-def _make_fp8_e4m3_lut() -> torch.Tensor:
-    """Pre-compute FP8 E4M3 → float32 lookup table (256 entries)."""
-    lut = torch.zeros(256, dtype=torch.float32)
-    for i in range(256):
-        sign = (i >> 7) & 1
-        exp = (i >> 3) & 0xF
-        mant = i & 0x7
-        if exp == 0:
-            val = float((1 - 2 * sign)) * (2.0**-6) * (mant / 8.0)
-        else:
-            val = float((1 - 2 * sign)) * (2.0 ** (exp - 7)) * (1.0 + mant / 8.0)
-        lut[i] = val
-    return lut
-
-
-# Global LUT – created once on first use, moved to GPU lazily.
-_fp8_e4m3_lut: torch.Tensor | None = None
-
-
-def _get_fp8_e4m3_lut(device: torch.device) -> torch.Tensor:
-    global _fp8_e4m3_lut
-    if _fp8_e4m3_lut is None:
-        _fp8_e4m3_lut = _make_fp8_e4m3_lut()
-    if _fp8_e4m3_lut.device != device:
-        _fp8_e4m3_lut = _fp8_e4m3_lut.to(device)
-    return _fp8_e4m3_lut
+@functools.lru_cache(maxsize=None)
+def _decode_launch_config(device: torch.device) -> tuple[int, int, int]:
+    """Return (heads, keys, warps) tuned without querying during graph replay."""
+    if device.type == "cuda" and torch.cuda.get_device_capability(device) == (8, 6):
+        # A 16-head tile fills Ampere's native MMA M tile, while four warps
+        # avoid the scheduling overhead measured with eight warps.  BLOCK_N=32
+        # exceeds GA102's opt-in shared-memory limit for this 512-D fused QK/PV
+        # kernel, so 16 is intentionally retained.
+        return 16, 16, 4
+    return 8, 16, 8
 
 
 @triton.jit
 def _decode_sparse_attention_fp8_kernel(
     q_ptr,
-    swa_cache_fp8_ptr,
-    swa_cache_bf16_ptr,
     swa_cache_u8_ptr,
+    swa_cache_bf16_ptr,
     swa_indices_ptr,
     swa_lens_ptr,
-    extra_cache_fp8_ptr,
-    extra_cache_bf16_ptr,
     extra_cache_u8_ptr,
+    extra_cache_bf16_ptr,
     extra_indices_ptr,
     extra_lens_ptr,
     lut_ptr,
@@ -176,27 +163,63 @@ def _decode_sparse_attention_fp8_kernel(
         pos = tl.where(use_extra, extra_pos, swa_pos)
 
         is_fp8 = offs_d < FP8_DIM
-        scale_offsets = (
-            tl.where(use_extra, extra_block, swa_block)[:, None]
-            * stride_block_bytes[:, None]
-            + block_size[:, None] * TOKEN_BYTES
-            + pos[:, None] * SCALE_BYTES
-            + (offs_d[None, :] // SCALE_GROUP)
+        # Each token has only seven UE8M0 scales. Load each once per key and
+        # broadcast it across its 64-D group instead of issuing one scale load
+        # for every FP8 element. This is 7*BLOCK_N byte loads rather than
+        # 448*BLOCK_N address/load lanes on the Ampere software-decode path.
+        scale_base = (
+            tl.where(use_extra, extra_block, swa_block) * stride_block_bytes
+            + block_size * TOKEN_BYTES
+            + pos * SCALE_BYTES
         )
-        encoded_scale = tl.load(
-            tl.where(use_extra[:, None], extra_cache_u8_ptr, swa_cache_u8_ptr)
-            + scale_offsets,
-            mask=valid[:, None] & is_fp8[None, :],
-            other=127,
-        ).to(tl.float32)
+        scale_ptr = tl.where(use_extra, extra_cache_u8_ptr, swa_cache_u8_ptr)
+        scale_0 = tl.load(scale_ptr + scale_base, mask=valid, other=127).to(tl.float32)
+        scale_1 = tl.load(scale_ptr + scale_base + 1, mask=valid, other=127).to(
+            tl.float32
+        )
+        scale_2 = tl.load(scale_ptr + scale_base + 2, mask=valid, other=127).to(
+            tl.float32
+        )
+        scale_3 = tl.load(scale_ptr + scale_base + 3, mask=valid, other=127).to(
+            tl.float32
+        )
+        scale_4 = tl.load(scale_ptr + scale_base + 4, mask=valid, other=127).to(
+            tl.float32
+        )
+        scale_5 = tl.load(scale_ptr + scale_base + 5, mask=valid, other=127).to(
+            tl.float32
+        )
+        scale_6 = tl.load(scale_ptr + scale_base + 6, mask=valid, other=127).to(
+            tl.float32
+        )
+        scale_group = offs_d // SCALE_GROUP
+        encoded_scale = tl.where(scale_group[None, :] == 0, scale_0[:, None], 127.0)
+        encoded_scale = tl.where(
+            scale_group[None, :] == 1, scale_1[:, None], encoded_scale
+        )
+        encoded_scale = tl.where(
+            scale_group[None, :] == 2, scale_2[:, None], encoded_scale
+        )
+        encoded_scale = tl.where(
+            scale_group[None, :] == 3, scale_3[:, None], encoded_scale
+        )
+        encoded_scale = tl.where(
+            scale_group[None, :] == 4, scale_4[:, None], encoded_scale
+        )
+        encoded_scale = tl.where(
+            scale_group[None, :] == 5, scale_5[:, None], encoded_scale
+        )
+        encoded_scale = tl.where(
+            scale_group[None, :] == 6, scale_6[:, None], encoded_scale
+        )
         fp8_scale = tl.exp2(encoded_scale - 127.0)
 
         fp8_offsets = token_base[:, None] + offs_d[None, :]
         # Load nope as raw byte index (uint8) and decode FP8 E4M3 via
-        # a pre-computed float32 lookup table.  Avoids Triton's fp8e4nv
+        # a pre-computed BF16 lookup table. Avoids Triton's fp8e4nv
         # type (unsupported on SM < 90).
         raw = tl.load(
-            tl.where(use_extra[:, None], extra_cache_fp8_ptr, swa_cache_fp8_ptr)
+            tl.where(use_extra[:, None], extra_cache_u8_ptr, swa_cache_u8_ptr)
             + fp8_offsets,
             mask=valid[:, None] & is_fp8[None, :],
             other=0,
@@ -251,7 +274,7 @@ def _decode_sparse_attention_fp8_kernel(
 
 FP8_DS_BF16_NOPE_DIM = 448
 FP8_DS_BF16_ROPE_DIM = 64
-FP8_DS_BF16_TOKEN_ELEMS = (FP8_DS_BF16_NOPE_DIM + FP8_DS_BF16_ROPE_DIM)  # 512
+FP8_DS_BF16_TOKEN_ELEMS = FP8_DS_BF16_NOPE_DIM + FP8_DS_BF16_ROPE_DIM  # 512
 
 
 @triton.jit
@@ -303,9 +326,12 @@ def _decode_sparse_attention_bf16_kernel(
     mask_h = heads < num_heads
 
     q = tl.load(
-        q_ptr + token_id * stride_qt + heads[:, None] * stride_qh
+        q_ptr
+        + token_id * stride_qt
+        + heads[:, None] * stride_qh
         + offs_d[None, :] * stride_qd,
-        mask=mask_h[:, None], other=0.0,
+        mask=mask_h[:, None],
+        other=0.0,
     )
 
     if HAS_SINK:
@@ -330,14 +356,16 @@ def _decode_sparse_attention_bf16_kernel(
         extra_cols = offs_n
         swa_cols = offs_n - extra_len
         extra_idx = tl.load(
-            extra_indices_ptr + token_id * stride_extra_idx_t
+            extra_indices_ptr
+            + token_id * stride_extra_idx_t
             + extra_cols * stride_extra_idx_k,
-            mask=HAS_EXTRA & (extra_cols < extra_index_topk), other=-1,
+            mask=HAS_EXTRA & (extra_cols < extra_index_topk),
+            other=-1,
         )
         swa_idx = tl.load(
-            swa_indices_ptr + token_id * stride_swa_idx_t
-            + swa_cols * stride_swa_idx_k,
-            mask=(swa_cols >= 0) & (swa_cols < swa_index_topk), other=-1,
+            swa_indices_ptr + token_id * stride_swa_idx_t + swa_cols * stride_swa_idx_k,
+            mask=(swa_cols >= 0) & (swa_cols < swa_index_topk),
+            other=-1,
         )
         idx = tl.where(use_extra, extra_idx, swa_idx)
 
@@ -361,7 +389,8 @@ def _decode_sparse_attention_bf16_kernel(
         k = tl.load(
             tl.where(use_extra[:, None], extra_cache_bf16_ptr, swa_cache_bf16_ptr)
             + k_offsets,
-            mask=valid[:, None], other=0.0,
+            mask=valid[:, None],
+            other=0.0,
         ).to(tl.float32)
 
         qk = tl.dot(q, tl.trans(k.to(q.dtype))) * sm_scale_log2
@@ -377,15 +406,26 @@ def _decode_sparse_attention_bf16_kernel(
 
     acc = acc / tl.maximum(e_sum, 1.0e-20)[:, None]
     tl.store(
-        out_ptr + token_id * stride_out_t + heads[:, None] * stride_out_h
+        out_ptr
+        + token_id * stride_out_t
+        + heads[:, None] * stride_out_h
         + offs_d[None, :] * stride_out_d,
-        acc.to(tl.bfloat16), mask=mask_h[:, None],
+        acc.to(tl.bfloat16),
+        mask=mask_h[:, None],
     )
 
 
 def decode_sparse_attention_bf16(
-    q, swa_cache, swa_indices, swa_lens, scale, attn_sink, out,
-    extra_cache=None, extra_indices=None, extra_lens=None,
+    q,
+    swa_cache,
+    swa_indices,
+    swa_lens,
+    scale,
+    attn_sink,
+    out,
+    extra_cache=None,
+    extra_indices=None,
+    extra_lens=None,
 ) -> None:
     """SM_86 BF16 decode: cache is all-bf16, no FP8 at all."""
     if swa_indices.ndim == 3:
@@ -398,9 +438,7 @@ def decode_sparse_attention_bf16(
         return
 
     has_extra = bool(
-        extra_cache is not None
-        and extra_indices is not None
-        and extra_lens is not None
+        extra_cache is not None and extra_indices is not None and extra_lens is not None
     )
     if not has_extra:
         extra_cache = swa_cache
@@ -416,28 +454,106 @@ def decode_sparse_attention_bf16(
 
     _decode_sparse_attention_bf16_kernel[grid](
         q,
-        swa_cache_bf16, swa_indices, swa_lens,
-        extra_cache_bf16, extra_indices, extra_lens,
+        swa_cache_bf16,
+        swa_indices,
+        swa_lens,
+        extra_cache_bf16,
+        extra_indices,
+        extra_lens,
         attn_sink if attn_sink is not None else q,
         out,
-        num_tokens, num_heads,
+        num_tokens,
+        num_heads,
         swa_indices.shape[-1],
         extra_indices.shape[-1] if has_extra else 0,
-        swa_cache_bf16.shape[0], extra_cache_bf16.shape[0],
-        swa_cache_bf16.shape[1], extra_cache_bf16.shape[1],
-        swa_cache_bf16.stride(0), extra_cache_bf16.stride(0),
+        swa_cache_bf16.shape[0],
+        extra_cache_bf16.shape[0],
+        swa_cache_bf16.shape[1],
+        extra_cache_bf16.shape[1],
+        swa_cache_bf16.stride(0),
+        extra_cache_bf16.stride(0),
         scale * LOG2E,
-        q.stride(0), q.stride(1), q.stride(2),
-        swa_indices.stride(0), swa_indices.stride(1),
-        extra_indices.stride(0), extra_indices.stride(1),
-        out.stride(0), out.stride(1), out.stride(2),
-        BLOCK_H=BLOCK_H, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
-        NOPE_DIM=FP8_DS_BF16_NOPE_DIM, ROPE_DIM=FP8_DS_BF16_ROPE_DIM,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        swa_indices.stride(0),
+        swa_indices.stride(1),
+        extra_indices.stride(0),
+        extra_indices.stride(1),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        BLOCK_H=BLOCK_H,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
+        NOPE_DIM=FP8_DS_BF16_NOPE_DIM,
+        ROPE_DIM=FP8_DS_BF16_ROPE_DIM,
         TOKEN_ELEMS=FP8_DS_BF16_TOKEN_ELEMS,
-        HAS_EXTRA=has_extra, HAS_SINK=attn_sink is not None,
+        HAS_EXTRA=has_extra,
+        HAS_SINK=attn_sink is not None,
         LOG2E_CONST=LOG2E,
-        num_stages=1, num_warps=8,
+        num_stages=1,
+        num_warps=8,
     )
+
+
+def _resolve_packed_page_size(
+    cache: torch.Tensor,
+    explicit_page_size: int | None,
+    *,
+    name: str,
+) -> int:
+    if explicit_page_size is not None:
+        if explicit_page_size <= 0:
+            raise ValueError(f"{name}_block_size must be positive")
+        return explicit_page_size
+
+    # FlashMLA presents the raw page storage as
+    # [num_pages, page_size, 1, 584].  Preserve that compatibility, while
+    # requiring callers with the allocator's native 2-D padded page buffer to
+    # provide the logical page size explicitly.
+    if cache.ndim >= 3:
+        page_size = int(cache.shape[1])
+        if page_size > 0:
+            return page_size
+    raise ValueError(
+        f"{name}_block_size is required for a 2-D packed cache; got "
+        f"{tuple(cache.shape)}"
+    )
+
+
+def _prepare_packed_page_buffer(
+    cache: torch.Tensor,
+    page_size: int,
+    *,
+    name: str,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    if cache.ndim < 2:
+        raise ValueError(f"{name} must have a page dimension, got {cache.shape}")
+    if cache.element_size() != 1:
+        raise TypeError(
+            f"{name} must use one-byte E4M3FN/uint8 storage, got {cache.dtype}"
+        )
+
+    # Never expose a float8 pointer to Triton on Ampere.  A dtype view is
+    # allocation-free and retains the allocator's padded outer-page stride.
+    cache_u8 = cache if cache.dtype == torch.uint8 else cache.view(torch.uint8)
+    if cache_u8.stride(-1) != 1:
+        raise ValueError(f"{name}'s innermost byte dimension must be contiguous")
+    page_stride_bytes = cache_u8.stride(0)
+    required_page_bytes = page_size * (FP8_DS_MLA_TOKEN_BYTES + FP8_DS_MLA_SCALE_BYTES)
+    if page_stride_bytes < required_page_bytes:
+        raise ValueError(
+            f"{name} page stride is {page_stride_bytes} bytes, but page size "
+            f"{page_size} requires at least {required_page_bytes} bytes"
+        )
+    if page_stride_bytes % 2 or cache_u8.storage_offset() % 2:
+        raise ValueError(f"{name} must be BF16-aligned")
+
+    # RoPE occupies bytes [448, 576) of each value record.  Use a second typed
+    # view solely for those loads; all addresses passed to the kernel remain
+    # explicit offsets from the same stable storage.
+    return cache_u8, cache_u8.view(torch.bfloat16), page_stride_bytes
 
 
 def decode_sparse_attention_triton(
@@ -451,13 +567,20 @@ def decode_sparse_attention_triton(
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_lens: torch.Tensor | None = None,
+    *,
+    swa_block_size: int | None = None,
+    extra_block_size: int | None = None,
 ) -> None:
     """Run V4 sparse FP8 MLA decode through a portable Triton kernel.
 
     The kernel expects:
       q          : (N_tokens, num_heads, 512) bf16
-      swa_cache  : (num_blocks, swa_block_size, head_bytes) uint8 packed
-                   layout = [block_size * 576 data] + [block_size * 8 scale]
+      swa_cache  : raw uint8/E4M3FN page storage. Both the native allocator
+                   shape ``(num_pages, padded_page_bytes)`` and FlashMLA's
+                   logical shape ``(num_pages, page_size, 1, 584)`` work.
+                   Physical layout is ``page_size * 576`` value bytes followed
+                   by ``page_size * 8`` UE8M0 scale bytes; the outer page stride
+                   may include allocator padding.
       swa_indices: (N_tokens, topk_swa) int32 (gets squeezed if 3D)
       swa_lens   : (N_tokens,) int32
       out        : (N_tokens, num_heads, 512) bf16, written in place
@@ -475,48 +598,69 @@ def decode_sparse_attention_triton(
             "DeepSeek V4 decode Triton fallback expects "
             f"D={DEEPSEEK_V4_MLA_HEAD_DIM}, got {head_dim}"
         )
+    if q.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+        raise TypeError("DeepSeek V4 Ampere attention requires BF16 q and out")
+
     has_extra = (
-        extra_cache is not None
-        and extra_indices is not None
-        and extra_lens is not None
+        extra_cache is not None and extra_indices is not None and extra_lens is not None
+    )
+    resolved_swa_block_size = _resolve_packed_page_size(
+        swa_cache, swa_block_size, name="swa_cache"
     )
     if not has_extra:
         extra_cache = swa_cache
         extra_indices = swa_indices[:, :1]
         extra_lens = swa_lens
+        resolved_extra_block_size = resolved_swa_block_size
+    else:
+        assert extra_cache is not None
+        resolved_extra_block_size = _resolve_packed_page_size(
+            extra_cache, extra_block_size, name="extra_cache"
+        )
 
     assert extra_cache is not None
     assert extra_indices is not None
     assert extra_lens is not None
-    BLOCK_H = 8
-    grid = (num_tokens, triton.cdiv(num_heads, BLOCK_H))
-    # SM < 90 can't use fp8e4nv; pass nope as uint8 and decode via LUT.
-    lut = _get_fp8_e4m3_lut(q.device)
+    swa_cache_u8, swa_cache_bf16, swa_page_stride_bytes = _prepare_packed_page_buffer(
+        swa_cache,
+        resolved_swa_block_size,
+        name="swa_cache",
+    )
+    extra_cache_u8, extra_cache_bf16, extra_page_stride_bytes = (
+        _prepare_packed_page_buffer(
+            extra_cache,
+            resolved_extra_block_size,
+            name="extra_cache",
+        )
+    )
+    block_h, block_n, num_warps = _decode_launch_config(q.device)
+    grid = (num_tokens, triton.cdiv(num_heads, block_h))
+    # SM < 89 cannot consume a native float8 pointer. Decode the exact
+    # E4M3FN bit pattern through a persistent per-device BF16 LUT instead.
+    lut = get_e4m3fn_decode_lut(q.device)
     _decode_sparse_attention_fp8_kernel[grid](
         q,
-        swa_cache,  # uint8 nope
-        swa_cache.view(torch.bfloat16),  # bf16 rope
-        swa_cache,  # uint8 scale
+        swa_cache_u8,
+        swa_cache_bf16,
         swa_indices,
         swa_lens,
-        extra_cache,  # uint8 nope
-        extra_cache.view(torch.bfloat16),  # bf16 rope
-        extra_cache,  # uint8 scale
+        extra_cache_u8,
+        extra_cache_bf16,
         extra_indices,
         extra_lens,
-        lut,  # FP8 E4M3 → float32 LUT
+        lut,  # Raw E4M3FN byte -> BF16 LUT
         attn_sink if attn_sink is not None else q,
         out,
         num_tokens,
         num_heads,
         swa_indices.shape[-1],
         extra_indices.shape[-1] if has_extra else 0,
-        swa_cache.shape[0],
-        extra_cache.shape[0],
-        swa_cache.shape[1],
-        extra_cache.shape[1],
-        swa_cache.stride(0),
-        extra_cache.stride(0),
+        swa_cache_u8.shape[0],
+        extra_cache_u8.shape[0],
+        resolved_swa_block_size,
+        resolved_extra_block_size,
+        swa_page_stride_bytes,
+        extra_page_stride_bytes,
         scale * LOG2E,
         q.stride(0),
         q.stride(1),
@@ -528,8 +672,8 @@ def decode_sparse_attention_triton(
         out.stride(0),
         out.stride(1),
         out.stride(2),
-        BLOCK_H=8,
-        BLOCK_N=16,
+        BLOCK_H=block_h,
+        BLOCK_N=block_n,
         BLOCK_D=DEEPSEEK_V4_MLA_HEAD_DIM,
         FP8_DIM=FP8_DS_MLA_FP8_DIM,
         SCALE_GROUP=FP8_DS_MLA_SCALE_GROUP,
@@ -539,5 +683,5 @@ def decode_sparse_attention_triton(
         HAS_SINK=attn_sink is not None,
         LOG2E_CONST=LOG2E,
         num_stages=1,  # SM_86 tuned: single-stage pipeline fits 99KB LDS
-        num_warps=8,
+        num_warps=num_warps,
     )

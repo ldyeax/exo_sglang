@@ -40,6 +40,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    KTExpertHotspotReqInput,
+    KTExpertHotspotReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -107,6 +109,7 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("kt_expert_hotspot", KTExpertHotspotReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -300,6 +303,14 @@ class TokenizerControlMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def kt_expert_hotspot(
+        self: TokenizerManager, obj: KTExpertHotspotReqInput
+    ) -> List[KTExpertHotspotReqOutput]:
+        """Fan a request-boundary expert-cache transaction out to all ranks."""
+
+        self.auto_create_handle_loop()
+        return await self.kt_expert_hotspot_communicator(obj)
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

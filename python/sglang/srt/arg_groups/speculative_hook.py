@@ -406,6 +406,22 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     )
 
     ragged_mode = read_ragged_verify_mode()
+    fixed_verify_len = server_args.speculative_dspark_fixed_verify_len
+    if fixed_verify_len is not None:
+        fixed_verify_len = int(fixed_verify_len)
+        maximum_verify_len = int(server_args.speculative_num_draft_tokens)
+        if not 2 <= fixed_verify_len <= maximum_verify_len:
+            raise ValueError(
+                "--speculative-dspark-fixed-verify-len must be between 2 and "
+                f"gamma + 1 ({maximum_verify_len}), got {fixed_verify_len}."
+            )
+        if ragged_mode is not RaggedVerifyMode.COMPACT:
+            raise ValueError(
+                "--speculative-dspark-fixed-verify-len requires "
+                "SGLANG_RAGGED_VERIFY_MODE=compact so the requested verify "
+                "length maps to an exact captured CUDA-graph tier."
+            )
+        server_args.speculative_dspark_fixed_verify_len = fixed_verify_len
     if server_args.pp_size != 1:
         if server_args.enable_dp_attention:
             raise ValueError(

@@ -82,6 +82,34 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 
+def _resolve_dsv4_worker_compression_ratios(
+    *,
+    is_draft_worker: bool,
+    model_compression_ratios: list[int],
+    num_effective_layers: int,
+) -> list[int]:
+    """Return the physical DSV4 pool topology for one model worker.
+
+    Target workers retain the checkpoint's C4/C128 topology.  DSV4 speculative
+    workers execute NextN layers whose attention contract is SWA-only, so every
+    local draft layer must use the dedicated ratio-0 topology.  Keeping this
+    rewrite in one helper makes the later OSCAR target/draft admission contract
+    testable and prevents a future draft model refactor from accidentally
+    allocating an uncalibrated compressed cache.
+    """
+
+    if not is_draft_worker:
+        return list(model_compression_ratios)
+
+    from sglang.srt.models.deepseek_v4_nextn import COMPRESS_RATIO_NEXTN_LAYER
+
+    if COMPRESS_RATIO_NEXTN_LAYER != 0:
+        raise RuntimeError(
+            "DSV4 speculative workers require the SWA-only NextN cache topology"
+        )
+    return [COMPRESS_RATIO_NEXTN_LAYER] * num_effective_layers
+
+
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -917,16 +945,11 @@ class KVCacheConfigurator:
         if not _is_npu:
             assert swa_page_size == 256, "In paged swa mode, page_size must be 256."
 
-        if self.is_draft_worker:
-            from sglang.srt.models.deepseek_v4_nextn import (
-                COMPRESS_RATIO_NEXTN_LAYER,
-            )
-
-            compression_ratios = [
-                COMPRESS_RATIO_NEXTN_LAYER
-            ] * self.layer_info.num_effective_layers
-        else:
-            compression_ratios = self.model_config.compress_ratios
+        compression_ratios = _resolve_dsv4_worker_compression_ratios(
+            is_draft_worker=self.is_draft_worker,
+            model_compression_ratios=self.model_config.compress_ratios,
+            num_effective_layers=self.layer_info.num_effective_layers,
+        )
 
         # NPU + DSV4 → paged-state subclass: the fused compressor kernel
         # needs cache_mode=1 (paged); Atlas A3 rejects cache_mode=2 (ring),
@@ -989,6 +1012,7 @@ class KVCacheConfigurator:
             online_mtp_max_draft_tokens=(
                 self.server_args.max_speculative_num_draft_tokens or 0
             ),
+            is_draft_worker=self.is_draft_worker,
         )
         return token_to_kv_pool
 

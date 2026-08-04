@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from contextlib import contextmanager, nullcontext
 from typing import (
@@ -18,11 +19,10 @@ from typing import (
     Union,
 )
 
+import sglang.srt.models.deepseek_v2 as deepseek_v2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
@@ -204,6 +204,131 @@ logger = logging.getLogger(__name__)
 
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 _MHC_POST_MULT_VALUE = 2.0
+_DSV4_OSCAR_NOPE_DIM = 448
+_DSV4_OSCAR_ROPE_DIM = 64
+_DSV4_OSCAR_HEAD_DIM = _DSV4_OSCAR_NOPE_DIM + _DSV4_OSCAR_ROPE_DIM
+_DSV4_OSCAR_TARGET_CONSUMER_ROLE = "target_compressed"
+_DSV4_OSCAR_DRAFT_CONSUMER_ROLE = "draft_swa_only"
+_CAPTURE_DSV4_ATTENTION_IN_BCG = (
+    os.environ.get("SGLANG_DSV4_CAPTURE_ATTN_IN_BCG") == "1"
+)
+_EAGER_DSV4_ATTENTION_MODULE_IN_BCG = (
+    os.environ.get("SGLANG_DSV4_EAGER_ATTN_MODULE_IN_BCG") == "1"
+)
+
+
+class _Dsv4OscarWoAOutputRotationBinding(NamedTuple):
+    """Exact setup-time proof consumed by the OSCAR attention backend.
+
+    The tensor objects are retained deliberately.  Object identity binds the
+    folded weight to the exact admitted rotation, while ``weight_version``
+    catches any later in-place model update before a graph can be recaptured.
+    """
+
+    layer_id: int
+    artifact_sha256: str
+    admission_sha256: str
+    rotation: torch.Tensor
+    weight: torch.Tensor
+    weight_version: int
+    consumer_role: str
+
+
+class _Dsv4OscarWoAFoldPlan(NamedTuple):
+    layer_id: int
+    attention: Any
+    calibration: Any
+    weight: torch.Tensor
+    num_local_groups: int
+    output_rank: int
+    heads_per_group: int
+
+
+def _fold_dsv4_oscar_output_rotation_into_wo_a_weight_(
+    weight: torch.Tensor,
+    rotation: torch.Tensor,
+    *,
+    num_local_groups: int,
+    output_rank: int,
+    heads_per_group: int,
+    nope_dim: int = _DSV4_OSCAR_NOPE_DIM,
+    rope_dim: int = _DSV4_OSCAR_ROPE_DIM,
+    input_workspace: Optional[torch.Tensor] = None,
+    output_workspace: Optional[torch.Tensor] = None,
+) -> None:
+    """Fold OSCAR's inverse attention-output rotation into ``wo_a``.
+
+    DeepSeek V4 treats activations as row vectors.  OSCAR attention returns
+    ``z_rot = z @ R`` and the old runtime path restored ``z = z_rot @ R.T``
+    before applying ``wo_a`` as ``z @ W.T``.  Therefore
+
+    ``(z_rot @ R.T) @ W.T == z_rot @ (W @ R).T``.
+
+    Each output group contains consecutive 512-wide heads.  Only the first
+    448 columns of every head are multiplied by ``R``; the final 64 RoPE
+    columns are intentionally never copied or modified.  The caller can pass
+    reusable workspaces so the production setup path allocates exactly twice,
+    outside every CUDA graph, rather than once per layer or group.
+    """
+
+    if weight.ndim != 2 or not weight.is_contiguous():
+        raise ValueError("OSCAR wo_a weight must be a contiguous matrix")
+    if rotation.shape != (nope_dim, nope_dim) or not rotation.is_contiguous():
+        raise ValueError(
+            f"OSCAR rotation must be contiguous with shape ({nope_dim}, {nope_dim})"
+        )
+    if weight.dtype != rotation.dtype or weight.device != rotation.device:
+        raise ValueError("OSCAR wo_a weight and rotation must share dtype and device")
+    if min(num_local_groups, output_rank, heads_per_group) <= 0:
+        raise ValueError("OSCAR wo_a layout dimensions must all be positive")
+
+    head_dim = nope_dim + rope_dim
+    expected_shape = (
+        num_local_groups * output_rank,
+        heads_per_group * head_dim,
+    )
+    if tuple(weight.shape) != expected_shape:
+        raise ValueError(
+            f"OSCAR wo_a weight must have shape {expected_shape}, "
+            f"got {tuple(weight.shape)}"
+        )
+
+    workspace_shape = (output_rank * heads_per_group, nope_dim)
+    if input_workspace is None:
+        input_workspace = torch.empty(
+            workspace_shape, dtype=weight.dtype, device=weight.device
+        )
+    if output_workspace is None:
+        output_workspace = torch.empty_like(input_workspace)
+    for name, workspace in (
+        ("input_workspace", input_workspace),
+        ("output_workspace", output_workspace),
+    ):
+        if (
+            tuple(workspace.shape) != workspace_shape
+            or workspace.dtype != weight.dtype
+            or workspace.device != weight.device
+            or not workspace.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be contiguous with shape {workspace_shape}, "
+                "and share the wo_a dtype/device"
+            )
+    if input_workspace.data_ptr() == output_workspace.data_ptr():
+        raise ValueError("OSCAR wo_a input/output workspaces must not alias")
+
+    weight_by_head = weight.view(
+        num_local_groups,
+        output_rank,
+        heads_per_group,
+        head_dim,
+    )
+    input_by_head = input_workspace.view(output_rank, heads_per_group, nope_dim)
+    output_by_head = output_workspace.view(output_rank, heads_per_group, nope_dim)
+    for group_id in range(num_local_groups):
+        input_by_head.copy_(weight_by_head[group_id, :, :, :nope_dim])
+        torch.mm(input_workspace, rotation, out=output_workspace)
+        weight_by_head[group_id, :, :, :nope_dim].copy_(output_by_head)
 
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
@@ -383,6 +508,126 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 )
 
 
+def _get_bcg_static_forward_batch(
+    captured_forward_batch: "ForwardBatch",
+) -> "ForwardBatch":
+    """Prefer the current bucket-padded batch during BCG replay.
+
+    Eager-break closures retain their capture-time Python arguments. Tensor
+    inputs remain valid because capture and replay share static storage, but a
+    ``ForwardBatch`` scalar such as ``num_token_non_padded_cpu`` does not. The
+    prefill runner publishes its current static batch in the piecewise context;
+    decode BCG can omit that context, so keep the captured batch as fallback.
+    """
+    context = get_tc_piecewise_forward_context()
+    if context is not None and context.forward_batch is not None:
+        return context.forward_batch
+    return captured_forward_batch
+
+
+def _get_bcg_runtime_forward_batch(
+    captured_forward_batch: "ForwardBatch",
+) -> "ForwardBatch":
+    """Return the original unpadded serving batch when one is published."""
+    context = get_tc_piecewise_forward_context()
+    if context is not None:
+        runtime_forward_batch = getattr(context, "runtime_forward_batch", None)
+        if runtime_forward_batch is not None:
+            return runtime_forward_batch
+    return _get_bcg_static_forward_batch(captured_forward_batch)
+
+
+def deepseek_v4_attention_bcg(
+    query: torch.Tensor,
+    key_value: torch.Tensor,
+    output: torch.Tensor,
+    attention_backend,
+    attention_layer,
+    forward_batch: "ForwardBatch",
+    compress_ratio: int,
+    attn_sink: torch.Tensor,
+    save_kv_cache: bool,
+) -> None:
+    """Run DSV4 attention at a BCG break with explicit runtime context.
+
+    Prefill BCG publishes its replay-time batch through the TC-piecewise
+    context, while decode BCG does not always install that context. Resolve
+    the live prefill metadata when present and retain the captured batch as a
+    decode fallback. Mutating a capture-sized output keeps the bridge shape
+    stable when replay pads a short prefill tail to a larger graph bucket.
+    """
+    forward_batch = _get_bcg_static_forward_batch(forward_batch)
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    query = query[:real_num_tokens]
+    key_value = key_value[:real_num_tokens]
+
+    original_out_cache_loc = forward_batch.out_cache_loc
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    try:
+        ret = attention_backend.forward(
+            q=query,
+            k=key_value,
+            v=key_value,
+            layer=attention_layer,
+            forward_batch=forward_batch,
+            compress_ratio=compress_ratio,
+            attn_sink=attn_sink,
+            save_kv_cache=save_kv_cache,
+        )
+    finally:
+        forward_batch.out_cache_loc = original_out_cache_loc
+
+    assert output[:real_num_tokens].numel() == ret.numel(), (
+        "Output tensor element mismatch: "
+        f"{output[:real_num_tokens].numel()} != {ret.numel()}"
+    )
+    output[:real_num_tokens].view(ret.shape).copy_(ret)
+
+
+bcg_deepseek_v4_attention = eager_on_graph(True)(deepseek_v4_attention_bcg)
+
+
+def deepseek_v4_attention_module_bcg(
+    attention_module: nn.Module,
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    forward_batch: "ForwardBatch",
+    x_quant: Optional[torch.Tensor],
+) -> None:
+    """Run the complete live-token attention module at one BCG break.
+
+    Query/KV preparation writes the SWA and compressed caches before the
+    narrower attention break. It therefore must not see graph-bucket padding:
+    token-axis graph buffers zero-pad cache locations, which would alias every
+    padded write onto slot zero. Keep a capture-sized output bridge for the
+    following graph segment, but execute the module on live rows only.
+    """
+    forward_batch = _get_bcg_runtime_forward_batch(forward_batch)
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+    real_positions = (
+        positions[..., :real_num_tokens]
+        if positions.ndim > 1
+        else positions[:real_num_tokens]
+    )
+    ret = attention_module(
+        x=x[:real_num_tokens],
+        positions=real_positions,
+        forward_batch=forward_batch,
+        x_quant=(x_quant[:real_num_tokens] if x_quant is not None else None),
+    )
+    assert output[:real_num_tokens].numel() == ret.numel(), (
+        "Output tensor element mismatch: "
+        f"{output[:real_num_tokens].numel()} != {ret.numel()}"
+    )
+    output[:real_num_tokens].view(ret.shape).copy_(ret)
+
+
+bcg_deepseek_v4_attention_module = eager_on_graph(True)(
+    deepseek_v4_attention_module_bcg
+)
+
+
 def deepseek_v4_moe_ffn_bcg(
     decoder_layer: nn.Module,
     hidden_states: torch.Tensor,
@@ -391,6 +636,7 @@ def deepseek_v4_moe_ffn_bcg(
     input_ids_global: torch.Tensor,
 ) -> torch.Tensor:
     """Run MoE dispatch, experts, combine, and collectives at one BCG break."""
+    forward_batch = _get_bcg_static_forward_batch(forward_batch)
     # Replay happens after the per-layer Python context has exited.  Restore
     # that scope so route recording indexes the correct layer.
     with get_global_expert_distribution_recorder().with_current_layer_if_absent(
@@ -781,14 +1027,36 @@ class MQALayer(MqaAttentionBase):
         token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        from sglang.srt.layers.attention.dsv4.oscar_int2_capture import (
+            capture_should_materialize,
+        )
+
+        capture_unrotated_kv = capture_should_materialize(
+            forward_batch,
+            target_model=getattr(self, "_dsv4_oscar_capture_target", False),
+        )
         if (
-            envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get()
+            capture_unrotated_kv
+            or envs.SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get()
             or token_to_kv_pool.swa_kv_pool.use_bf16_cache
         ):
             # Quantize the nope payload from bf16-rounded values (the fused
             # kernel quantizes from fp32 registers; the bf16 rounding moves
             # values across fp8 bins relative to bf16-sourced consumers).
             kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+            if capture_unrotated_kv:
+                from sglang.srt.layers.attention.dsv4.oscar_int2_capture import (
+                    maybe_capture_swa_latent,
+                )
+
+                maybe_capture_swa_latent(
+                    layer_id=self.layer_id,
+                    shared_kv=kv,
+                    forward_batch=forward_batch,
+                    target_model=True,
+                    tp_rank=self.attn_tp_rank,
+                    tp_size=self.attn_tp_size,
+                )
             attn_backend.store_cache(
                 layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
             )
@@ -1271,6 +1539,21 @@ class MQALayer(MqaAttentionBase):
                 x_quant=x_quant,
             )
 
+        from sglang.srt.layers.attention.dsv4.oscar_int2_capture import (
+            capture_configured,
+            maybe_capture_attention_query_nope,
+        )
+
+        if capture_configured():
+            maybe_capture_attention_query_nope(
+                layer_id=self.layer_id,
+                query=q[:, : self.n_local_heads],
+                forward_batch=forward_batch,
+                target_model=getattr(self, "_dsv4_oscar_capture_target", False),
+                tp_rank=self.attn_tp_rank,
+                tp_size=self.attn_tp_size,
+            )
+
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
         # (no DSA-CP), pass `q` as a sentinel for the `k is v` assert; the
@@ -1294,15 +1577,17 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if is_in_breakable_cuda_graph() and not _CAPTURE_DSV4_ATTENTION_IN_BCG:
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
-                bcg_deepseek_v4_attention_with_output(
+                bcg_deepseek_v4_attention(
                     attn_q,
                     attn_k,
                     o,
-                    self.attn_mqa.layer_id,
+                    attn_backend,
+                    self.attn_mqa,
+                    forward_batch,
                     self.compress_ratio,
                     attn_sink,
                     save_kv_cache,
@@ -1343,7 +1628,6 @@ class MQALayer(MqaAttentionBase):
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
-
             from sglang.srt.layers import deep_gemm_wrapper
 
             T, G, D = o.shape
@@ -1421,6 +1705,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_streams=None if _is_npu else alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
+        # Calibration observes only the 43-layer target model.  NextN/DSpark
+        # forwards reuse layer IDs and compatible tensor shapes, so failing to
+        # bind this role explicitly would silently mix draft observations into
+        # the target covariance.
+        self.self_attn._dsv4_oscar_capture_target = not is_nextn
+        compressor = getattr(self.self_attn, "compressor", None)
+        if compressor is not None:
+            compressor._dsv4_oscar_capture_target = not is_nextn
+        indexer = getattr(self.self_attn, "indexer", None)
+        if indexer is not None:
+            indexer._dsv4_oscar_capture_target = not is_nextn
+            indexer.compressor._dsv4_oscar_capture_target = not is_nextn
         moe_alt_stream = (
             alt_streams[0]
             if (
@@ -1718,12 +2014,28 @@ class DeepseekV4DecoderLayer(nn.Module):
                 x_quant = None
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            hidden_states = self.self_attn(
-                x=hidden_states,
-                positions=positions,
-                forward_batch=forward_batch,
-                x_quant=x_quant,
-            )
+            if (
+                is_in_breakable_cuda_graph()
+                and _EAGER_DSV4_ATTENTION_MODULE_IN_BCG
+                and not _CAPTURE_DSV4_ATTENTION_IN_BCG
+            ):
+                attention_output = torch.empty_like(hidden_states)
+                bcg_deepseek_v4_attention_module(
+                    self.self_attn,
+                    hidden_states,
+                    positions,
+                    attention_output,
+                    forward_batch,
+                    x_quant,
+                )
+                hidden_states = attention_output
+            else:
+                hidden_states = self.self_attn(
+                    x=hidden_states,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    x_quant=x_quant,
+                )
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -2566,10 +2878,255 @@ class DeepseekV4ForCausalLM(nn.Module):
         # mid-serving (RL refit sends many partial batches); the prewarm and
         # its barrier must only run on the first (startup) load.
         self._mhc_prewarmed_at_load = False
+        # Filled exactly once after the admitted target KV pool exists.  The
+        # draft model never owns these bindings because its OSCAR contract is
+        # protected-SWA-only.
+        self._dsv4_oscar_wo_a_pool: Any = None
+        self._dsv4_oscar_wo_a_bindings: dict[
+            int, _Dsv4OscarWoAOutputRotationBinding
+        ] = {}
+        self._dsv4_oscar_wo_a_expected_layer_ids: tuple[int, ...] = ()
+        self._dsv4_oscar_wo_a_apply_count = 0
 
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
+
+    def _validate_dsv4_oscar_wo_a_output_rotation_bindings(self) -> None:
+        pool = self._dsv4_oscar_wo_a_pool
+        if pool is None:
+            raise RuntimeError("OSCAR wo_a output rotation has not been absorbed")
+        if not bool(getattr(pool, "use_oscar_int2_storage", False)):
+            raise RuntimeError("OSCAR wo_a binding outlived its admitted KV pool")
+        if (
+            getattr(pool, "oscar_consumer_role", None)
+            != _DSV4_OSCAR_TARGET_CONSUMER_ROLE
+        ):
+            raise RuntimeError("OSCAR wo_a absorption is target-compressed-only")
+
+        expected = self._dsv4_oscar_wo_a_expected_layer_ids
+        if tuple(sorted(self._dsv4_oscar_wo_a_bindings)) != expected:
+            raise RuntimeError("OSCAR wo_a binding coverage changed after admission")
+        artifact_sha256 = str(getattr(pool, "oscar_artifact_sha256", ""))
+        admission_sha256 = str(getattr(pool, "oscar_admission_sha256", ""))
+        for layer_id in expected:
+            attention = self.model.layers[layer_id].self_attn
+            binding = self._dsv4_oscar_wo_a_bindings[layer_id]
+            calibration = pool.get_oscar_calibration(layer_id)
+            if binding.layer_id != layer_id or calibration.layer_id != layer_id:
+                raise RuntimeError("OSCAR wo_a binding has the wrong model layer")
+            if binding.rotation is not calibration.rotation:
+                raise RuntimeError("OSCAR wo_a binding rotation object changed")
+            if binding.weight is not attention.wo_a.weight:
+                raise RuntimeError("OSCAR wo_a bound parameter object changed")
+            if binding.weight._version != binding.weight_version:
+                raise RuntimeError(
+                    f"OSCAR-folded wo_a for layer {layer_id} was mutated after setup"
+                )
+            if (
+                binding.artifact_sha256 != artifact_sha256
+                or binding.admission_sha256 != admission_sha256
+            ):
+                raise RuntimeError("OSCAR wo_a artifact/admission binding changed")
+            if binding.consumer_role != _DSV4_OSCAR_TARGET_CONSUMER_ROLE:
+                raise RuntimeError("OSCAR wo_a binding has a non-target consumer role")
+            if (
+                getattr(
+                    attention.attn_mqa,
+                    "_dsv4_oscar_wo_a_output_rotation_binding",
+                    None,
+                )
+                is not binding
+            ):
+                raise RuntimeError("OSCAR attention lost its wo_a absorption binding")
+
+    def get_dsv4_oscar_wo_a_absorption_state(self) -> dict[str, Any]:
+        """Return authoritative, JSON-safe proof for ``/server_info`` wiring."""
+
+        self._validate_dsv4_oscar_wo_a_output_rotation_bindings()
+        layer_ids = list(self._dsv4_oscar_wo_a_expected_layer_ids)
+        pool = self._dsv4_oscar_wo_a_pool
+        return {
+            "enabled": True,
+            "consumer_role": _DSV4_OSCAR_TARGET_CONSUMER_ROLE,
+            "target_only": True,
+            "applied": True,
+            "apply_count": self._dsv4_oscar_wo_a_apply_count,
+            "artifact_sha256": str(pool.oscar_artifact_sha256),
+            "admission_sha256": str(pool.oscar_admission_sha256),
+            "expected_local_compressed_layer_ids": layer_ids,
+            "absorbed_local_layer_ids": layer_ids,
+            "runtime_restore_skipped_layer_ids": layer_ids,
+            "all_local_target_compressed_layers_absorbed": True,
+            "all_local_target_compressed_layers_skip_runtime_restore": True,
+            "weight_dtype": "bfloat16",
+            "head_layout": "per-head-nope448-rope64",
+            "fold_orientation": "wo_a_nope@rotation",
+            "rope_columns_unchanged": True,
+        }
+
+    @torch.no_grad()
+    def absorb_dsv4_oscar_output_rotation_into_wo_a(
+        self, token_to_kv_pool: Any
+    ) -> dict[str, Any]:
+        """Apply the admitted target's per-layer fold once, before warmup.
+
+        The complete plan is validated before the first weight is touched.  A
+        second call is an allocation-free validation of the original binding,
+        never a second multiplication by ``R``.
+        """
+
+        if self._dsv4_oscar_wo_a_pool is not None:
+            if token_to_kv_pool is not self._dsv4_oscar_wo_a_pool:
+                raise RuntimeError(
+                    "OSCAR wo_a absorption cannot be rebound to a new pool"
+                )
+            return self.get_dsv4_oscar_wo_a_absorption_state()
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("OSCAR wo_a absorption is forbidden in CUDA capture")
+        if not bool(getattr(token_to_kv_pool, "use_oscar_int2_storage", False)):
+            raise RuntimeError("OSCAR wo_a absorption requires an admitted OSCAR pool")
+        if bool(getattr(token_to_kv_pool, "is_draft_worker", False)):
+            raise RuntimeError(
+                "OSCAR draft is SWA-only; draft wo_a must remain unchanged"
+            )
+        if (
+            getattr(token_to_kv_pool, "oscar_consumer_role", None)
+            != _DSV4_OSCAR_TARGET_CONSUMER_ROLE
+        ):
+            raise RuntimeError("OSCAR wo_a absorption requires target_compressed role")
+        if _FP8_WO_A_GEMM:
+            raise RuntimeError("OSCAR SM86 wo_a absorption requires the BF16 wo_a path")
+
+        artifact_sha256 = str(
+            getattr(token_to_kv_pool, "oscar_artifact_sha256", "")
+        )
+        admission_sha256 = str(
+            getattr(token_to_kv_pool, "oscar_admission_sha256", "")
+        )
+        if len(artifact_sha256) != 64 or len(admission_sha256) != 64:
+            raise RuntimeError(
+                "OSCAR wo_a absorption requires admitted SHA-256 bindings"
+            )
+
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        compression_ratios = token_to_kv_pool.compression_ratios
+        expected_layer_ids = tuple(
+            layer_id
+            for layer_id in range(self.model.start_layer, self.model.end_layer)
+            if compression_ratios[layer_id] != 0
+        )
+        plans: list[_Dsv4OscarWoAFoldPlan] = []
+        seen_weight_ptrs: set[int] = set()
+        workspace_shape: tuple[int, int] | None = None
+        for layer_id in expected_layer_ids:
+            layer = self.model.layers[layer_id]
+            attention = layer.self_attn
+            ratio = compression_ratios[layer_id]
+            if ratio not in (4, 128) or attention.compress_ratio != ratio:
+                raise RuntimeError(
+                    f"OSCAR layer {layer_id} compression binding mismatch: "
+                    f"pool={ratio}, model={attention.compress_ratio}"
+                )
+            calibration = token_to_kv_pool.get_oscar_calibration(layer_id)
+            if calibration.layer_id != layer_id:
+                raise RuntimeError("OSCAR calibration is bound to the wrong layer")
+            weight = attention.wo_a.weight
+            if (
+                weight.dtype != torch.bfloat16
+                or not weight.is_cuda
+                or not weight.is_contiguous()
+            ):
+                raise RuntimeError(
+                    f"OSCAR layer {layer_id} wo_a must be contiguous CUDA BF16"
+                )
+            if torch.cuda.get_device_capability(weight.device) != (8, 6):
+                raise RuntimeError("OSCAR wo_a absorption is implemented only on SM86")
+            if not isinstance(attention.wo_a.quant_method, UnquantizedLinearMethod):
+                raise TypeError(
+                    "OSCAR wo_a absorption requires unquantized BF16 wo_a"
+                )
+            if calibration.rotation.dtype != torch.bfloat16:
+                raise RuntimeError("OSCAR shared-latent rotation must be BF16")
+            if calibration.rotation.device != weight.device:
+                raise RuntimeError("OSCAR rotation and wo_a must share one CUDA device")
+            if weight.data_ptr() in seen_weight_ptrs:
+                raise RuntimeError(
+                    "OSCAR compressed layers unexpectedly share wo_a storage"
+                )
+            seen_weight_ptrs.add(weight.data_ptr())
+
+            heads_per_group = attention.n_heads // attention.n_groups
+            plan_workspace_shape = (
+                attention.o_lora_rank * heads_per_group,
+                _DSV4_OSCAR_NOPE_DIM,
+            )
+            if workspace_shape is None:
+                workspace_shape = plan_workspace_shape
+            elif workspace_shape != plan_workspace_shape:
+                raise RuntimeError("OSCAR compressed layers disagree on wo_a layout")
+            plans.append(
+                _Dsv4OscarWoAFoldPlan(
+                    layer_id=layer_id,
+                    attention=attention,
+                    calibration=calibration,
+                    weight=weight,
+                    num_local_groups=attention.n_local_groups,
+                    output_rank=attention.o_lora_rank,
+                    heads_per_group=heads_per_group,
+                )
+            )
+
+        if not plans:
+            raise RuntimeError("OSCAR target stage owns no compressed layers to absorb")
+        assert workspace_shape is not None
+        template = plans[0].weight
+        input_workspace = torch.empty(
+            workspace_shape, dtype=template.dtype, device=template.device
+        )
+        output_workspace = torch.empty_like(input_workspace)
+        for plan in plans:
+            _fold_dsv4_oscar_output_rotation_into_wo_a_weight_(
+                plan.weight,
+                plan.calibration.rotation,
+                num_local_groups=plan.num_local_groups,
+                output_rank=plan.output_rank,
+                heads_per_group=plan.heads_per_group,
+                input_workspace=input_workspace,
+                output_workspace=output_workspace,
+            )
+        torch.cuda.synchronize(template.device)
+
+        bindings: dict[int, _Dsv4OscarWoAOutputRotationBinding] = {}
+        for plan in plans:
+            binding = _Dsv4OscarWoAOutputRotationBinding(
+                layer_id=plan.layer_id,
+                artifact_sha256=artifact_sha256,
+                admission_sha256=admission_sha256,
+                rotation=plan.calibration.rotation,
+                weight=plan.weight,
+                weight_version=plan.weight._version,
+                consumer_role=_DSV4_OSCAR_TARGET_CONSUMER_ROLE,
+            )
+            plan.attention.attn_mqa._dsv4_oscar_wo_a_output_rotation_binding = (
+                binding
+            )
+            bindings[plan.layer_id] = binding
+
+        self._dsv4_oscar_wo_a_pool = token_to_kv_pool
+        self._dsv4_oscar_wo_a_bindings = bindings
+        self._dsv4_oscar_wo_a_expected_layer_ids = expected_layer_ids
+        self._dsv4_oscar_wo_a_apply_count = 1
+        state = self.get_dsv4_oscar_wo_a_absorption_state()
+        logger.info(
+            "Absorbed DSV4 OSCAR inverse output rotations into BF16 wo_a for "
+            "%d target-compressed layers (artifact=%s admission=%s)",
+            len(expected_layer_ids),
+            artifact_sha256,
+            admission_sha256,
+        )
+        return state
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
@@ -2841,6 +3398,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        if self._dsv4_oscar_wo_a_pool is not None:
+            raise RuntimeError(
+                "hot weight reload is disabled after OSCAR wo_a output-rotation "
+                "absorption; reloading unrotated checkpoint weights would invalidate "
+                "the captured no-restore path"
+            )
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 

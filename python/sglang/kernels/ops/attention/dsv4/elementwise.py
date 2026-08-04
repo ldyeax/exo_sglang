@@ -52,10 +52,17 @@ def _jit_main_k_norm_rope_flashmla_module(
     rope_dim: int,
     page_size: int,
     bf16_store: bool,
+    int4_store: bool,
 ):
     """Main MLA path K kernel: rmsnorm + RoPE + write to FlashMLA paged cache."""
     args = make_cpp_args(
-        dtype, head_dim, rope_dim, page_size, is_arch_support_pdl(), bf16_store
+        dtype,
+        head_dim,
+        rope_dim,
+        page_size,
+        is_arch_support_pdl(),
+        bf16_store,
+        int4_store,
     )
     return load_jit(
         make_name("main_k_norm_rope_flashmla"),
@@ -295,7 +302,11 @@ def fused_k_norm_rope_flashmla(
     out_loc: torch.Tensor,
     kvcache: torch.Tensor,
     page_size: int,
+    bf16_store: bool,
+    int4_store: bool = False,
 ) -> None:
+    if bf16_store and int4_store:
+        raise ValueError("BF16 and INT4 DSV4 cache stores are mutually exclusive")
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]
@@ -304,6 +315,7 @@ def fused_k_norm_rope_flashmla(
         head_dim,
         rope_dim,
         page_size,
-        torch.cuda.get_device_capability() < (8, 9),
+        bf16_store,
+        int4_store,
     )
     module.forward(kv, kv_weight, freqs_real, positions, out_loc, kvcache, eps)

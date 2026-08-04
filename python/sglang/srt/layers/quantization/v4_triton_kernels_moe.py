@@ -34,8 +34,11 @@ Force-override env (diagnostic only):
 
 from __future__ import annotations
 
-import os
 import logging
+import os
+from dataclasses import replace
+from functools import wraps
+from inspect import Parameter, signature
 from typing import Optional, Tuple
 
 import torch
@@ -43,6 +46,280 @@ import triton
 import triton.language as tl
 
 logger = logging.getLogger(__name__)
+
+_SMALL_ROW_ROUTING_ENV = "SGLANG_V4_MXFP4_SMALL_ROW_ROUTING"
+# The variable-width residency campaign admits at most twenty-two local GPU
+# experts (g14 plus eight selectively promoted experts).
+# Keep the tiny router valid for every layer width under that ceiling; width is
+# a compile-time specialization, while route values remain graph-replay dynamic.
+_SMALL_ROW_ROUTING_MAX_EXPERTS = 22
+_SMALL_ROW_ROUTING_TOP_K = 6
+_SMALL_ROW_ROUTING_PADDED_TOP_K = 8
+_SMALL_ROW_ROUTING_MAX_ROWS = 6
+_SMALL_ROW_ROUTING_BLOCK_M_VALUES = (16, 32, 64, 128)
+_SM86_SMALL_BATCH_GEMM_ENV = "SGLANG_V4_MXFP4_SM86_SMALL_BATCH_GEMM"
+_SM86_SMALL_BATCH_GEMM_BLOCK_N = 128
+_SM86_SMALL_BATCH_GEMM_SPLIT_K = 2
+_SM86_SMALL_BATCH_GEMM_NUM_STAGES = 4
+_SM86_SMALL_BATCH_GEMM_NUM_WARPS = 4
+_SM86_SMALL_BATCH_GEMM_EXPECTED_PARAMETERS = (
+    "out_dtype",
+    "lhs_dtype",
+    "rhs_dtype",
+    "precision_config",
+    "m",
+    "n",
+    "k",
+    "routing_data",
+    "can_use_persistent_tma",
+    "can_use_fused_scatter",
+    "enforce_bitwise_invariance",
+    "epilogue_effective_itemsize",
+    "constraints",
+)
+
+# These counters live in each scheduler process.  They record Python-side
+# specialization selection, which happens while the CUDA-graph kernels are
+# compiled/captured; graph replay intentionally does not re-enter Python.
+_sm86_small_batch_gemm_patch_state = "not_attempted"
+_sm86_small_batch_gemm_patch_error: Optional[str] = None
+_sm86_small_batch_gemm_selection_counts: dict[tuple[int, int, int, int], int] = {}
+
+
+def _sm86_small_batch_gemm_enabled() -> bool:
+    return os.environ.get(_SM86_SMALL_BATCH_GEMM_ENV) == "1"
+
+
+def _set_sm86_small_batch_gemm_patch_failure(
+    state: str, error: BaseException | str
+) -> None:
+    global _sm86_small_batch_gemm_patch_error
+    global _sm86_small_batch_gemm_patch_state
+
+    _sm86_small_batch_gemm_patch_state = state
+    if isinstance(error, BaseException):
+        _sm86_small_batch_gemm_patch_error = f"{type(error).__name__}: {error}"
+    else:
+        _sm86_small_batch_gemm_patch_error = error
+
+
+def get_sm86_small_batch_gemm_telemetry() -> dict[str, object]:
+    """Return JSON/msgpack-safe proof of rank-local specialization selection."""
+
+    observed_signatures = []
+    for (m, n, k, local_experts), count in sorted(
+        _sm86_small_batch_gemm_selection_counts.items()
+    ):
+        observed_signatures.append(
+            {
+                "m": m,
+                "logical_rows": m // _SMALL_ROW_ROUTING_PADDED_TOP_K,
+                "n": n,
+                "k": k,
+                "local_experts": local_experts,
+                "selection_count": count,
+            }
+        )
+    return {
+        "configured": _sm86_small_batch_gemm_enabled(),
+        "patch_state": _sm86_small_batch_gemm_patch_state,
+        "patch_installed": _sm86_small_batch_gemm_patch_state == "installed",
+        "patch_error": _sm86_small_batch_gemm_patch_error,
+        "selection_count": sum(_sm86_small_batch_gemm_selection_counts.values()),
+        "observed_signatures": observed_signatures,
+        "selected_config": {
+            "block_n": _SM86_SMALL_BATCH_GEMM_BLOCK_N,
+            "split_k": _SM86_SMALL_BATCH_GEMM_SPLIT_K,
+            "num_stages": _SM86_SMALL_BATCH_GEMM_NUM_STAGES,
+            "num_warps": _SM86_SMALL_BATCH_GEMM_NUM_WARPS,
+        },
+        "expected_call_parameters": list(_SM86_SMALL_BATCH_GEMM_EXPECTED_PARAMETERS),
+    }
+
+
+def _sm86_small_batch_gemm_matches_dispatch(
+    *,
+    rhs_dtype,
+    precision_config,
+    m: int,
+    n: int,
+    k: int,
+    routing_data,
+) -> bool:
+    """Match the measured model/architecture dispatch, excluding opt-in state."""
+
+    from triton_kernels.tensor import FP4
+
+    return (
+        torch.cuda.is_available()
+        and torch.cuda.get_device_capability() == (8, 6)
+        and rhs_dtype == FP4
+        and getattr(precision_config, "weight_scale", None) is not None
+        and n == 4096
+        and k in (2048, 4096)
+        and m in (8, 16, 24, 32, 40, 48)
+        and routing_data is not None
+        and 6 <= getattr(routing_data, "n_expts_tot", 0) <= 22
+        and getattr(routing_data, "n_expts_act", None) == 8
+        and getattr(routing_data, "expt_data", None) is not None
+    )
+
+
+def _sm86_small_batch_gemm_is_eligible(
+    *,
+    rhs_dtype,
+    precision_config,
+    m: int,
+    n: int,
+    k: int,
+    routing_data,
+    constraints: dict,
+) -> bool:
+    """Admit only the measured V4-Flash target/draft decode GEMMs.
+
+    ``matmul_ogs`` sees the padded top-8 gather dimension as M.  Consequently
+    M=8..48 corresponds exactly to one through six verification rows.  The
+    N/K signatures below are the checkpoint's W13 and W2 matrices; constraining
+    every dimension prevents this package-level flag patch from changing
+    unrelated MoE, prefill, or dense matmuls.
+    """
+    return (
+        _sm86_small_batch_gemm_enabled()
+        and _sm86_small_batch_gemm_matches_dispatch(
+            rhs_dtype=rhs_dtype,
+            precision_config=precision_config,
+            m=m,
+            n=n,
+            k=k,
+            routing_data=routing_data,
+        )
+        # Respect diagnostic package constraints instead of silently
+        # overriding them.  The V4 strided-layout patch contributes only the
+        # required non-persistent constraint in production.
+        and constraints == {"is_persistent": False}
+    )
+
+
+def _install_sm86_small_batch_gemm_patch(opt_flags_module) -> bool:
+    """Install the exact pinned opt-flags wrapper, or fail closed when enabled.
+
+    This is deliberately a separately testable boundary.  The upstream helper
+    is package-private and has changed signatures between triton_kernels
+    releases; silently retaining its heuristic after an incompatible upgrade
+    makes the launcher's opt-in flag and benchmark provenance false.
+    """
+
+    global _sm86_small_batch_gemm_patch_error
+    global _sm86_small_batch_gemm_patch_state
+
+    if getattr(opt_flags_module, "_v4_sm86_small_batch_gemm_patched", False):
+        _sm86_small_batch_gemm_patch_state = "installed"
+        _sm86_small_batch_gemm_patch_error = None
+        return True
+
+    original = getattr(opt_flags_module, "make_default_opt_flags_nvidia", None)
+    if original is None:
+        message = "triton_kernels is missing make_default_opt_flags_nvidia"
+        state = (
+            "incompatible" if _sm86_small_batch_gemm_enabled() else "disabled_fallback"
+        )
+        _set_sm86_small_batch_gemm_patch_failure(state, message)
+        if _sm86_small_batch_gemm_enabled():
+            raise RuntimeError(message)
+        return False
+
+    parameters = tuple(signature(original).parameters.values())
+    parameter_names = tuple(parameter.name for parameter in parameters)
+    positional_only_or_keyword = all(
+        parameter.kind in (Parameter.POSITIONAL_ONLY, Parameter.POSITIONAL_OR_KEYWORD)
+        for parameter in parameters
+    )
+    if (
+        parameter_names != _SM86_SMALL_BATCH_GEMM_EXPECTED_PARAMETERS
+        or not positional_only_or_keyword
+    ):
+        message = (
+            "incompatible triton_kernels make_default_opt_flags_nvidia "
+            f"signature: expected {_SM86_SMALL_BATCH_GEMM_EXPECTED_PARAMETERS}, "
+            f"got {parameter_names}"
+        )
+        state = (
+            "incompatible" if _sm86_small_batch_gemm_enabled() else "disabled_fallback"
+        )
+        _set_sm86_small_batch_gemm_patch_failure(state, message)
+        if _sm86_small_batch_gemm_enabled():
+            raise RuntimeError(message)
+        return False
+
+    @wraps(original)
+    def make_default_opt_flags_nvidia_v4(*args, **kwargs):
+        if len(args) != len(_SM86_SMALL_BATCH_GEMM_EXPECTED_PARAMETERS) or kwargs:
+            if _sm86_small_batch_gemm_enabled():
+                message = (
+                    "SM86 V4 MXFP4 small-batch specialization received an "
+                    "incompatible opt-flags call; expected thirteen positional "
+                    f"arguments, got {len(args)} positional and "
+                    f"{tuple(kwargs)} keyword arguments"
+                )
+                _set_sm86_small_batch_gemm_patch_failure(
+                    "dispatch_incompatible", message
+                )
+                raise RuntimeError(message)
+            return original(*args, **kwargs)
+
+        dispatch_matches = _sm86_small_batch_gemm_matches_dispatch(
+            rhs_dtype=args[2],
+            precision_config=args[3],
+            m=args[4],
+            n=args[5],
+            k=args[6],
+            routing_data=args[7],
+        )
+        specialization_enabled = _sm86_small_batch_gemm_enabled()
+        if (
+            dispatch_matches
+            and specialization_enabled
+            and args[12] != {"is_persistent": False}
+        ):
+            message = (
+                "SM86 V4 MXFP4 small-batch dispatch constraints drifted: "
+                f"expected {{'is_persistent': False}}, got {args[12]!r}"
+            )
+            _set_sm86_small_batch_gemm_patch_failure("dispatch_incompatible", message)
+            raise RuntimeError(message)
+
+        selected = original(*args)
+        if not dispatch_matches or not specialization_enabled:
+            return selected
+
+        specialized = replace(
+            selected,
+            block_n=_SM86_SMALL_BATCH_GEMM_BLOCK_N,
+            split_k=_SM86_SMALL_BATCH_GEMM_SPLIT_K,
+            num_stages=_SM86_SMALL_BATCH_GEMM_NUM_STAGES,
+            num_warps=_SM86_SMALL_BATCH_GEMM_NUM_WARPS,
+        )
+        local_experts = int(args[7].n_expts_tot)
+        dispatch_signature = (int(args[4]), int(args[5]), int(args[6]), local_experts)
+        _sm86_small_batch_gemm_selection_counts[dispatch_signature] = (
+            _sm86_small_batch_gemm_selection_counts.get(dispatch_signature, 0) + 1
+        )
+        if not getattr(opt_flags_module, "_v4_sm86_small_batch_gemm_logged", False):
+            logger.info(
+                "V4 MXFP4 SM86 small-batch GEMM enabled: "
+                "block_n=%d split_k=%d stages=%d",
+                _SM86_SMALL_BATCH_GEMM_BLOCK_N,
+                _SM86_SMALL_BATCH_GEMM_SPLIT_K,
+                _SM86_SMALL_BATCH_GEMM_NUM_STAGES,
+            )
+            opt_flags_module._v4_sm86_small_batch_gemm_logged = True
+        return specialized
+
+    opt_flags_module.make_default_opt_flags_nvidia = make_default_opt_flags_nvidia_v4
+    opt_flags_module._v4_sm86_small_batch_gemm_patched = True
+    _sm86_small_batch_gemm_patch_state = "installed"
+    _sm86_small_batch_gemm_patch_error = None
+    return True
 
 
 def use_v4_triton_kernels() -> bool:
@@ -76,8 +353,8 @@ def force_disable_v4_triton_kernels() -> bool:
 
 @triton.jit
 def _pack_bitmatrix_v4(
-    bitmatrix_ptr,      # uint32 [n_rows, bm_cols]
-    topk_ids_ptr,       # int16 [n_rows, n_expts_act]
+    bitmatrix_ptr,  # uint32 [n_rows, bm_cols]
+    topk_ids_ptr,  # int16 [n_rows, n_expts_act]
     n_rows,
     bm_cols: tl.constexpr,
     n_expts_act,
@@ -107,8 +384,256 @@ def _pack_bitmatrix_v4(
         tl.atomic_or(ptrs, (1 << bit).to(tl.uint32), mask=valid)
 
 
+@triton.jit
+def _pack_small_row_routing_v4(
+    topk_ids_ptr,
+    topk_weights_ptr,
+    gather_indices_ptr,
+    scatter_indices_ptr,
+    gate_scal_ptr,
+    expert_hist_ptr,
+    token_offsets_raw_ptr,
+    token_offsets_pad_ptr,
+    block_pid_map_ptr,
+    stride_ids_m,
+    stride_ids_k,
+    stride_weights_m,
+    stride_weights_k,
+    NUM_EXPERTS: tl.constexpr,
+    INPUT_TOP_K: tl.constexpr,
+    ROUTING_TOP_K: tl.constexpr,
+    NUM_GATES: tl.constexpr,
+    MAX_TILES: tl.constexpr,
+    BLOCK_G: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Build every tiny grouped-MoE routing tensor in one CUDA program."""
+    gate_positions = tl.arange(0, BLOCK_G)
+    gate_mask = gate_positions < NUM_GATES
+    token_rows = gate_positions // ROUTING_TOP_K
+    topk_columns = gate_positions - token_rows * ROUTING_TOP_K
+    input_mask = gate_mask & (topk_columns < INPUT_TOP_K)
+    route_ids = tl.load(
+        topk_ids_ptr + token_rows * stride_ids_m + topk_columns * stride_ids_k,
+        mask=input_mask,
+        other=-1,
+    ).to(tl.int32)
+    valid_routes = gate_mask & (route_ids >= 0) & (route_ids < NUM_EXPERTS)
+
+    # Sorting the combined (expert, original-position) key is stable by
+    # construction.  It exactly matches routing_from_bitmatrix's expert-major
+    # order while writing its logical top-8 padded index geometry directly.
+    sentinel_expert = 0x7FFF
+    sortable_experts = tl.where(valid_routes, route_ids, sentinel_expert)
+    sort_keys = (sortable_experts.to(tl.uint32) << 16) | gate_positions.to(tl.uint32)
+    sorted_keys = tl.sort(sort_keys)
+    sorted_experts = (sorted_keys >> 16).to(tl.int32)
+    sorted_positions = (sorted_keys & 0xFFFF).to(tl.int32)
+    sorted_valid = (gate_positions < NUM_GATES) & (sorted_experts < NUM_EXPERTS)
+
+    tl.store(
+        gather_indices_ptr + gate_positions,
+        tl.where(sorted_valid, sorted_positions, -1),
+        mask=gate_mask,
+    )
+    tl.store(scatter_indices_ptr + gate_positions, -1, mask=gate_mask)
+    tl.store(
+        scatter_indices_ptr + sorted_positions,
+        gate_positions,
+        mask=sorted_valid,
+    )
+    sorted_rows = sorted_positions // ROUTING_TOP_K
+    sorted_columns = sorted_positions - sorted_rows * ROUTING_TOP_K
+    sorted_weights = tl.load(
+        topk_weights_ptr
+        + sorted_rows * stride_weights_m
+        + sorted_columns * stride_weights_k,
+        mask=sorted_valid,
+        other=0.0,
+    ).to(tl.bfloat16)
+    tl.store(
+        gate_scal_ptr + gate_positions,
+        tl.where(sorted_valid, sorted_weights, 0.0),
+        mask=gate_mask,
+    )
+
+    experts = tl.arange(0, BLOCK_E)
+    expert_mask = experts < NUM_EXPERTS
+    route_matches = (sorted_experts[None, :] == experts[:, None]) & sorted_valid[
+        None, :
+    ]
+    expert_hist = tl.sum(route_matches.to(tl.int32), axis=1)
+    expert_offsets = tl.cumsum(expert_hist, axis=0) - expert_hist
+    valid_gate_count = tl.sum(expert_hist, axis=0)
+    tl.store(expert_hist_ptr + experts, expert_hist, mask=expert_mask)
+    tl.store(
+        token_offsets_raw_ptr + experts,
+        expert_offsets,
+        mask=expert_mask,
+    )
+    tl.store(token_offsets_raw_ptr + NUM_EXPERTS, valid_gate_count)
+
+    tile_positions = tl.arange(0, BLOCK_T)
+    for block_index in tl.static_range(0, 4):
+        expert_tiles = (expert_hist + (16 << block_index) - 1) // (16 << block_index)
+        expert_tile_offsets = tl.cumsum(expert_tiles, axis=0) - expert_tiles
+        total_tiles = tl.sum(expert_tiles, axis=0)
+        token_offsets_row = token_offsets_pad_ptr + block_index * (NUM_EXPERTS + 1)
+        tl.store(
+            token_offsets_row + experts,
+            expert_tile_offsets,
+            mask=expert_mask,
+        )
+        tl.store(token_offsets_row + NUM_EXPERTS, total_tiles)
+
+        owns_tile = (
+            (tile_positions[:, None] >= expert_tile_offsets[None, :])
+            & (tile_positions[:, None] < (expert_tile_offsets + expert_tiles)[None, :])
+            & expert_mask[None, :]
+        )
+        tile_expert = tl.sum(
+            tl.where(owns_tile, experts[None, :], 0),
+            axis=1,
+        )
+        tile_block = tile_positions - tl.sum(
+            tl.where(owns_tile, expert_tile_offsets[None, :], 0),
+            axis=1,
+        )
+        encoded_tile = (tile_block << 16) | tile_expert
+        map_mask = tile_positions < MAX_TILES
+        block_map_row = block_pid_map_ptr + block_index * MAX_TILES
+        tl.store(
+            block_map_row + tile_positions,
+            tl.where(tile_positions < total_tiles, encoded_tile, -1),
+            mask=map_mask,
+        )
+
+
+def _small_row_routing_is_eligible(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_local_experts: int,
+) -> bool:
+    """Return whether the opt-in fixed SM86 target-verify router applies."""
+    return (
+        os.environ.get(_SMALL_ROW_ROUTING_ENV) == "1"
+        and 1 <= num_local_experts <= _SMALL_ROW_ROUTING_MAX_EXPERTS
+        and topk_ids.ndim == 2
+        and topk_weights.ndim == 2
+        and topk_ids.shape == topk_weights.shape
+        and 1 <= topk_ids.shape[0] <= _SMALL_ROW_ROUTING_MAX_ROWS
+        and topk_ids.shape[1] == _SMALL_ROW_ROUTING_TOP_K
+        and topk_ids.device.type == "cuda"
+        and topk_weights.device == topk_ids.device
+        and torch.cuda.get_device_capability(topk_ids.device) == (8, 6)
+        # StandardTopKOutput is int32/FP32.  Keep the production specialization
+        # to that single compiled signature; other dtypes retain the baseline.
+        and topk_ids.dtype == torch.int32
+        and topk_weights.dtype == torch.float32
+    )
+
+
+def _make_small_row_routing_data_v4(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_local_experts: int,
+):
+    """Build exact top-6 routing in the baseline's padded top-8 geometry."""
+    from triton_kernels.routing import (
+        ExptData,
+        GatherIndx,
+        RoutingData,
+        ScatterIndx,
+    )
+
+    num_rows, input_top_k = topk_ids.shape
+    routing_top_k = _SMALL_ROW_ROUTING_PADDED_TOP_K
+    # Preserve the baseline router's logical top-8 geometry.  In particular,
+    # ScatterIndx uses row * 8 + column and GEMM2 reduces eight slots per row.
+    # Compacting this to six changes BF16 reduction association at M >= 5.
+    num_gates = num_rows * routing_top_k
+    if num_gates <= num_local_experts:
+        max_tiles = num_gates
+    else:
+        max_tiles = num_local_experts - 1 - ((num_local_experts - num_gates - 1) // 16)
+    device = topk_ids.device
+    gather_indices = torch.empty(num_gates, dtype=torch.int32, device=device)
+    scatter_indices = torch.empty_like(gather_indices)
+    gate_scal = torch.empty(num_gates, dtype=torch.bfloat16, device=device)
+    expert_hist = torch.empty(
+        num_local_experts,
+        dtype=torch.int32,
+        device=device,
+    )
+    token_offsets_raw = torch.empty(
+        num_local_experts + 1,
+        dtype=torch.int32,
+        device=device,
+    )
+    token_offsets_pad_storage = torch.empty(
+        (len(_SMALL_ROW_ROUTING_BLOCK_M_VALUES), num_local_experts + 1),
+        dtype=torch.int32,
+        device=device,
+    )
+    block_pid_map_storage = torch.empty(
+        (len(_SMALL_ROW_ROUTING_BLOCK_M_VALUES), max_tiles),
+        dtype=torch.int32,
+        device=device,
+    )
+    _pack_small_row_routing_v4[(1,)](
+        topk_ids,
+        topk_weights,
+        gather_indices,
+        scatter_indices,
+        gate_scal,
+        expert_hist,
+        token_offsets_raw,
+        token_offsets_pad_storage,
+        block_pid_map_storage,
+        topk_ids.stride(0),
+        topk_ids.stride(1),
+        topk_weights.stride(0),
+        topk_weights.stride(1),
+        NUM_EXPERTS=num_local_experts,
+        INPUT_TOP_K=input_top_k,
+        ROUTING_TOP_K=routing_top_k,
+        NUM_GATES=num_gates,
+        MAX_TILES=max_tiles,
+        BLOCK_G=triton.next_power_of_2(num_gates),
+        BLOCK_E=triton.next_power_of_2(num_local_experts),
+        BLOCK_T=triton.next_power_of_2(max_tiles),
+        num_warps=1,
+    )
+    token_offsets_pad = {
+        block_m: token_offsets_pad_storage[index]
+        for index, block_m in enumerate(_SMALL_ROW_ROUTING_BLOCK_M_VALUES)
+    }
+    block_pid_map = {
+        block_m: block_pid_map_storage[index]
+        for index, block_m in enumerate(_SMALL_ROW_ROUTING_BLOCK_M_VALUES)
+    }
+    expert_data = ExptData(
+        expert_hist,
+        token_offsets_raw,
+        token_offsets_pad,
+        block_pid_map,
+    )
+    return (
+        RoutingData(
+            gate_scal,
+            expert_hist,
+            num_local_experts,
+            routing_top_k,
+            expert_data,
+        ),
+        GatherIndx(gather_indices, scatter_indices),
+        ScatterIndx(scatter_indices, gather_indices),
+    )
+
+
 def _make_routing_data_v4(
-    topk_ids: torch.Tensor,    # [M, n_topk] int (any int dtype)
+    topk_ids: torch.Tensor,  # [M, n_topk] int (any int dtype)
     topk_weights: torch.Tensor,  # [M, n_topk] float
     num_local_experts: int,
 ):
@@ -127,6 +652,17 @@ def _make_routing_data_v4(
     convention). Pad cost is ~33% extra slot bookkeeping; gemm work is
     unchanged because invalid slots are not routed.
     """
+    if _small_row_routing_is_eligible(
+        topk_ids,
+        topk_weights,
+        num_local_experts,
+    ):
+        return _make_small_row_routing_data_v4(
+            topk_ids,
+            topk_weights,
+            num_local_experts,
+        )
+
     try:
         from triton_kernels.routing import routing_from_bitmatrix
     except ModuleNotFoundError:
@@ -225,8 +761,10 @@ def _make_routing_data_v4(
             (n_rows, pad_len), -1, dtype=torch.int16, device=topk_ids_i16.device
         )
         pad_w = torch.full(
-            (n_rows, pad_len), -1.0,
-            dtype=torch.bfloat16, device=topk_ids_i16.device,
+            (n_rows, pad_len),
+            -1.0,
+            dtype=torch.bfloat16,
+            device=topk_ids_i16.device,
         )
         topk_ids_i16 = torch.cat([topk_ids_i16, pad_ids], dim=1).contiguous()
         topk_weights_bf = torch.cat([topk_weights_bf, pad_w], dim=1).contiguous()
@@ -293,7 +831,7 @@ def _use_strided_layout() -> bool:
 
 
 def _patch_strided_mxfp():
-    """Strided-layout enablement for triton_kernels MXFP4 path. Two patches:
+    """Strided-layout enablement for triton_kernels MXFP4 path. Three patches:
 
     (1) `target_info.has_native_mxfp()` must return False on non-trtllm-
         whitelist capabilities so matmul_ogs takes the simulated MXFP non-
@@ -311,18 +849,33 @@ def _patch_strided_mxfp():
         M) auto-selects non-persistent so it works without this; prefill
         needs the explicit constraint.
 
+    (3) An opt-in exact-SM86 decode specialization replaces the package's
+        dense-grid split-K estimate with the real-weight-qualified block-N
+        128, split-K 2, four-stage point.  Its guards exclude prefill and all
+        non-V4 matrix shapes.
+
     Origin: sglang 本身 (triton_kernels package's Blackwell layout assumes
     SM_100 features; everything outside the trtllm whitelist falls in a
     similar gap)."""
     if not _use_strided_layout():
+        if _sm86_small_batch_gemm_enabled():
+            message = (
+                "SGLANG_V4_MXFP4_SM86_SMALL_BATCH_GEMM=1 requires the "
+                "SM86 strided-MXFP path"
+            )
+            _set_sm86_small_batch_gemm_patch_failure("incompatible", message)
+            raise RuntimeError(message)
         return
     import triton_kernels.target_info as target_info
+
     if not getattr(target_info, "_v4_strided_patched", False):
         original = target_info.has_native_mxfp
+
         def has_native_mxfp_strided():
             if _use_strided_layout():
                 return False
             return original()
+
         target_info.has_native_mxfp = has_native_mxfp_strided
         target_info._v4_strided_patched = True
     # opt_flags imports has_native_mxfp into its namespace at import time;
@@ -339,13 +892,13 @@ def _patch_strided_mxfp():
     # only place this can be neutralized without forking triton_kernels.
     try:
         import triton_kernels.matmul_ogs_details.opt_flags as _of
+
         if hasattr(_of, "has_native_mxfp"):
             _of.has_native_mxfp = target_info.has_native_mxfp
         _of.update_opt_flags_constraints({"is_persistent": False})
 
-        if (
-            hasattr(_of, "make_default_opt_flags_nvidia")
-            and not getattr(_of, "_v4_assert_patched", False)
+        if hasattr(_of, "make_default_opt_flags_nvidia") and not getattr(
+            _of, "_v4_assert_patched", False
         ):
             import inspect as _inspect
             import textwrap as _textwrap
@@ -369,8 +922,26 @@ def _patch_strided_mxfp():
                     _of._v4_make_default_opt_flags_nvidia
                 )
                 _of._v4_assert_patched = True
-    except Exception:
-        pass
+
+        _install_sm86_small_batch_gemm_patch(_of)
+    except Exception as error:
+        if _sm86_small_batch_gemm_patch_state not in {
+            "incompatible",
+            "dispatch_incompatible",
+        }:
+            _set_sm86_small_batch_gemm_patch_failure(
+                (
+                    "patch_error"
+                    if _sm86_small_batch_gemm_enabled()
+                    else "disabled_fallback"
+                ),
+                error,
+            )
+        if _sm86_small_batch_gemm_enabled():
+            raise RuntimeError(
+                "SGLANG_V4_MXFP4_SM86_SMALL_BATCH_GEMM=1 but the "
+                "triton_kernels specialization could not be installed"
+            ) from error
 
 
 def _swizzle_mxfp4_strided(quant_tensor: torch.Tensor, scale: torch.Tensor):
@@ -395,10 +966,10 @@ def _swizzle_mxfp4_strided(quant_tensor: torch.Tensor, scale: torch.Tensor):
 
 
 def convert_v4_weights_to_triton_kernels(
-    w13: torch.Tensor,        # [E, 2*N_int, K//2] int8 packed FP4
+    w13: torch.Tensor,  # [E, 2*N_int, K//2] int8 packed FP4
     w13_scale: torch.Tensor,  # [E, 2*N_int, K//group] float8_e8m0fnu (or uint8)
-    w2: torch.Tensor,         # [E, K, N_int//2] int8 packed FP4
-    w2_scale: torch.Tensor,   # [E, K, N_int//group] float8_e8m0fnu
+    w2: torch.Tensor,  # [E, K, N_int//2] int8 packed FP4
+    w2_scale: torch.Tensor,  # [E, K, N_int//group] float8_e8m0fnu
     *,
     num_warps: int = 4,
 ) -> Tuple:
@@ -446,6 +1017,7 @@ def convert_v4_weights_to_triton_kernels(
         # Reached only via the SGLANG_V4_USE_TRITON_KERNELS=1 force-override;
         # the default dispatch routes this capability to the trtllm path.
         from sglang.srt.layers.quantization.mxfp4 import _swizzle_mxfp4
+
         w13_swiz, w13_flex, w13_scale_swiz = _swizzle_mxfp4(w13, w13_scale, num_warps)
         w2_swiz, w2_flex, w2_scale_swiz = _swizzle_mxfp4(w2, w2_scale, num_warps)
 
@@ -468,17 +1040,18 @@ def convert_v4_weights_to_triton_kernels(
 
 def apply_v4_triton_kernels_moe(
     *,
-    hidden_states: torch.Tensor,    # [M, K] bf16
-    w13_swiz,                        # triton_kernels.Tensor (FP4) [E, K, 2*N]
-    w13_pcg,                         # PrecisionConfig
-    w2_swiz,                         # triton_kernels.Tensor (FP4) [E, N, K]
-    w2_pcg,                          # PrecisionConfig
-    topk_weights: torch.Tensor,     # [M, n_topk] bf16/float
-    topk_ids: torch.Tensor,         # [M, n_topk] int
-    intermediate_size: int,         # per-partition N
+    hidden_states: torch.Tensor,  # [M, K] bf16
+    w13_swiz,  # triton_kernels.Tensor (FP4) [E, K, 2*N]
+    w13_pcg,  # PrecisionConfig
+    w2_swiz,  # triton_kernels.Tensor (FP4) [E, N, K]
+    w2_pcg,  # PrecisionConfig
+    topk_weights: torch.Tensor,  # [M, n_topk] bf16/float
+    topk_ids: torch.Tensor,  # [M, n_topk] int
+    intermediate_size: int,  # per-partition N
     num_experts: int,
     routed_scaling_factor: float = 1.0,
     swiglu_limit: Optional[float] = None,
+    caller_output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run V4 sparse MoE through `triton_kernels.matmul_ogs`.
 
@@ -504,6 +1077,25 @@ def apply_v4_triton_kernels_moe(
 
     M, K = hidden_states.shape
     N = intermediate_size
+
+    gemm2_output = None
+    if caller_output is not None:
+        if (
+            caller_output.shape != hidden_states.shape
+            or caller_output.dtype != hidden_states.dtype
+            or caller_output.device != hidden_states.device
+            or not caller_output.is_contiguous()
+        ):
+            raise ValueError(
+                "V4 MXFP4 caller-owned output must be a contiguous tensor "
+                "matching hidden_states shape, dtype, and device"
+            )
+        # matmul_ogs uses a leading batch dimension for caller-owned output,
+        # then returns a squeezed view.  The KT hybrid path intentionally
+        # supplies hidden_states here: its CPU staging copy was enqueued first,
+        # and GEMM1 consumes the input before GEMM2 overwrites it on the same
+        # CUDA stream.
+        gemm2_output = caller_output.unsqueeze(0)
 
     # Build routing data from sglang topk → triton_kernels (RoutingData,
     # GatherIndx, ScatterIndx). Note: this rebuilds per-call. Cheap
@@ -546,7 +1138,10 @@ def apply_v4_triton_kernels_moe(
         scatter_indx=scatter_indx,
         precision_config=w2_pcg,
         gammas=routing_data.gate_scal,
+        y=gemm2_output,
     )
+    if caller_output is not None and output.data_ptr() != caller_output.data_ptr():
+        raise RuntimeError("V4 MXFP4 GEMM2 did not preserve caller-owned output")
 
     # routed_scaling_factor is NOT applied here; the caller
     # (mxfp4_deepseek.apply) handles it to stay consistent with the trtllm

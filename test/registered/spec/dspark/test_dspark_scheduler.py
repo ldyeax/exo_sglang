@@ -1,6 +1,7 @@
 import functools
 import types
 import unittest
+from unittest import mock
 
 import torch
 
@@ -9,10 +10,12 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
+    DSparkVerifyPlanner,
     HostConfidenceBudgetPlanner,
     VerifyBudgetDecision,
     compute_verify_token_budget,
     graph_tier_fill_budget,
+    uniform_verify_token_budget,
 )
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
@@ -223,6 +226,96 @@ class TestBudgetDecisionLifecycle(CustomTestCase):
         planner.last_decision = VerifyBudgetDecision(budget=1)
         planner.note_non_decode_step()
         self.assertIsNone(planner.take_last_decision())
+
+
+class TestUniformVerifyBudget(CustomTestCase):
+    def test_maps_tiers_two_through_six_to_exact_batch_budget(self):
+        for verify_len in range(2, 7):
+            with self.subTest(verify_len=verify_len):
+                self.assertEqual(
+                    uniform_verify_token_budget(
+                        num_requests=3,
+                        verify_len=verify_len,
+                        min_verify_len=1,
+                    ),
+                    3 * (verify_len - 1),
+                )
+
+    def test_respects_non_default_floor(self):
+        self.assertEqual(
+            uniform_verify_token_budget(
+                num_requests=4, verify_len=5, min_verify_len=2
+            ),
+            12,
+        )
+
+
+class TestForcedVerifyTier(CustomTestCase):
+    @staticmethod
+    def _planner(verify_len: int) -> DSparkVerifyPlanner:
+        planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+        planner._configured_forced_verify_len = None
+        planner._budget_planner = types.SimpleNamespace(
+            forced_verify_len=verify_len,
+            forced_budget_frac=None,
+            last_decision=None,
+        )
+        planner._schedule_cfg = DSparkScheduleConfig(gamma=5)
+        planner.verify_num_draft_tokens = 6
+        planner.server_args = types.SimpleNamespace(tp_size=1)
+        return planner
+
+    def test_first_cycle_without_confidence_gets_exact_forced_budget(self):
+        planner = self._planner(verify_len=3)
+        budget = planner._budget_from_resolved(
+            resolved=None,
+            req_pool_indices_cpu=torch.tensor([4, 7], dtype=torch.int64),
+        )
+
+        self.assertEqual(budget, 4)
+        self.assertEqual(planner._budget_planner.last_decision.budget, 4)
+
+    def test_first_cycle_without_confidence_gets_exact_forced_layout(self):
+        planner = self._planner(verify_len=3)
+        with mock.patch(
+            "sglang.srt.speculative.dspark_components.dspark_planner."
+            "verify_lens_broadcast_group",
+            return_value=(None, 1),
+        ):
+            verify_lens = planner._schedule_verify_lens(
+                req_pool_indices=torch.tensor([4, 7], dtype=torch.int64),
+                prefix_lens=torch.tensor([10, 20], dtype=torch.int64),
+                device=torch.device("cpu"),
+                confidence=None,
+                budget=None,
+            )
+
+        torch.testing.assert_close(
+            verify_lens, torch.tensor([3, 3], dtype=torch.int32)
+        )
+
+    def test_clearing_diagnostic_override_restores_serving_baseline(self):
+        planner = self._planner(verify_len=4)
+        planner._configured_forced_verify_len = 4
+
+        planner.set_forced_verify_len(3)
+        self.assertEqual(planner._budget_planner.forced_verify_len, 3)
+
+        planner.set_forced_verify_len(None)
+        self.assertEqual(planner._budget_planner.forced_verify_len, 4)
+        self.assertIsNone(planner._budget_planner.forced_budget_frac)
+
+    def test_clearing_budget_override_restores_serving_baseline(self):
+        planner = self._planner(verify_len=4)
+        planner._configured_forced_verify_len = 4
+
+        planner.set_forced_budget_frac(0.5)
+        self.assertIsNone(planner._budget_planner.forced_verify_len)
+        self.assertEqual(planner._budget_planner.forced_budget_frac, 0.5)
+
+        planner.set_forced_budget_frac(None)
+        self.assertEqual(planner._budget_planner.forced_verify_len, 4)
+        self.assertIsNone(planner._budget_planner.forced_budget_frac)
 
 
 class TestScheduleVerifyLensTopk(CustomTestCase):

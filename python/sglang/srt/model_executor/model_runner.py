@@ -16,11 +16,12 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -298,6 +299,7 @@ class ModelRunner:
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        self._dsv4_oscar_wo_a_absorption_state: Optional[dict[str, Any]] = None
 
         self.init_remote_instance_weight_transporter()
 
@@ -766,6 +768,12 @@ class ModelRunner:
     def _init_post_memory_pool_components(self):
         """Post-pool component wiring, split out of alloc_memory_pool so forks
         that build bespoke memory pools can reuse it after allocating them."""
+        # The OSCAR artifact is admitted while constructing the KV pool.  Fold
+        # its inverse attention-output rotations into target BF16 wo_a now:
+        # after exact pool/artifact binding exists, but before any attention
+        # warmup or CUDA-graph capture can execute a compressed layer.
+        self._ensure_dsv4_oscar_wo_a_output_rotation_absorbed()
+
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
         # forwards captured into the graph see the patched pool methods.
@@ -784,6 +792,94 @@ class ModelRunner:
         self.init_indexer_capturer()
 
         self.graph_shared_output = None
+
+    def _ensure_dsv4_oscar_wo_a_output_rotation_absorbed(self) -> None:
+        """Apply or revalidate the target-only OSCAR wo_a fold.
+
+        Revalidation is intentionally called at every public graph-capture
+        entry point.  The model implementation is idempotent: only the first
+        post-pool call mutates weights; later calls verify tensor versions and
+        exact artifact/layer bindings without multiplying by the rotation
+        again.
+        """
+
+        token_to_kv_pool = getattr(self, "token_to_kv_pool", None)
+        if token_to_kv_pool is None:
+            raise RuntimeError("KV pool must exist before OSCAR wo_a setup")
+        if not bool(getattr(token_to_kv_pool, "use_oscar_int2_storage", False)):
+            self._dsv4_oscar_wo_a_absorption_state = {
+                "enabled": False,
+                "applied": False,
+                "consumer_role": "disabled",
+            }
+            return
+
+        consumer_role = str(
+            getattr(token_to_kv_pool, "oscar_consumer_role", "")
+        )
+        if self.is_draft_worker:
+            if consumer_role != "draft_swa_only":
+                raise RuntimeError(
+                    "OSCAR draft must retain its protected-SWA-only pool contract"
+                )
+            state: dict[str, Any] = {
+                "enabled": True,
+                "consumer_role": "draft_swa_only",
+                "target_only": True,
+                "applied": False,
+                "apply_count": 0,
+                "expected_local_compressed_layer_ids": [],
+                "absorbed_local_layer_ids": [],
+                "runtime_restore_skipped_layer_ids": [],
+                "all_local_target_compressed_layers_absorbed": True,
+                "all_local_target_compressed_layers_skip_runtime_restore": True,
+                "rope_columns_unchanged": True,
+            }
+            self._dsv4_oscar_wo_a_absorption_state = copy.deepcopy(state)
+            token_to_kv_pool.oscar_wo_a_absorption_state = copy.deepcopy(state)
+            return
+
+        if consumer_role != "target_compressed":
+            raise RuntimeError(
+                "OSCAR target wo_a absorption requires target_compressed pool role"
+            )
+        if get_lora().enable_lora:
+            raise RuntimeError(
+                "OSCAR wo_a output-rotation absorption is incompatible with "
+                "runtime LoRA mutation"
+            )
+        absorb = getattr(
+            self.model, "absorb_dsv4_oscar_output_rotation_into_wo_a", None
+        )
+        if not callable(absorb):
+            raise RuntimeError(
+                "admitted OSCAR target model does not implement BF16 wo_a absorption"
+            )
+        state = absorb(token_to_kv_pool)
+        if (
+            state.get("apply_count") != 1
+            or state.get("all_local_target_compressed_layers_absorbed") is not True
+            or state.get("all_local_target_compressed_layers_skip_runtime_restore")
+            is not True
+        ):
+            raise RuntimeError("OSCAR wo_a absorption returned incomplete coverage")
+        self._dsv4_oscar_wo_a_absorption_state = copy.deepcopy(state)
+        # Authoritative runner state is exposed through the getter below.  Keep
+        # a pool-side copy as well so launch diagnostics can inspect it without
+        # importing the model class.
+        token_to_kv_pool.oscar_wo_a_absorption_state = copy.deepcopy(state)
+
+    def get_dsv4_oscar_wo_a_absorption_state(self) -> dict[str, Any]:
+        """Return JSON-safe target/draft proof for server-info aggregation."""
+
+        if self._dsv4_oscar_wo_a_absorption_state is None:
+            raise RuntimeError("OSCAR wo_a absorption state is not initialized")
+        if bool(getattr(self.token_to_kv_pool, "use_oscar_int2_storage", False)):
+            # Re-run the idempotent validator so telemetry cannot report a
+            # stale success after a parameter or artifact binding changes.
+            self._ensure_dsv4_oscar_wo_a_output_rotation_absorbed()
+        assert self._dsv4_oscar_wo_a_absorption_state is not None
+        return copy.deepcopy(self._dsv4_oscar_wo_a_absorption_state)
 
     def maybe_init_hisparse_coordinator(self):
         if not self.enable_hisparse:
@@ -854,6 +950,7 @@ class ModelRunner:
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
+        self._ensure_dsv4_oscar_wo_a_output_rotation_absorbed()
         # Must be called BEFORE init_decode_cuda_graph() so CUDA graph capture
         # runs with aux hidden state capture enabled.
         configure_aux_hidden_state_capture(
@@ -915,6 +1012,7 @@ class ModelRunner:
         )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        self._ensure_dsv4_oscar_wo_a_output_rotation_absorbed()
         capture = capture_cuda_graphs(
             model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
         )
@@ -1194,6 +1292,7 @@ class ModelRunner:
         )
 
     def init_decode_cuda_graph(self):
+        self._ensure_dsv4_oscar_wo_a_output_rotation_absorbed()
         self.decode_cuda_graph_runner = None
         self.graph_mem_usage = 0
         capture = capture_decode_graph(model_runner=self)
@@ -1201,6 +1300,7 @@ class ModelRunner:
         self.graph_mem_usage = capture.graph_mem_usage
 
     def init_prefill_cuda_graph(self, force_for_draft_worker: bool = False):
+        self._ensure_dsv4_oscar_wo_a_output_rotation_absorbed()
         self.prefill_cuda_graph_runner = None
         self.prefill_cuda_graph_runner = capture_prefill_graph(
             model_runner=self,

@@ -46,7 +46,6 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import torch
 import tqdm
-
 from sglang.kernels.ops.kvcache.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
@@ -78,6 +77,9 @@ from sglang.srt.model_executor.forward_context import ForwardContext, forward_co
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
+)
+from sglang.srt.model_executor.runner.kt_capture_buffers import (
+    register_kt_capture_batch_sizes,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
@@ -113,13 +115,6 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
-
-try:
-    from kt_kernel import KTMoEWrapper
-
-    KTRANSFORMERS_AVAILABLE = True
-except ImportError:
-    KTRANSFORMERS_AVAILABLE = False
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -268,13 +263,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = sorted(capture_tokens)
         assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
-        if KTRANSFORMERS_AVAILABLE:
-            # KT's CUDA-stream bridge records copies to and from pinned host
-            # buffers in every prefill graph. Persist one buffer set per graph
-            # tier; otherwise capturing the next tier replaces the temporary
-            # set and leaves previously captured graphs with dangling host
-            # pointers at replay.
-            KTMoEWrapper.set_capture_batch_sizes(self.capture_num_tokens)
+        # KT's CUDA-stream bridge records copies to and from pinned host
+        # buffers in every prefill graph. Persist one buffer set per graph
+        # tier; otherwise capturing the next tier replaces the temporary set
+        # and leaves previously captured graphs with dangling host pointers at
+        # replay.
+        register_kt_capture_batch_sizes(self.capture_num_tokens)
 
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)
@@ -489,9 +483,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # the contract only when the backend is Breakable; FullCG and
         # TC_PIECEWISE use the eager init_forward_metadata path.
         if isinstance(self.backend, BreakableCudaGraphBackend):
-            self.use_captured_attn_metadata = (
-                model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
-            )
+            self.use_captured_attn_metadata = model_runner.attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
         else:
             self.use_captured_attn_metadata = False
         self.attn_metadata_buffers: Optional[Dict[int, object]] = (
@@ -554,9 +546,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     def _prefill_logits_buffer_rows(self, forward_batch: ForwardBatch) -> int:
         if not forward_batch.return_logprob:
             return forward_batch.batch_size
-        assert (
-            self._uses_eager_prefill_tail()
-        ), "Prefill return_logprob requires an eager logits tail."
+        assert self._uses_eager_prefill_tail(), (
+            "Prefill return_logprob requires an eager logits tail."
+        )
 
         global_num_tokens = forward_batch.global_num_tokens_for_logprob_cpu
         if global_num_tokens is not None:
@@ -607,6 +599,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         *,
         num_tokens: Optional[int] = None,
         raw_num_tokens: Optional[int] = None,
+        runtime_forward_batch: Optional[ForwardBatch] = None,
     ):
         with (
             forward_context(
@@ -623,6 +616,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 num_tokens=num_tokens,
                 raw_num_tokens=raw_num_tokens,
                 full_graph=self._is_full_backend,
+                runtime_forward_batch=runtime_forward_batch,
             ),
         ):
             yield
@@ -1596,6 +1590,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 static_forward_batch,
                 num_tokens=static_num_tokens,
                 raw_num_tokens=raw_num_tokens,
+                runtime_forward_batch=forward_batch,
             ):
                 return self.model_runner.model.forward(
                     tail_batch.input_ids,

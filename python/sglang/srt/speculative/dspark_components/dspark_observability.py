@@ -39,6 +39,10 @@ class InfoComponent(str, Enum):
     DRAFT_GPU_TIME = "draft_gpu_time"
     TARGET_VERIFY_GPU_TIME = "target_verify_gpu_time"
     REQS = "reqs"
+    # Compact, per-position greedy-verification evidence.  This intentionally
+    # records only the winning logit and the proposed-token logit; dumping the
+    # full vocabulary would perturb memory use enough to invalidate a profile.
+    VERIFY_LOGITS = "verify_logits"
 
 
 class InfoSegment(str, Enum):
@@ -89,6 +93,11 @@ class ReqDetail(msgspec.Struct, omit_defaults=True):
     rid: Optional[str] = None
     confidence: Optional[list[float]] = None
     survival: Optional[list[float]] = None
+    greedy_target_tokens: Optional[list[int]] = None
+    greedy_target_top1_logits: Optional[list[float]] = None
+    greedy_target_proposed_token_logits: Optional[list[float]] = None
+    greedy_target_logit_margins: Optional[list[float]] = None
+    greedy_step_matches: Optional[list[bool]] = None
 
 
 class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
@@ -133,6 +142,9 @@ class DecodeStepObservation(msgspec.Struct):
     cap_trim_lens: torch.Tensor
     commit_lens: torch.Tensor
     rids: Optional[list[str]]
+    greedy_target_tokens: Optional[torch.Tensor] = None
+    greedy_target_top1_logits: Optional[torch.Tensor] = None
+    greedy_target_proposed_token_logits: Optional[torch.Tensor] = None
 
 
 class _PendingStep(msgspec.Struct):
@@ -151,6 +163,49 @@ class _PendingStep(msgspec.Struct):
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
     segment_events: dict[InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]]
+
+
+def compact_greedy_logit_evidence(
+    *,
+    target_logits: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    bs: int,
+    verify_num_draft_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reduce full target logits to graph-safe, per-draft comparison tensors.
+
+    The returned tensors are all ``[bs, gamma]``.  Target row ``p`` predicts
+    draft token ``p`` (candidate column ``p + 1``); the final target row is the
+    bonus-token prediction and is deliberately omitted.  This helper performs
+    only fixed-shape device operations and never copies vocabulary logits to
+    the host.
+    """
+    if bs <= 0 or verify_num_draft_tokens <= 1:
+        raise ValueError("logit evidence requires a positive batch and block > 1")
+    gamma = verify_num_draft_tokens - 1
+    if draft_tokens.shape != (bs, gamma):
+        raise ValueError(
+            "draft token shape does not match DSpark block: "
+            f"got {tuple(draft_tokens.shape)}, expected {(bs, gamma)}"
+        )
+    if target_logits.ndim != 2 or target_logits.shape[0] != (
+        bs * verify_num_draft_tokens
+    ):
+        raise ValueError(
+            "target logits do not match DSpark verify rows: "
+            f"got {tuple(target_logits.shape)}, expected first dimension "
+            f"{bs * verify_num_draft_tokens}"
+        )
+    compared_logits = target_logits.reshape(
+        bs, verify_num_draft_tokens, target_logits.shape[-1]
+    )[:, :gamma, :]
+    top1_logits, target_tokens = torch.max(compared_logits, dim=-1)
+    draft_token_logits = torch.gather(
+        compared_logits,
+        dim=-1,
+        index=draft_tokens.to(torch.int64).unsqueeze(-1),
+    ).squeeze(-1)
+    return target_tokens, top1_logits, draft_token_logits
 
 
 class DsparkInfoDumper:
@@ -194,7 +249,7 @@ class DsparkInfoDumper:
         self._prev_stamp: Optional[float] = None
 
         self._d2h_stream: Optional[torch.cuda.Stream] = None
-        if self.enabled and InfoComponent.REQS in self._components:
+        if self.enabled and self._stages_request_details:
             self._d2h_stream = torch.cuda.Stream(device=device)
 
         self._current_segments: dict[
@@ -236,9 +291,7 @@ class DsparkInfoDumper:
         step_cpu_ms = self._step_cpu_ms(now=now)
         self._drain_pending()
 
-        future = (
-            self._stage_reqs(obs) if InfoComponent.REQS in self._components else None
-        )
+        future = self._stage_reqs(obs) if self._stages_request_details else None
         self._pending = _PendingStep(
             forward_ct=int(obs.forward_ct),
             bs=int(obs.bs),
@@ -302,6 +355,16 @@ class DsparkInfoDumper:
             return InfoComponent.TARGET_VERIFY_GPU_TIME in self._components
         return False
 
+    @property
+    def _stages_request_details(self) -> bool:
+        return bool(
+            {InfoComponent.REQS, InfoComponent.VERIFY_LOGITS} & self._components
+        )
+
+    @property
+    def needs_verify_logits(self) -> bool:
+        return InfoComponent.VERIFY_LOGITS in self._components
+
     def _open_segment(self, segment: InfoSegment) -> None:
         start = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -329,6 +392,20 @@ class DsparkInfoDumper:
             tensors["verify_lens"] = obs.verify_lens
         if obs.confidence is not None:
             tensors["confidence"] = obs.confidence
+        if self.needs_verify_logits:
+            if (
+                obs.greedy_target_tokens is None
+                or obs.greedy_target_top1_logits is None
+                or obs.greedy_target_proposed_token_logits is None
+            ):
+                raise ValueError(
+                    "verify_logits tracing requires compact target/draft logit tensors"
+                )
+            tensors["greedy_target_tokens"] = obs.greedy_target_tokens
+            tensors["greedy_target_top1_logits"] = obs.greedy_target_top1_logits
+            tensors["greedy_target_proposed_token_logits"] = (
+                obs.greedy_target_proposed_token_logits
+            )
         return FutureTensors.device_to_host(tensors, d2h_stream=self._d2h_stream)
 
     def _drain_pending(self) -> None:
@@ -360,7 +437,7 @@ class DsparkInfoDumper:
             record.target_verify_gpu_ms = self._segment_ms(
                 pending, InfoSegment.TARGET_VERIFY
             )
-        if InfoComponent.REQS in self._components and pending.future is not None:
+        if self._stages_request_details and pending.future is not None:
             record.reqs = self._build_reqs(
                 host=pending.future.wait(), bs=pending.bs, rids=pending.rids
             )
@@ -443,6 +520,21 @@ class DsparkInfoDumper:
         cap_trim = host["cap_trim_lens"].tolist()
         commit = host["commit_lens"].tolist()
         verify_lens = host["verify_lens"].tolist() if "verify_lens" in host else None
+        target_token_rows = (
+            host["greedy_target_tokens"].tolist()
+            if "greedy_target_tokens" in host
+            else None
+        )
+        target_top1_rows = (
+            host["greedy_target_top1_logits"].float().tolist()
+            if "greedy_target_top1_logits" in host
+            else None
+        )
+        proposed_logit_rows = (
+            host["greedy_target_proposed_token_logits"].float().tolist()
+            if "greedy_target_proposed_token_logits" in host
+            else None
+        )
         if "confidence" in host:
             conf_host = host["confidence"].float()
             conf_rows = conf_host.tolist()
@@ -458,6 +550,54 @@ class DsparkInfoDumper:
                 if verify_lens is None
                 else int(verify_lens[row])
             )
+            compared_positions = max(verify_len - 1, 0)
+            greedy_target_tokens = (
+                None
+                if target_token_rows is None
+                else [int(t) for t in target_token_rows[row][:compared_positions]]
+            )
+            greedy_target_top1_logits = (
+                None
+                if target_top1_rows is None
+                else [
+                    round(float(value), 4)
+                    for value in target_top1_rows[row][:compared_positions]
+                ]
+            )
+            greedy_target_proposed_token_logits = (
+                None
+                if proposed_logit_rows is None
+                else [
+                    round(float(value), 4)
+                    for value in proposed_logit_rows[row][:compared_positions]
+                ]
+            )
+            greedy_target_logit_margins = (
+                None
+                if greedy_target_top1_logits is None
+                or greedy_target_proposed_token_logits is None
+                else [
+                    round(top1 - proposed, 4)
+                    for top1, proposed in zip(
+                        greedy_target_top1_logits,
+                        greedy_target_proposed_token_logits,
+                        strict=True,
+                    )
+                ]
+            )
+            draft_row = [int(t) for t in draft_rows[row]]
+            greedy_step_matches = (
+                None
+                if greedy_target_tokens is None
+                else [
+                    target == proposed
+                    for target, proposed in zip(
+                        greedy_target_tokens,
+                        draft_row[:compared_positions],
+                        strict=True,
+                    )
+                ]
+            )
             reqs.append(
                 ReqDetail(
                     rid=None if rids is None else rids[row],
@@ -468,7 +608,7 @@ class DsparkInfoDumper:
                     correct_drafts=int(correct[row]),
                     cap_trim=int(cap_trim[row]),
                     bonus_token=int(bonus[row]),
-                    draft_tokens=[int(t) for t in draft_rows[row]],
+                    draft_tokens=draft_row,
                     confidence=(
                         None
                         if conf_rows is None
@@ -479,6 +619,13 @@ class DsparkInfoDumper:
                         if survival_rows is None
                         else [round(float(p), 4) for p in survival_rows[row]]
                     ),
+                    greedy_target_tokens=greedy_target_tokens,
+                    greedy_target_top1_logits=greedy_target_top1_logits,
+                    greedy_target_proposed_token_logits=(
+                        greedy_target_proposed_token_logits
+                    ),
+                    greedy_target_logit_margins=greedy_target_logit_margins,
+                    greedy_step_matches=greedy_step_matches,
                 )
             )
         return reqs
@@ -885,6 +1032,24 @@ class DsparkStepObservers:
                 layout=layout,
             )
         if self._info_dumper.enabled:
+            greedy_target_tokens = None
+            greedy_target_top1_logits = None
+            greedy_target_proposed_token_logits = None
+            if self._info_dumper.needs_verify_logits:
+                if target_logits is None:
+                    raise ValueError(
+                        "verify_logits tracing requires target logits on every step"
+                    )
+                (
+                    greedy_target_tokens,
+                    greedy_target_top1_logits,
+                    greedy_target_proposed_token_logits,
+                ) = compact_greedy_logit_evidence(
+                    target_logits=target_logits,
+                    draft_tokens=draft_tokens,
+                    bs=bs,
+                    verify_num_draft_tokens=self._verify_num_draft_tokens,
+                )
             budget_decision = planner.take_budget_decision()
             predicted_step_ms = (
                 None
@@ -925,6 +1090,11 @@ class DsparkStepObservers:
                     cap_trim_lens=cap_trim_lens,
                     commit_lens=commit_lens,
                     rids=[req.rid for req in reqs],
+                    greedy_target_tokens=greedy_target_tokens,
+                    greedy_target_top1_logits=greedy_target_top1_logits,
+                    greedy_target_proposed_token_logits=(
+                        greedy_target_proposed_token_logits
+                    ),
                 )
             )
 

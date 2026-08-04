@@ -112,10 +112,14 @@ def hpc_bf16xfp32_gemm_enabled() -> bool:
     return _linear_bf16_fp32_algo == "hpc" and _hpc_gemm_bf16xfp32_available()
 
 
-def _linear_bf16_fp32_cublas(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+def _linear_bf16_fp32_cublas(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
     if x.is_cuda and x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16:
-        return torch.mm(x, y.t(), out_dtype=torch.float32)
-    return torch.mm(x.float(), y.float().t())
+        return torch.mm(x, y.t(), out=output, out_dtype=torch.float32)
+    return torch.mm(x.float(), y.float().t(), out=output)
 
 
 def _linear_bf16_fp32_hpc(
@@ -145,25 +149,52 @@ def linear_bf16_fp32(
     x: torch.Tensor,
     y: torch.Tensor,
     *,
+    output: Optional[torch.Tensor] = None,
     hpc_kernel_min_m: Optional[int] = None,
 ) -> torch.Tensor:
+    expected_shape = (x.size(0), y.size(0))
+    if output is not None and (
+        output.shape != expected_shape
+        or output.dtype != torch.float32
+        or output.device != x.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            "caller-owned BF16xBF16->FP32 output must be contiguous FP32 "
+            f"on {x.device} with shape {expected_shape}, got "
+            f"shape={tuple(output.shape)} dtype={output.dtype} "
+            f"device={output.device} contiguous={output.is_contiguous()}"
+        )
+
+    def return_result(result: torch.Tensor) -> torch.Tensor:
+        if output is None or result is output:
+            return result
+        output.copy_(result)
+        return output
+
     if _use_aiter and y.dtype == torch.bfloat16:
-        return tgemm.mm(x, y, otype=x.dtype).float()
+        return return_result(tgemm.mm(x, y, otype=x.dtype).float())
     elif hpc_kernel_min_m is not None:
-        output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
-        if output is not None:
-            return output
-        return _linear_bf16_fp32_cublas(x, y)
+        hpc_output = _linear_bf16_fp32_hpc(x, y, min_m=hpc_kernel_min_m)
+        if hpc_output is not None:
+            return return_result(hpc_output)
+        return _linear_bf16_fp32_cublas(x, y, output)
     elif _linear_bf16_fp32_algo == "hpc":
-        output = _linear_bf16_fp32_hpc(x, y)
-        if output is not None:
-            return output
-        return _linear_bf16_fp32_cublas(x, y)
+        hpc_output = _linear_bf16_fp32_hpc(x, y)
+        if hpc_output is not None:
+            return return_result(hpc_output)
+        return _linear_bf16_fp32_cublas(x, y, output)
     elif _linear_bf16_fp32_algo == "deep_gemm" and y.dtype == torch.bfloat16:
         from sglang.srt.layers import deep_gemm_wrapper
 
-        z = torch.empty(x.size(0), y.size(0), dtype=torch.float32, device=x.device)
+        z = (
+            output
+            if output is not None
+            else torch.empty(
+                x.size(0), y.size(0), dtype=torch.float32, device=x.device
+            )
+        )
         deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, y, z)
         return z
     else:
-        return _linear_bf16_fp32_cublas(x, y)
+        return _linear_bf16_fp32_cublas(x, y, output)

@@ -218,7 +218,12 @@ def hc_split_sinkhorn(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        # TileLang 0.1.8 forwards integer pass-config values as TVM IntImm
+        # reprs (rather than scalars) to nvcc.  The equivalent explicit flag
+        # survives the TVM-FFI boundary and preserves the intended setting.
+        tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: [
+            "--ptxas-options=--register-usage-level=10"
+        ],
     },
 )
 def mhc_pre_big_fuse_tilelang(
@@ -612,7 +617,9 @@ def prewarm_mhc_pre(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: [
+            "--ptxas-options=--register-usage-level=10"
+        ],
     },
 )
 def mhc_pre_big_fuse_with_norm_tilelang(
@@ -985,7 +992,9 @@ def mhc_pre(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: [
+            "--ptxas-options=--register-usage-level=10"
+        ],
     },
 )
 def mhc_post_tilelang(
@@ -1065,7 +1074,9 @@ def mhc_post(
     pass_configs={
         tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
         tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_PTXAS_REGISTER_USAGE_LEVEL: 10,
+        tilelang.PassConfigKey.TL_DEVICE_COMPILE_FLAGS: [
+            "--ptxas-options=--register-usage-level=10"
+        ],
     },
 )
 def mhc_fused_post_pre_fma_tilelang(

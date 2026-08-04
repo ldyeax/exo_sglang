@@ -1285,6 +1285,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_deepseek_v4_kv_cache_dtype_pass(self):
+        import sglang.srt.arg_groups.overrides as overrides_module
         from sglang.srt.arg_groups.overrides import (
             ResolvedView,
             _deepseek_v4_kv_cache_dtype,
@@ -1300,17 +1301,40 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             )
 
-        self.assertEqual(
-            _deepseek_v4_kv_cache_dtype(_view()), {"kv_cache_dtype": "fp8_e4m3"}
-        )
+        with patch.object(
+            overrides_module, "get_dsv4_device_capability", return_value=(8, 6)
+        ):
+            # Ampere cannot use the packed FP8 DSV4 cache layout, so both auto
+            # and an explicit FP8 request resolve to the physical BF16 dtype.
+            self.assertEqual(
+                _deepseek_v4_kv_cache_dtype(_view()),
+                {"kv_cache_dtype": "bfloat16"},
+            )
+            self.assertEqual(
+                _deepseek_v4_kv_cache_dtype(
+                    _view(kv_cache_dtype="fp8_e4m3")
+                ),
+                {"kv_cache_dtype": "bfloat16"},
+            )
+        with patch.object(
+            overrides_module, "get_dsv4_device_capability", return_value=(12, 0)
+        ):
+            # RTX 5090 / SM120 preserves the FP8 default, while an explicit
+            # BF16 request remains BF16.
+            self.assertEqual(
+                _deepseek_v4_kv_cache_dtype(_view()),
+                {"kv_cache_dtype": "fp8_e4m3"},
+            )
+            self.assertEqual(
+                _deepseek_v4_kv_cache_dtype(
+                    _view(kv_cache_dtype="bfloat16")
+                ),
+                {},
+            )
         # NPU pins bfloat16 regardless of the auto default
         self.assertEqual(
             _deepseek_v4_kv_cache_dtype(_view(device="npu")),
             {"kv_cache_dtype": "bfloat16"},
-        )
-        # explicit supported value survives
-        self.assertEqual(
-            _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="bfloat16")), {}
         )
         with self.assertRaises(AssertionError):
             _deepseek_v4_kv_cache_dtype(_view(kv_cache_dtype="fp8_e5m2"))

@@ -2074,6 +2074,14 @@ class ServerArgs:
         "off the schedule is byte-for-byte unchanged.",
         NS("spec"),
     ] = False
+    speculative_dspark_fixed_verify_len: A[
+        Optional[int],
+        "DSPARK compact ragged-verify only. Pin every request to this exact "
+        "verify length as the serving baseline. Runtime diagnostic overrides "
+        "may temporarily replace it; clearing an override restores this value. "
+        "Must be between 2 and gamma + 1. Omit to use confidence/SPS scheduling.",
+        NS("spec"),
+    ] = None
     speculative_accept_threshold_single: A[
         float,
         "Accept a draft token if its probability in the target model is greater than this threshold.",

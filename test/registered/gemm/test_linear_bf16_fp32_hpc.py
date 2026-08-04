@@ -26,6 +26,27 @@ register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
 _ROUTER_SHAPES = ((6144, 768), (3072, 384))
 
 
+class TestLinearBf16Fp32OutputBuffer(unittest.TestCase):
+    def test_writes_into_caller_owned_output(self):
+        torch.manual_seed(0)
+        x = torch.randn(4, 8, dtype=torch.bfloat16)
+        weight = torch.randn(6, 8, dtype=torch.float32)
+        output = torch.empty(4, 6, dtype=torch.float32)
+
+        result = linear_bf16_fp32(x, weight, output=output)
+
+        self.assertIs(result, output)
+        torch.testing.assert_close(output, torch.mm(x.float(), weight.t()))
+
+    def test_rejects_incompatible_caller_owned_output(self):
+        x = torch.randn(4, 8, dtype=torch.bfloat16)
+        weight = torch.randn(6, 8, dtype=torch.float32)
+        output = torch.empty(4, 6, dtype=torch.bfloat16)
+
+        with self.assertRaisesRegex(ValueError, "contiguous FP32"):
+            linear_bf16_fp32(x, weight, output=output)
+
+
 @unittest.skipUnless(
     _hpc_gemm_bf16xfp32_available(),
     "requires HPC-Ops (https://github.com/Tencent/hpc-ops) and a Hopper GPU",

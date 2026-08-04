@@ -32,6 +32,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.kt_ep_wrapper import (
     KTEPWrapperMethod,
     create_kt_config_from_server_args,
+    validate_kt_fused_shared_experts,
 )
 from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
@@ -337,6 +338,11 @@ class FusedMoE(torch.nn.Module):
         server_args = get_server_args()
         kt_config = create_kt_config_from_server_args(server_args, layer_id, prefix)
         if kt_config is not None:
+            validate_kt_fused_shared_experts(
+                kt_config=kt_config,
+                model_num_experts=num_experts,
+                num_fused_shared_experts=num_fused_shared_experts,
+            )
             if quant_config is not None:
                 gpu_method = quant_config.get_quant_method(self, prefix)
             else:
@@ -837,6 +843,37 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: Optional[int],
     ) -> None:
+        if (
+            isinstance(self.quant_method, KTEPWrapperMethod)
+            and self.quant_method.rank_local_logical_expert_ids
+        ):
+            if expert_id is None:
+                raise ValueError(
+                    "Compact rank-local KT expert loading requires one global "
+                    "logical expert ID per checkpoint tensor"
+                )
+            if not 0 <= expert_id < self.quant_method.gpu_experts_mask.numel():
+                raise ValueError(
+                    f"KT global logical expert ID {expert_id} is outside the model"
+                )
+            if not self.quant_method.gpu_experts_mask[expert_id]:
+                return
+            compact_expert_id = int(
+                self.quant_method.logical_to_gpu_index[expert_id].item()
+            )
+            if compact_expert_id < 0:
+                raise ValueError(
+                    f"KT selected expert {expert_id} has no compact GPU slot"
+                )
+            self._weight_loader_impl(
+                param=param,
+                loaded_weight=loaded_weight,
+                weight_name=weight_name,
+                shard_id=shard_id,
+                expert_id=compact_expert_id,
+            )
+            return
+
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (

@@ -4,10 +4,10 @@ from dataclasses import replace
 from typing import Optional
 
 import torch
-
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -65,8 +65,25 @@ from sglang.srt.utils import get_available_gpu_memory, is_cuda
 logger = logging.getLogger(__name__)
 
 
-class DSparkWorkerV2(BaseSpecWorker):
+def broadcast_dspark_tensors(tensors: tuple[torch.Tensor, ...]) -> None:
+    """Keep proposal and acceptance state identical across tensor-parallel ranks."""
+    # DP-attention ranks can run unrelated requests and idle ranks do not enter
+    # the proposal/accept paths below.  Broadcasting over the enclosing TP
+    # group would therefore mix requests or deadlock on a missing idle-rank
+    # participant.  This mirrors verify_lens_broadcast_group() and EAGLE's
+    # sampling synchronization contract.
+    tensor_parallel_group = (
+        get_parallel().attn_tp_group
+        if is_dp_attention_enabled()
+        else get_parallel().tp_group
+    )
+    if tensor_parallel_group.world_size <= 1:
+        return
+    for tensor in tensors:
+        tensor_parallel_group.broadcast(tensor, src=0)
 
+
+class DSparkWorkerV2(BaseSpecWorker):
     def __init__(
         self,
         server_args: ServerArgs,
@@ -211,6 +228,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                     resolve_req_to_token=lambda: (
                         self.model_runner.req_to_token_pool.req_to_token
                     ),
+                    tp_size=self.ps.tp_size,
                 ),
             )
             self.model_runner.capture_tail_hooks.append(
@@ -247,6 +265,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
         self._forced_budget_frac: Optional[float] = None
+        self._forced_verify_len: Optional[int] = None
         self._need_mamba_verify_commit = False
 
         self._observers = DsparkStepObservers(
@@ -357,6 +376,14 @@ class DSparkWorkerV2(BaseSpecWorker):
     def set_dspark_forced_budget_frac(self, frac: Optional[float]) -> None:
         self._forced_budget_frac = frac
         self._verify_planner.set_forced_budget_frac(frac)
+        if frac is not None:
+            self._forced_verify_len = None
+
+    def set_dspark_forced_verify_len(self, verify_len: Optional[int]) -> None:
+        self._verify_planner.set_forced_verify_len(verify_len)
+        self._forced_verify_len = verify_len
+        if verify_len is not None:
+            self._forced_budget_frac = None
 
     def dump_info_records(self) -> Optional[dict]:
         return self._observers.dump_info_records()
@@ -403,6 +430,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         logits_output = batch_output.logits_output
         next_token_ids = batch_output.next_token_ids
+        # This token becomes the first DSpark anchor on the next scheduler
+        # iteration.  A rare TP sampling tie after a long prefill can otherwise
+        # seed different draft inputs, making the ranks enter different target
+        # collectives before the decode-side proposal broadcast is reached.
+        broadcast_dspark_tensors((next_token_ids,))
         batch_output.new_seq_lens = batch.seq_lens
         if on_publish is not None:
             on_publish(batch_output.new_seq_lens)
@@ -546,6 +578,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         draft_block_ids = proposal.draft_block_ids
         draft_block = proposal.draft_block
         draft_tokens = draft_block.draft_tokens
+        # Small floating-point differences between TP ranks can change an
+        # argmax proposal. Feeding different token IDs into the following
+        # target TP collectives corrupts verification rather than merely
+        # lowering acceptance, so make rank 0 authoritative as EAGLE does.
+        broadcast_dspark_tensors((draft_tokens,))
 
         confidence = proposal.confidence
         if confidence is None:
@@ -650,6 +687,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             layout=layout,
             prefix_lens=prefix_lens,
             draft_tokens=draft_tokens,
+        )
+        # Target logits and acceptance kernels can also differ at a close
+        # decision boundary. Every rank must advance the same sequence and
+        # commit the same draft-cache rows.
+        broadcast_dspark_tensors(
+            (
+                accept.correct_len,
+                accept.bonus,
+                accept.cap_trim_lens,
+                accept.commit_lens,
+                accept.new_seq_lens,
+                accept.out_tokens,
+            )
         )
         if on_publish is not None:
             if confidence is not None:

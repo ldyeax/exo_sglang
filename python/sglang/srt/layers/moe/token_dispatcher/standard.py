@@ -131,17 +131,18 @@ class StandardDispatcher(BaseDispatcher):
         kt_mapping = getattr(
             moe_runner_config, "kt_global_to_local_expert_mapping", None
         )
-        self.local_expert_mapping = (
-            None
-            if kt_mapping is None
-            else kt_mapping.to(device=get_device(), non_blocking=True)
-        )
+        if kt_mapping is not None:
+            # KT consumes global routes and performs its own arbitrary compact
+            # GPU/CPU remaps. Avoid an identity gather on every MoE layer.
+            self.skip_local_expert_mapping = True
+            self.local_expert_mapping = None
+        else:
+            self.local_expert_mapping = None
         self.expert_mask_gpu = None
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> StandardDispatchOutput:
-
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
             # all-gather fp4 hidden states
             if (
@@ -201,8 +202,9 @@ class StandardDispatcher(BaseDispatcher):
                     (self.num_experts,), -1, dtype=torch.int32, device=device
                 )
                 self.local_expert_mapping[
-                    self.moe_ep_rank
-                    * self.num_local_routed_experts : (self.moe_ep_rank + 1)
+                    self.moe_ep_rank * self.num_local_routed_experts : (
+                        self.moe_ep_rank + 1
+                    )
                     * self.num_local_routed_experts
                 ] = torch.arange(
                     0, self.num_local_routed_experts, dtype=torch.int32, device=device

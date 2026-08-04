@@ -227,7 +227,6 @@ class InvariantCheckLevel(IntEnum):
 
 
 class Envs:
-
     # Raise on bare server_args field assignments after resolution; mutation
     # must go through ServerArgs.override() (enabled by the test harness).
     SGLANG_STRICT_CONFIG_MUTATION = EnvBool(False)
@@ -307,6 +306,7 @@ class Envs:
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_DSV4_TP_TRACE = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER = EnvBool(False)
     SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS = EnvBool(False)
     SGLANG_DSPARK_DEBUG_DUMP = EnvTuple(tuple())
@@ -1108,6 +1108,34 @@ class Envs:
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
     SGLANG_EXPERIMENTAL_ONLINE_C128_MTP = EnvBool(False)
     SGLANG_DSV4_COMPRESS_STATE_DTYPE = EnvStr("float32")
+    # Experimental SM86-only DeepSeek-V4 KV storage mode.  The public
+    # kv-cache dtype remains fp8_e4m3 (there is no torch.int4 dtype); this
+    # switch changes the physical latent SWA/C4/C128 pages to signed symmetric
+    # INT4 with BF16 per-group scales.  Pool construction validates the exact
+    # architecture and rejects incompatible layouts fail-closed.
+    SGLANG_DSV4_INT4_KV_STORAGE = EnvBool(False)
+    # Independently quantize the C4 index-selection cache/scorer.  Keeping this
+    # separate from the latent SWA/C4/C128 cache switch allows quality and
+    # bandwidth attribution for all four mixed-mode combinations.
+    SGLANG_DSV4_INT4_C4_INDEXER_STORAGE = EnvBool(False)
+    # Exact-SM86 DeepSeek-V4 OSCAR cache.  This is a distinct, fail-closed
+    # format: the SWA protection window is kept in rotated BF16 while C4/C128
+    # history uses calibrated asymmetric INT2.  Enabling the flag without a
+    # readable, model-bound shared-latent calibration artifact is an error;
+    # there is deliberately no identity/Hadamard-only fallback.
+    SGLANG_DSV4_OSCAR_INT2_KV_STORAGE = EnvBool(False)
+    SGLANG_DSV4_OSCAR_CALIBRATION_PATH = EnvStr("")
+    SGLANG_DSV4_OSCAR_ADMISSION_RECEIPT_PATH = EnvStr("")
+    # Opt-in exact-SM86 OSCAR target decode: split the logical history across
+    # additional CTAs and merge persistent FP32 online-softmax partials.  The
+    # target backend allocates the fixed workspace before graph capture;
+    # prefill and unsupported token shapes retain the monolithic OSCAR kernel.
+    SGLANG_DSV4_OSCAR_INT2_SPLIT_HISTORY = EnvBool(False)
+    # Exact-SM86-only mixed cache layout: preserve byte-packed FP8 for SWA/C4
+    # and the C4 scorer, but store C128 compressed latent pages as BF16.  The
+    # C128 working set is small enough that this removes software FP8 decode
+    # from long-context odd layers for a modest fixed memory cost.
+    SGLANG_DSV4_SM86_C128_BF16_STORAGE = EnvBool(False)
     # Deprecated: DSV4 compressor V2 is always used.
     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)

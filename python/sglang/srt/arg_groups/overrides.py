@@ -35,6 +35,11 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sglang.srt.arg_groups.arg_utils import resolvable_fields
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.dsv4_kv_cache_dtype import (
+    format_dsv4_device_capability,
+    get_dsv4_device_capability,
+    resolve_dsv4_kv_cache_dtype_name,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -1569,9 +1574,11 @@ def _deepseek_spec_moe_resolution(view: Any) -> dict:
 
 @register_post_process
 def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
-    """Slot pass in the DeepSeek V4 hook: default the kv-cache dtype to FP8
-    (bfloat16 on NPU, where the pool geometry differs) and validate the
-    result. The NPU split-backend writes stay in the hook."""
+    """Resolve the DeepSeek V4 KV cache dtype before memory planning.
+
+    FP8 is the preferred default, but pre-SM89 CUDA devices and NPU use the
+    BF16 storage layout.  The NPU split-backend writes stay in the hook.
+    """
     hf_config = view.get_model_config().hf_config
     model_arch = hf_config.architectures[0]
     if model_arch != "DeepseekV4ForCausalLM":
@@ -1580,13 +1587,31 @@ def _deepseek_v4_kv_cache_dtype(view: Any) -> dict:
     kv_cache_dtype = view.kv_cache_dtype
     if kv_cache_dtype == "auto":
         kv_cache_dtype = "fp8_e4m3"
-        logger.warning(f"Setting KV cache dtype to {kv_cache_dtype} for {model_arch}.")
     if view.device == "npu":
         kv_cache_dtype = "bfloat16"
-    assert kv_cache_dtype in [
-        "fp8_e4m3",
-        "bfloat16",
-    ], f"{kv_cache_dtype} is not supported for {model_arch}"
+    else:
+        assert kv_cache_dtype in [
+            "fp8_e4m3",
+            "bfloat16",
+        ], f"{kv_cache_dtype} is not supported for {model_arch}"
+        device_capability = get_dsv4_device_capability(view.device)
+        requested_kv_cache_dtype = kv_cache_dtype
+        kv_cache_dtype = resolve_dsv4_kv_cache_dtype_name(
+            requested_kv_cache_dtype,
+            device_capability=device_capability,
+        )
+        if kv_cache_dtype != requested_kv_cache_dtype:
+            logger.warning(
+                "DeepSeek V4 requested KV cache dtype %s, but %s does not "
+                "support its FP8 storage path; using effective dtype %s.",
+                requested_kv_cache_dtype,
+                format_dsv4_device_capability(device_capability),
+                kv_cache_dtype,
+            )
+    if view.kv_cache_dtype == "auto":
+        logger.warning(
+            "Setting KV cache dtype to %s for %s.", kv_cache_dtype, model_arch
+        )
     if kv_cache_dtype != view.kv_cache_dtype:
         return {"kv_cache_dtype": kv_cache_dtype}
     return {}

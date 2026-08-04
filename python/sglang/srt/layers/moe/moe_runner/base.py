@@ -62,6 +62,10 @@ class MoeRunnerConfig:
     gate_up_interleaved: bool = True
     layer: Optional[torch.nn.Module] = None
     use_tp_all_gather_activation: bool = False
+    # KTransformers performs its own arbitrary global-to-local expert remap.
+    # Preserve global route IDs through the standard dispatcher so profile-
+    # guided CPU shards do not get remapped a second time by contiguous EP.
+    kt_global_to_local_expert_mapping: Optional[torch.Tensor] = None
 
 
 @dataclass

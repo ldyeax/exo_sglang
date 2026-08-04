@@ -375,7 +375,11 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_num: int,
         device: str,
         enable_memory_saver: bool,
+        use_bf16_cache: bool = False,
+        use_oscar_int2_cache: bool = False,
     ) -> NPUDeepSeekV4IndexerPool:
+        if use_oscar_int2_cache:
+            raise ValueError("OSCAR-INT2 C4 storage is implemented only on SM86 CUDA")
         # NPU dedicated int8 K + fp16 scale buffers use the GLOBAL page_size
         # (= self.page_size) as kernel_page_size, matching ori_kv for the kernel.
         return NPUDeepSeekV4IndexerPool(
@@ -386,6 +390,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             layer_num,
             device,
             enable_memory_saver,
+            use_bf16_cache=use_bf16_cache,
             kernel_page_size=self.page_size,
         )
 

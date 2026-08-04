@@ -131,6 +131,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
+    KTExpertHotspotReqInput,
+    KTExpertHotspotReqOutput,
     ListExternalCorporaReqInput,
     ListExternalCorporaReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -352,6 +354,540 @@ def _accumulate_decode_moment(
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+
+
+_DSV4_OSCAR_WO_A_TARGET_STATE_KEYS = frozenset(
+    {
+        "enabled",
+        "consumer_role",
+        "target_only",
+        "applied",
+        "apply_count",
+        "artifact_sha256",
+        "admission_sha256",
+        "expected_local_compressed_layer_ids",
+        "absorbed_local_layer_ids",
+        "runtime_restore_skipped_layer_ids",
+        "all_local_target_compressed_layers_absorbed",
+        "all_local_target_compressed_layers_skip_runtime_restore",
+        "weight_dtype",
+        "head_layout",
+        "fold_orientation",
+        "rope_columns_unchanged",
+    }
+)
+
+_DSV4_OSCAR_WORKER_INIT_INFO_KEYS = (
+    "dsv4_oscar_int2_kv_storage",
+    "dsv4_oscar_algorithm",
+    "dsv4_oscar_model_id",
+    "dsv4_kv_storage_mode",
+    "dsv4_latent_kv_bytes_per_token",
+    "dsv4_swa_kv_bytes_per_token",
+    "dsv4_c4_kv_bytes_per_token",
+    "dsv4_c128_kv_bytes_per_token",
+    "dsv4_c4_indexer_bytes_per_token",
+    "dsv4_oscar_c4_scorer",
+    "dsv4_oscar_c4_scorer_algorithm",
+    "dsv4_oscar_masked_writer_execution",
+    "dsv4_oscar_c4_masked_writer_execution",
+    "dsv4_oscar_c4_query_rotation_execution",
+    "dsv4_oscar_int2_split_history",
+    "dsv4_oscar_int2_split_history_execution",
+    "dsv4_oscar_int2_split_history_split_map",
+    "dsv4_oscar_int2_split_history_workspace_bytes",
+    "dsv4_oscar_int2_split_history_max_partial_rows",
+    "dsv4_oscar_int2_split_history_sink_owner",
+    "dsv4_oscar_int2_split_history_prefill_enabled",
+    "dsv4_oscar_int2_split_history_fixed_address",
+    "dsv4_oscar_int2_split_history_workspace_address",
+    "dsv4_int4_kv_storage",
+    "dsv4_int4_c4_indexer_storage",
+    "dsv4_sm86_c128_bf16_storage",
+    "dsv4_oscar_artifact_sha256",
+    "dsv4_oscar_model_config_sha256",
+    "dsv4_oscar_artifact_provenance_sha256",
+    "dsv4_oscar_checkpoint_sha256",
+    "dsv4_oscar_checkpoint_fingerprint_sha256",
+    "dsv4_oscar_admission_sha256",
+    "dsv4_oscar_admission_receipt_sha256",
+    "dsv4_oscar_wo_a_absorption_state",
+)
+
+_DSV4_OSCAR_SPLIT_HISTORY_STATE_KEYS = frozenset(
+    {
+        "enabled",
+        "execution",
+        "split_map",
+        "workspace_bytes",
+        "max_partial_rows",
+        "sink_owner",
+        "prefill_enabled",
+        "fixed_address",
+        "workspace_address",
+    }
+)
+
+
+def _disabled_dsv4_oscar_split_history_telemetry() -> Dict[str, Any]:
+    return {
+        "enabled": False,
+        "execution": "",
+        "split_map": {},
+        "workspace_bytes": 0,
+        "max_partial_rows": 0,
+        "sink_owner": "",
+        "prefill_enabled": False,
+        "fixed_address": False,
+        "workspace_address": 0,
+    }
+
+
+def _get_dsv4_oscar_split_history_telemetry(
+    model_runner: Any,
+    kv_pool: Any,
+    *,
+    oscar_storage_active: bool,
+) -> Dict[str, Any]:
+    """Export the live target backend's split workspace or fail closed."""
+
+    target_requested = (
+        oscar_storage_active
+        and str(getattr(kv_pool, "oscar_consumer_role", ""))
+        == "target_compressed"
+        and envs.SGLANG_DSV4_OSCAR_INT2_SPLIT_HISTORY.get()
+    )
+    backend = getattr(model_runner, "attn_backend", None)
+    getter = getattr(
+        backend, "get_dsv4_oscar_int2_split_history_telemetry", None
+    )
+    if not callable(getter):
+        if target_requested:
+            raise RuntimeError(
+                "OSCAR split-history opt-in requires authoritative backend telemetry"
+            )
+        return _disabled_dsv4_oscar_split_history_telemetry()
+    state = getter()
+    if not isinstance(state, dict):
+        raise RuntimeError("OSCAR split-history telemetry getter must return a dict")
+    if set(state) != _DSV4_OSCAR_SPLIT_HISTORY_STATE_KEYS:
+        missing = sorted(_DSV4_OSCAR_SPLIT_HISTORY_STATE_KEYS - set(state))
+        extra = sorted(set(state) - _DSV4_OSCAR_SPLIT_HISTORY_STATE_KEYS, key=repr)
+        raise RuntimeError(
+            "OSCAR split-history telemetry has the wrong schema: "
+            f"missing={missing}, extra={extra}"
+        )
+    if state["enabled"] is not target_requested:
+        raise RuntimeError(
+            "OSCAR split-history backend state does not match its target opt-in"
+        )
+    if not target_requested:
+        if state != _disabled_dsv4_oscar_split_history_telemetry():
+            raise RuntimeError(
+                "disabled OSCAR split-history telemetry is not canonical"
+            )
+        return state
+
+    from sglang.kernels.ops.attention.dsv4.oscar_int2_decode import (
+        SPLIT_HISTORY_EXECUTION,
+        SPLIT_HISTORY_MAX_PARTIAL_ROWS,
+        SPLIT_HISTORY_SPLIT_MAP,
+        SPLIT_HISTORY_WORKSPACE_BYTES,
+    )
+
+    exact_contract = {
+        "enabled": True,
+        "execution": SPLIT_HISTORY_EXECUTION,
+        "split_map": {
+            str(num_tokens): split_count
+            for num_tokens, split_count in SPLIT_HISTORY_SPLIT_MAP.items()
+        },
+        "workspace_bytes": SPLIT_HISTORY_WORKSPACE_BYTES,
+        "max_partial_rows": SPLIT_HISTORY_MAX_PARTIAL_ROWS,
+        "sink_owner": "stage2-exactly-once",
+        "prefill_enabled": False,
+        "fixed_address": True,
+    }
+    for key, expected in exact_contract.items():
+        if state[key] != expected:
+            raise RuntimeError(
+                "OSCAR split-history telemetry contract mismatch: "
+                f"{key}={state[key]!r}, expected={expected!r}"
+            )
+    if not isinstance(state["workspace_address"], int) or state[
+        "workspace_address"
+    ] <= 0:
+        raise RuntimeError("OSCAR split-history workspace address is invalid")
+    return state
+
+
+def _get_dsv4_oscar_worker_telemetry(
+    ps: ParallelState, init_info: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Build one rank-local physical/admission record from the handshake."""
+
+    missing_keys = [
+        key for key in _DSV4_OSCAR_WORKER_INIT_INFO_KEYS if key not in init_info
+    ]
+    if missing_keys:
+        raise RuntimeError(
+            f"OSCAR worker telemetry is incomplete: missing={missing_keys}"
+        )
+    if init_info["dsv4_oscar_int2_kv_storage"] is not True:
+        raise RuntimeError("OSCAR worker telemetry requires admitted INT2 storage")
+    return {
+        "pid": os.getpid(),
+        "gpu_id": int(ps.gpu_id),
+        "tp_rank": int(ps.tp_rank),
+        "pp_rank": int(ps.pp_rank),
+        "dp_rank": None if ps.dp_rank is None else int(ps.dp_rank),
+        **{key: init_info[key] for key in _DSV4_OSCAR_WORKER_INIT_INFO_KEYS},
+    }
+
+
+def _gather_dsv4_oscar_worker_telemetry(
+    world_group: Any, local_telemetry: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Gather OSCAR proof at startup, before serialized PP control traffic."""
+
+    gathered = world_group.all_gather_object(local_telemetry)
+    expected_count = int(world_group.world_size)
+    if not isinstance(gathered, list) or len(gathered) != expected_count:
+        raise RuntimeError(
+            "OSCAR worker telemetry world gather returned "
+            f"{len(gathered) if isinstance(gathered, list) else type(gathered).__name__} "
+            f"records; expected {expected_count}"
+        )
+    if not all(isinstance(telemetry, dict) for telemetry in gathered):
+        raise RuntimeError("OSCAR worker telemetry world gather returned a non-dict")
+    return gathered
+
+
+def _get_dsv4_oscar_wo_a_absorption_telemetry(
+    model_runner: Any,
+    kv_pool: Any,
+    *,
+    oscar_storage_active: bool,
+) -> Dict[str, Any]:
+    """Revalidate and export the authoritative target-only wo_a fold proof."""
+
+    if not oscar_storage_active:
+        return {}
+    getter = getattr(model_runner, "get_dsv4_oscar_wo_a_absorption_state", None)
+    if not callable(getter):
+        raise RuntimeError(
+            "admitted OSCAR storage requires authoritative wo_a absorption telemetry"
+        )
+    state = getter()
+    if not isinstance(state, dict):
+        raise RuntimeError("OSCAR wo_a absorption getter must return a dict")
+    if set(state) != _DSV4_OSCAR_WO_A_TARGET_STATE_KEYS:
+        missing = sorted(_DSV4_OSCAR_WO_A_TARGET_STATE_KEYS - set(state))
+        extra = sorted(set(state) - _DSV4_OSCAR_WO_A_TARGET_STATE_KEYS, key=repr)
+        raise RuntimeError(
+            "OSCAR wo_a absorption state has the wrong schema: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    exact_contract = {
+        "enabled": True,
+        "consumer_role": "target_compressed",
+        "target_only": True,
+        "applied": True,
+        "apply_count": 1,
+        "all_local_target_compressed_layers_absorbed": True,
+        "all_local_target_compressed_layers_skip_runtime_restore": True,
+        "weight_dtype": "bfloat16",
+        "head_layout": "per-head-nope448-rope64",
+        "fold_orientation": "wo_a_nope@rotation",
+        "rope_columns_unchanged": True,
+    }
+    mismatches = {
+        key: state.get(key)
+        for key, expected in exact_contract.items()
+        if state.get(key) != expected
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"OSCAR wo_a absorption state violates the target contract: {mismatches}"
+        )
+
+    for key, pool_attribute in (
+        ("artifact_sha256", "oscar_artifact_sha256"),
+        ("admission_sha256", "oscar_admission_sha256"),
+    ):
+        digest = state[key]
+        expected_digest = str(getattr(kv_pool, pool_attribute, ""))
+        if (
+            not isinstance(digest, str)
+            or digest != expected_digest
+            or len(digest) != 64
+        ):
+            raise RuntimeError(f"OSCAR wo_a {key} is not bound to the admitted pool")
+        try:
+            int(digest, 16)
+        except ValueError as error:
+            raise RuntimeError(f"OSCAR wo_a {key} is not a SHA-256 digest") from error
+
+    layer_fields = (
+        "expected_local_compressed_layer_ids",
+        "absorbed_local_layer_ids",
+        "runtime_restore_skipped_layer_ids",
+    )
+    layer_lists = [state[field] for field in layer_fields]
+    if any(
+        not isinstance(layer_ids, list)
+        or not layer_ids
+        or any(
+            not isinstance(layer_id, int) or isinstance(layer_id, bool)
+            for layer_id in layer_ids
+        )
+        or layer_ids != sorted(set(layer_ids))
+        for layer_ids in layer_lists
+    ):
+        raise RuntimeError(
+            "OSCAR wo_a absorption layer coverage must be a non-empty sorted int list"
+        )
+    if not all(layer_ids == layer_lists[0] for layer_ids in layer_lists[1:]):
+        raise RuntimeError(
+            "OSCAR wo_a absorbed and runtime-skip layer coverage must be exact"
+        )
+    return state
+
+
+def _gather_dsv4_sm86_small_batch_gemm_workers(
+    tp_group: Any, local_telemetry: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Collect and validate the TP-rank records hidden behind one IPC reply."""
+
+    gathered = tp_group.all_gather_object(local_telemetry)
+    expected_count = int(tp_group.world_size)
+    if not isinstance(gathered, list) or len(gathered) != expected_count:
+        raise RuntimeError(
+            "SM86 small-batch telemetry TP gather returned "
+            f"{len(gathered) if isinstance(gathered, list) else type(gathered).__name__} "
+            f"records; expected {expected_count}"
+        )
+    if not all(isinstance(telemetry, dict) for telemetry in gathered):
+        raise RuntimeError("SM86 small-batch telemetry TP gather returned a non-dict")
+    tp_ranks = {telemetry.get("tp_rank") for telemetry in gathered}
+    if tp_ranks != set(range(expected_count)):
+        raise RuntimeError(
+            "SM86 small-batch telemetry TP gather rank coverage mismatch: "
+            f"expected {list(range(expected_count))}, "
+            f"got {sorted(repr(rank) for rank in tp_ranks)}"
+        )
+    return gathered
+
+
+def _get_kt_task_queue_affinity_worker_record(ps: ParallelState) -> Dict[str, Any]:
+    """Collect one rank's native affinity proof without breaking collectives.
+
+    A local failure is serialized into the record so every TP/EP/PP rank can
+    still enter the world-group all-gather.  The HTTP aggregation marks the
+    entire configuration inactive when any such record is present.
+    """
+
+    rank_fields: Dict[str, Any] = {
+        "pid": os.getpid(),
+        "gpu_id": int(ps.gpu_id),
+        "tp_rank": int(ps.tp_rank),
+        "pp_rank": int(ps.pp_rank),
+        "dp_rank": None if ps.dp_rank is None else int(ps.dp_rank),
+        "moe_ep_rank": int(ps.moe_ep_rank),
+        "moe_dp_rank": None if ps.moe_dp_rank is None else int(ps.moe_dp_rank),
+    }
+    try:
+        from sglang.srt.layers.moe.kt_ep_wrapper import (
+            get_kt_task_queue_affinity_telemetry,
+        )
+
+        telemetry = get_kt_task_queue_affinity_telemetry()
+        return {
+            **rank_fields,
+            "telemetry": telemetry,
+            "validation_error": None,
+        }
+    except Exception as error:
+        return {
+            **rank_fields,
+            "telemetry": None,
+            "validation_error": f"{type(error).__name__}: {error}",
+        }
+
+
+def _gather_kt_task_queue_affinity_workers(
+    world_group: Any,
+    local_record: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Gather TP and PP worker records for one DP replica."""
+
+    gathered = world_group.all_gather_object(local_record)
+    expected_count = int(world_group.world_size)
+    if not isinstance(gathered, list) or len(gathered) != expected_count:
+        return [
+            {
+                **local_record,
+                "telemetry": None,
+                "validation_error": (
+                    "RuntimeError: TaskQueue affinity world gather returned "
+                    f"{len(gathered) if isinstance(gathered, list) else type(gathered).__name__} "
+                    f"records; expected {expected_count}"
+                ),
+            }
+        ]
+    if not all(isinstance(record, dict) for record in gathered):
+        return [
+            {
+                **local_record,
+                "telemetry": None,
+                "validation_error": (
+                    "RuntimeError: TaskQueue affinity world gather returned a "
+                    "non-dict record"
+                ),
+            }
+        ]
+    return gathered
+
+
+def _get_kt_single_numa_inline_dispatch_worker_record(
+    ps: ParallelState,
+) -> Dict[str, Any]:
+    """Exercise and serialize one rank's native inline-dispatch proof.
+
+    Local validation failures are records rather than raised exceptions so all
+    model-parallel ranks still reach the startup collective.  The HTTP layer
+    rejects the complete EP2 proof if any rank reports an error.
+    """
+
+    rank_fields: Dict[str, Any] = {
+        "pid": os.getpid(),
+        "gpu_id": int(ps.gpu_id),
+        "tp_rank": int(ps.tp_rank),
+        "pp_rank": int(ps.pp_rank),
+        "dp_rank": None if ps.dp_rank is None else int(ps.dp_rank),
+        "moe_ep_rank": int(ps.moe_ep_rank),
+        "moe_dp_rank": None if ps.moe_dp_rank is None else int(ps.moe_dp_rank),
+    }
+    try:
+        from sglang.srt.layers.moe.kt_ep_wrapper import (
+            get_kt_single_numa_inline_dispatch_telemetry,
+        )
+
+        telemetry = get_kt_single_numa_inline_dispatch_telemetry()
+        return {
+            **rank_fields,
+            "telemetry": telemetry,
+            "validation_error": None,
+        }
+    except Exception as error:
+        return {
+            **rank_fields,
+            "telemetry": None,
+            "validation_error": f"{type(error).__name__}: {error}",
+        }
+
+
+def _gather_kt_single_numa_inline_dispatch_workers(
+    world_group: Any,
+    local_record: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Gather the cached inline-dispatch startup proof across the world."""
+
+    gathered = world_group.all_gather_object(local_record)
+    expected_count = int(world_group.world_size)
+    if not isinstance(gathered, list) or len(gathered) != expected_count:
+        return [
+            {
+                **local_record,
+                "telemetry": None,
+                "validation_error": (
+                    "RuntimeError: single-NUMA inline-dispatch world gather "
+                    "returned "
+                    f"{len(gathered) if isinstance(gathered, list) else type(gathered).__name__} "
+                    f"records; expected {expected_count}"
+                ),
+            }
+        ]
+    if not all(isinstance(record, dict) for record in gathered):
+        return [
+            {
+                **local_record,
+                "telemetry": None,
+                "validation_error": (
+                    "RuntimeError: single-NUMA inline-dispatch world gather "
+                    "returned a non-dict record"
+                ),
+            }
+        ]
+    return gathered
+
+
+def _get_kt_mxfp4_avx_scale_fold_worker_record(
+    ps: ParallelState,
+) -> Dict[str, Any]:
+    """Serialize one rank's immutable native scale-buffer admission."""
+
+    rank_fields: Dict[str, Any] = {
+        "pid": os.getpid(),
+        "gpu_id": int(ps.gpu_id),
+        "tp_rank": int(ps.tp_rank),
+        "pp_rank": int(ps.pp_rank),
+        "dp_rank": None if ps.dp_rank is None else int(ps.dp_rank),
+        "moe_ep_rank": int(ps.moe_ep_rank),
+        "moe_dp_rank": None if ps.moe_dp_rank is None else int(ps.moe_dp_rank),
+    }
+    try:
+        from sglang.srt.layers.moe.kt_ep_wrapper import (
+            get_kt_mxfp4_avx_scale_fold_telemetry,
+        )
+
+        telemetry = get_kt_mxfp4_avx_scale_fold_telemetry()
+        return {
+            **rank_fields,
+            "telemetry": telemetry,
+            "validation_error": None,
+        }
+    except Exception as error:
+        return {
+            **rank_fields,
+            "telemetry": None,
+            "validation_error": f"{type(error).__name__}: {error}",
+        }
+
+
+def _gather_kt_mxfp4_avx_scale_fold_workers(
+    world_group: Any,
+    local_record: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Gather scale-fold proof once while every model rank is at startup."""
+
+    gathered = world_group.all_gather_object(local_record)
+    expected_count = int(world_group.world_size)
+    if not isinstance(gathered, list) or len(gathered) != expected_count:
+        return [
+            {
+                **local_record,
+                "telemetry": None,
+                "validation_error": (
+                    "RuntimeError: MXFP4 AVX scale-fold world gather returned "
+                    f"{len(gathered) if isinstance(gathered, list) else type(gathered).__name__} "
+                    f"records; expected {expected_count}"
+                ),
+            }
+        ]
+    if not all(isinstance(record, dict) for record in gathered):
+        return [
+            {
+                **local_record,
+                "telemetry": None,
+                "validation_error": (
+                    "RuntimeError: MXFP4 AVX scale-fold world gather returned "
+                    "a non-dict record"
+                ),
+            }
+        ]
+    return gathered
 
 
 class Scheduler(
@@ -635,6 +1171,70 @@ class Scheduler(
         self.init_output_streamer()
 
         self.init_batch_result_processor()
+
+        self.dsv4_oscar_worker_telemetry: Optional[Dict[str, Any]] = None
+        self.dsv4_oscar_worker_telemetry_workers: Optional[List[Dict[str, Any]]] = None
+        if os.environ.get("SGLANG_DSV4_OSCAR_INT2_KV_STORAGE") == "1":
+            self.dsv4_oscar_worker_telemetry = _get_dsv4_oscar_worker_telemetry(
+                self.ps, self.get_init_info()
+            )
+            self.dsv4_oscar_worker_telemetry_workers = (
+                _gather_dsv4_oscar_worker_telemetry(
+                    self.world_group,
+                    self.dsv4_oscar_worker_telemetry,
+                )
+            )
+
+        self.kt_single_numa_inline_dispatch_worker_record: Optional[Dict[str, Any]] = (
+            None
+        )
+        self.kt_single_numa_inline_dispatch_workers: Optional[List[Dict[str, Any]]] = (
+            None
+        )
+        if os.environ.get("KT_SINGLE_NUMA_INLINE_DISPATCH") == "1":
+            self.kt_single_numa_inline_dispatch_worker_record = (
+                _get_kt_single_numa_inline_dispatch_worker_record(self.ps)
+            )
+            self.kt_single_numa_inline_dispatch_workers = (
+                _gather_kt_single_numa_inline_dispatch_workers(
+                    self.world_group,
+                    self.kt_single_numa_inline_dispatch_worker_record,
+                )
+            )
+
+        self.kt_mxfp4_avx_scale_fold_worker_record: Optional[Dict[str, Any]] = None
+        self.kt_mxfp4_avx_scale_fold_workers: Optional[List[Dict[str, Any]]] = None
+        if os.environ.get("KT_MXFP4_AVX_SCALE_FOLD_MODE", "off") not in (
+            "",
+            "off",
+        ):
+            self.kt_mxfp4_avx_scale_fold_worker_record = (
+                _get_kt_mxfp4_avx_scale_fold_worker_record(self.ps)
+            )
+            self.kt_mxfp4_avx_scale_fold_workers = (
+                _gather_kt_mxfp4_avx_scale_fold_workers(
+                    self.world_group,
+                    self.kt_mxfp4_avx_scale_fold_worker_record,
+                )
+            )
+
+        # PP0 processes a control request before forwarding it to PP1, so a
+        # TP x PP collective inside get_internal_state would deadlock.  Every
+        # model-parallel rank reaches this point after its KT wrapper is fully
+        # constructed; capture the native proof once here and cache the
+        # complete world-group result for later /server_info reads.
+        self.kt_task_queue_affinity_worker_record: Optional[Dict[str, Any]] = None
+        self.kt_task_queue_affinity_workers: Optional[List[Dict[str, Any]]] = None
+        if os.environ.get("KT_TASK_QUEUE_PIN_FIRST_CORE") == "1":
+            self.kt_task_queue_affinity_worker_record = (
+                _get_kt_task_queue_affinity_worker_record(self.ps)
+            )
+            self.kt_task_queue_affinity_workers = (
+                _gather_kt_task_queue_affinity_workers(
+                    self.world_group,
+                    self.kt_task_queue_affinity_worker_record,
+                )
+            )
 
         self.is_initializing = False
 
@@ -1485,6 +2085,7 @@ class Scheduler(
                 (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (KTExpertHotspotReqInput, self.handle_kt_expert_hotspot),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -1531,11 +2132,162 @@ class Scheduler(
         This method provides the initialization info needed by the tokenizer manager
         and other components to verify the scheduler is ready.
         """
-        result_dict = {
+        result_dict: Dict[str, Any] = {
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
         }
+
+        # Report effective post-allocation DSV4 storage admission, not merely
+        # launcher environment intent.  /server_info and its legacy alias
+        # merge this scheduler handshake verbatim, allowing benchmark receipts
+        # to fail closed on mixed INT4 modes and exact physical byte layouts.
+        model_runner = getattr(self.tp_worker, "model_runner", None)
+        kv_pool = getattr(model_runner, "token_to_kv_pool", None)
+        if kv_pool is not None and hasattr(kv_pool, "use_int4_storage"):
+            swa_pool = kv_pool.swa_kv_pool
+            indexer_pool = kv_pool.c4_indexer_kv_pool
+            c4_pool = getattr(kv_pool, "c4_kv_pool", None)
+            c128_pool = getattr(kv_pool, "c128_kv_pool", None)
+            oscar_storage_active = bool(
+                getattr(kv_pool, "use_oscar_int2_storage", False)
+            )
+            oscar_wo_a_absorption_state = _get_dsv4_oscar_wo_a_absorption_telemetry(
+                model_runner,
+                kv_pool,
+                oscar_storage_active=oscar_storage_active,
+            )
+            oscar_split_history_state = (
+                _get_dsv4_oscar_split_history_telemetry(
+                    model_runner,
+                    kv_pool,
+                    oscar_storage_active=oscar_storage_active,
+                )
+            )
+            oscar_c4_scorer_active = (
+                oscar_storage_active
+                and bool(getattr(indexer_pool, "use_oscar_int2_cache", False))
+                and int(getattr(indexer_pool, "layer_num", 0)) > 0
+            )
+            oscar_storage_format = ""
+            oscar_c4_scorer_format = ""
+            oscar_masked_writer_execution = ""
+            oscar_c4_masked_writer_execution = ""
+            oscar_c4_query_rotation_execution = ""
+            if oscar_storage_active:
+                from sglang.kernels.ops.attention.dsv4.oscar_int2_storage import (
+                    FORMAT_NAME as OSCAR_STORAGE_FORMAT,
+                )
+                from sglang.kernels.ops.attention.dsv4.oscar_int2_storage import (
+                    MASKED_WRITER_EXECUTION as OSCAR_MASKED_WRITER_EXECUTION,
+                )
+
+                oscar_storage_format = OSCAR_STORAGE_FORMAT
+                oscar_masked_writer_execution = OSCAR_MASKED_WRITER_EXECUTION
+            if oscar_c4_scorer_active:
+                from sglang.kernels.ops.attention.dsv4.oscar_int2_c4_indexer import (
+                    FORMAT_NAME as OSCAR_C4_SCORER_FORMAT,
+                )
+                from sglang.kernels.ops.attention.dsv4.oscar_int2_c4_indexer import (
+                    MASKED_WRITER_EXECUTION as OSCAR_C4_MASKED_WRITER_EXECUTION,
+                )
+                from sglang.kernels.ops.attention.dsv4.oscar_int2_c4_indexer import (
+                    QUERY_ROTATION_EXECUTION as OSCAR_C4_QUERY_ROTATION_EXECUTION,
+                )
+
+                oscar_c4_scorer_format = OSCAR_C4_SCORER_FORMAT
+                oscar_c4_masked_writer_execution = OSCAR_C4_MASKED_WRITER_EXECUTION
+                oscar_c4_query_rotation_execution = OSCAR_C4_QUERY_ROTATION_EXECUTION
+            result_dict.update(
+                {
+                    "dsv4_int4_kv_storage": bool(kv_pool.use_int4_storage),
+                    "dsv4_int4_c4_indexer_storage": bool(
+                        kv_pool.use_int4_indexer_storage
+                    ),
+                    "dsv4_oscar_int2_kv_storage": oscar_storage_active,
+                    "dsv4_oscar_algorithm": oscar_storage_format,
+                    "dsv4_oscar_masked_writer_execution": (
+                        oscar_masked_writer_execution
+                    ),
+                    "dsv4_oscar_wo_a_absorption_state": (oscar_wo_a_absorption_state),
+                    "dsv4_oscar_artifact_sha256": str(
+                        getattr(kv_pool, "oscar_artifact_sha256", "")
+                    ),
+                    "dsv4_oscar_model_config_sha256": str(
+                        getattr(kv_pool, "oscar_model_config_sha256", "")
+                    ),
+                    "dsv4_oscar_artifact_provenance_sha256": str(
+                        getattr(kv_pool, "oscar_artifact_provenance_sha256", "")
+                    ),
+                    "dsv4_oscar_checkpoint_sha256": str(
+                        getattr(kv_pool, "oscar_checkpoint_sha256", "")
+                    ),
+                    "dsv4_oscar_checkpoint_fingerprint_sha256": str(
+                        getattr(kv_pool, "oscar_checkpoint_fingerprint_sha256", "")
+                    ),
+                    "dsv4_oscar_admission_sha256": str(
+                        getattr(kv_pool, "oscar_admission_sha256", "")
+                    ),
+                    "dsv4_oscar_admission_receipt_sha256": str(
+                        getattr(kv_pool, "oscar_admission_receipt_sha256", "")
+                    ),
+                    "dsv4_oscar_model_id": str(getattr(kv_pool, "oscar_model_id", "")),
+                    "dsv4_sm86_c128_bf16_storage": bool(
+                        kv_pool.use_selective_c128_bf16_storage
+                    ),
+                    "dsv4_oscar_c4_scorer": oscar_c4_scorer_active,
+                    "dsv4_oscar_c4_scorer_algorithm": oscar_c4_scorer_format,
+                    "dsv4_oscar_c4_masked_writer_execution": (
+                        oscar_c4_masked_writer_execution
+                    ),
+                    "dsv4_oscar_c4_query_rotation_execution": (
+                        oscar_c4_query_rotation_execution
+                    ),
+                    "dsv4_oscar_int2_split_history": oscar_split_history_state[
+                        "enabled"
+                    ],
+                    "dsv4_oscar_int2_split_history_execution": (
+                        oscar_split_history_state["execution"]
+                    ),
+                    "dsv4_oscar_int2_split_history_split_map": (
+                        oscar_split_history_state["split_map"]
+                    ),
+                    "dsv4_oscar_int2_split_history_workspace_bytes": (
+                        oscar_split_history_state["workspace_bytes"]
+                    ),
+                    "dsv4_oscar_int2_split_history_max_partial_rows": (
+                        oscar_split_history_state["max_partial_rows"]
+                    ),
+                    "dsv4_oscar_int2_split_history_sink_owner": (
+                        oscar_split_history_state["sink_owner"]
+                    ),
+                    "dsv4_oscar_int2_split_history_prefill_enabled": (
+                        oscar_split_history_state["prefill_enabled"]
+                    ),
+                    "dsv4_oscar_int2_split_history_fixed_address": (
+                        oscar_split_history_state["fixed_address"]
+                    ),
+                    "dsv4_oscar_int2_split_history_workspace_address": (
+                        oscar_split_history_state["workspace_address"]
+                    ),
+                    "dsv4_latent_kv_bytes_per_token": int(
+                        swa_pool.get_bytes_per_token()
+                    ),
+                    "dsv4_swa_kv_bytes_per_token": int(swa_pool.get_bytes_per_token()),
+                    "dsv4_c4_kv_bytes_per_token": int(
+                        c4_pool.get_bytes_per_token() if c4_pool is not None else 1024
+                    ),
+                    "dsv4_c4_indexer_bytes_per_token": int(
+                        indexer_pool.get_bytes_per_token()
+                    ),
+                    "dsv4_c128_kv_bytes_per_token": int(
+                        c128_pool.get_bytes_per_token()
+                        if c128_pool is not None
+                        else 1024
+                    ),
+                    "dsv4_kv_storage_mode": str(kv_pool.kv_storage_mode),
+                }
+            )
 
         return result_dict
 
@@ -1598,6 +2350,31 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def _trace_dsv4_tp_phase(
+        self, phase: str, batch: Optional[ScheduleBatch] = None
+    ) -> None:
+        """Log rank-local scheduler progress for bounded DSV4 TP diagnostics."""
+        if not envs.SGLANG_DSV4_TP_TRACE.get():
+            return
+        logger.info(
+            "[dsv4-tp-trace] ts_ns=%d tp_rank=%d phase=%s forward_ct=%d "
+            "batch_iter=%s mode=%s reqs=%s extend_tokens=%s seq_lens_sum=%s "
+            "result_queue=%d waiting_queue=%d running_reqs=%s last_mode=%s",
+            time.monotonic_ns(),
+            self.ps.tp_rank,
+            phase,
+            self.forward_ct,
+            None if batch is None else batch.forward_iter,
+            None if batch is None else batch.forward_mode.name,
+            None if batch is None else batch.batch_size(),
+            None if batch is None else batch.extend_num_tokens,
+            None if batch is None else batch.seq_lens_sum,
+            len(getattr(self, "result_queue", ())),
+            len(self.waiting_queue),
+            None if self.running_batch is None else self.running_batch.batch_size(),
+            None if self.last_batch is None else self.last_batch.forward_mode.name,
+        )
+
     @DynamicGradMode()
     def event_loop_normal(self):
         """A normal scheduler loop."""
@@ -1642,25 +2419,47 @@ class Scheduler(
         def pop_and_process():
             # Process the results of the last batch
             tmp_batch, tmp_result = self.result_queue.popleft()
+            self._trace_dsv4_tp_phase("result_process_enter", tmp_batch)
             self.process_batch_result(tmp_batch, tmp_result)
+            self._trace_dsv4_tp_phase("result_process_exit", tmp_batch)
 
         while True:
             if self.gracefully_exit:
                 break
 
             # Receive requests
+            # ``forward_ct`` is monotonic, so it cannot distinguish a server that
+            # has returned to idle after serving its first batch.
+            trace_active_receive = (
+                envs.SGLANG_DSV4_TP_TRACE.get() and not self.is_fully_idle()
+            )
+            if trace_active_receive:
+                self._trace_dsv4_tp_phase("recv_enter", self.last_batch)
             recv_reqs = self.request_receiver.recv_requests()
+            if recv_reqs or trace_active_receive:
+                self._trace_dsv4_tp_phase("recv_exit", self.last_batch)
+            trace_new_request = bool(recv_reqs) and envs.SGLANG_DSV4_TP_TRACE.get()
+            if trace_new_request:
+                self._trace_dsv4_tp_phase("input_process_enter", self.last_batch)
             self.process_input_requests(recv_reqs)
+            if trace_new_request:
+                self._trace_dsv4_tp_phase("input_process_exit", self.last_batch)
             if self._engine_paused:
                 continue
 
             # Get the next batch to run
+            if trace_new_request:
+                self._trace_dsv4_tp_phase("plan_enter", self.last_batch)
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
+            if trace_new_request:
+                self._trace_dsv4_tp_phase("plan_exit", plan.batch_to_run)
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            if batch is not None:
+                self._trace_dsv4_tp_phase("batch_planned", batch)
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
             )
@@ -1680,10 +2479,14 @@ class Scheduler(
 
             # Launch the current batch
             if batch:
+                self._trace_dsv4_tp_phase("run_batch_enter", batch)
                 batch_result = self.run_batch(batch)
+                self._trace_dsv4_tp_phase("run_batch_exit", batch)
                 # Fence result processing behind this forward's shared reads.
                 self._apply_war_barrier()
+                self._trace_dsv4_tp_phase("war_barrier_enqueued", batch)
                 self.result_queue.append((batch.copy(), batch_result))
+                self._trace_dsv4_tp_phase("result_queued", batch)
             else:
                 batch_result = None
 
@@ -3106,9 +3909,8 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+                    req, self.server_args
                 ):
                     break
 
@@ -4071,6 +4873,99 @@ class Scheduler(
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
+        # `/server_info`'s scheduler_info reflects one handshake. The cached
+        # world gather proves every PP stage without a control-time collective.
+        if self.dsv4_oscar_worker_telemetry is not None:
+            if self.dsv4_oscar_worker_telemetry_workers is None:
+                raise RuntimeError("OSCAR startup worker telemetry gather is missing")
+            ret["dsv4_oscar_worker_telemetry"] = self.dsv4_oscar_worker_telemetry
+            ret["dsv4_oscar_worker_telemetry_workers"] = (
+                self.dsv4_oscar_worker_telemetry_workers
+            )
+
+        if os.environ.get("KT_MXFP4_AVX_SCALE_FOLD_MODE", "off") not in (
+            "",
+            "off",
+        ):
+            scale_fold_record = self.kt_mxfp4_avx_scale_fold_worker_record
+            scale_fold_workers = self.kt_mxfp4_avx_scale_fold_workers
+            if not isinstance(scale_fold_record, dict) or not isinstance(
+                scale_fold_workers, list
+            ):
+                scale_fold_record = {
+                    **_get_kt_mxfp4_avx_scale_fold_worker_record(self.ps),
+                    "telemetry": None,
+                    "validation_error": (
+                        "RuntimeError: MXFP4 AVX scale-fold startup proof is missing"
+                    ),
+                }
+                scale_fold_workers = [scale_fold_record]
+            ret["kt_mxfp4_avx_scale_fold"] = scale_fold_record
+            ret["kt_mxfp4_avx_scale_fold_workers"] = scale_fold_workers
+
+        if os.environ.get("KT_TASK_QUEUE_PIN_FIRST_CORE") == "1":
+            kt_task_queue_affinity = self.kt_task_queue_affinity_worker_record
+            kt_task_queue_affinity_workers = self.kt_task_queue_affinity_workers
+            if not isinstance(kt_task_queue_affinity, dict) or not isinstance(
+                kt_task_queue_affinity_workers, list
+            ):
+                kt_task_queue_affinity = {
+                    **_get_kt_task_queue_affinity_worker_record(self.ps),
+                    "telemetry": None,
+                    "validation_error": (
+                        "RuntimeError: TaskQueue affinity startup proof is missing"
+                    ),
+                }
+                kt_task_queue_affinity_workers = [kt_task_queue_affinity]
+            ret["kt_task_queue_affinity"] = kt_task_queue_affinity
+            ret["kt_task_queue_affinity_workers"] = kt_task_queue_affinity_workers
+
+        if os.environ.get("KT_SINGLE_NUMA_INLINE_DISPATCH") == "1":
+            inline_record = self.kt_single_numa_inline_dispatch_worker_record
+            inline_workers = self.kt_single_numa_inline_dispatch_workers
+            if not isinstance(inline_record, dict) or not isinstance(
+                inline_workers, list
+            ):
+                inline_record = {
+                    **_get_kt_single_numa_inline_dispatch_worker_record(self.ps),
+                    "telemetry": None,
+                    "validation_error": (
+                        "RuntimeError: single-NUMA inline-dispatch startup proof "
+                        "is missing"
+                    ),
+                }
+                inline_workers = [inline_record]
+            ret["kt_single_numa_inline_dispatch"] = inline_record
+            ret["kt_single_numa_inline_dispatch_workers"] = inline_workers
+
+        if os.environ.get("SGLANG_V4_MXFP4_SM86_SMALL_BATCH_GEMM") == "1":
+            from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
+                get_sm86_small_batch_gemm_telemetry,
+            )
+
+            sm86_small_batch_gemm = get_sm86_small_batch_gemm_telemetry()
+            sm86_small_batch_gemm.update(
+                {
+                    "pid": os.getpid(),
+                    "gpu_id": int(self.ps.gpu_id),
+                    "tp_rank": int(self.ps.tp_rank),
+                    "pp_rank": int(self.ps.pp_rank),
+                    "dp_rank": (
+                        None if self.ps.dp_rank is None else int(self.ps.dp_rank)
+                    ),
+                }
+            )
+            ret["dsv4_sm86_small_batch_gemm"] = sm86_small_batch_gemm
+            # Control requests are broadcast to every TP rank, but only the
+            # TP-group leader owns a tokenizer output socket. Gather here so
+            # that the single response forwarded by the leader proves the
+            # specialization on every participating GPU process.
+            ret["dsv4_sm86_small_batch_gemm_workers"] = (
+                _gather_dsv4_sm86_small_batch_gemm_workers(
+                    self.tp_group, sm86_small_batch_gemm
+                )
+            )
+
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 
@@ -4112,18 +5007,32 @@ class Scheduler(
                 "speculative_accept_threshold_single",
                 "speculative_accept_threshold_acc",
                 "dspark_force_budget_frac",
+                "dspark_force_verify_len",
                 "dspark_clear_info_records",
             ]
         )
 
         if_success = True
+        if (
+            server_args_dict.get("dspark_force_budget_frac") is not None
+            and server_args_dict.get("dspark_force_verify_len") is not None
+        ):
+            logging.warning(
+                "Set only one of dspark_force_budget_frac and dspark_force_verify_len."
+            )
+            if_success = False
         for k, v in server_args_dict.items():
+            if not if_success:
+                break
             if k not in args_allow_update:
                 logging.warning(f"Updating {k} is not supported.")
                 if_success = False
                 break
             elif k == "pp_max_micro_batch_size" and (
-                v > self.max_running_requests // self.ps.pp_size or v < 1
+                isinstance(v, bool)
+                or not isinstance(v, int)
+                or v > self.max_running_requests // self.ps.pp_size
+                or v < 1
             ):
                 logging.warning(
                     f"Updating {k} to {v} is rejected because it is out of the valid range [1, {self.max_running_requests // self.ps.pp_size}]."
@@ -4139,9 +5048,31 @@ class Scheduler(
                     )
                     if_success = False
                     break
-                if v is not None and not (0.0 < float(v) <= 1.0):
+                if v is not None and (
+                    isinstance(v, bool)
+                    or not isinstance(v, (int, float))
+                    or not (0.0 < float(v) <= 1.0)
+                ):
                     logging.warning(
                         f"dspark_force_budget_frac must be in (0, 1] or null, got {v}."
+                    )
+                    if_success = False
+                    break
+            elif k == "dspark_force_verify_len":
+                if not self.spec_algorithm.is_dspark() or not hasattr(
+                    self.draft_worker, "set_dspark_forced_verify_len"
+                ):
+                    logging.warning(
+                        "dspark_force_verify_len requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
+                if v is not None and (
+                    isinstance(v, bool) or not isinstance(v, int) or not 2 <= v <= 6
+                ):
+                    logging.warning(
+                        "dspark_force_verify_len must be an integer in [2, 6] "
+                        f"or null, got {v}."
                     )
                     if_success = False
                     break
@@ -4151,6 +5082,12 @@ class Scheduler(
                 ):
                     logging.warning(
                         "dspark_clear_info_records requires a DSpark draft worker."
+                    )
+                    if_success = False
+                    break
+                if not isinstance(v, bool):
+                    logging.warning(
+                        f"dspark_clear_info_records must be boolean, got {v}."
                     )
                     if_success = False
                     break
@@ -4176,6 +5113,11 @@ class Scheduler(
                 self.draft_worker.set_dspark_forced_budget_frac(
                     None if frac is None else float(frac)
                 )
+            verify_len = remaining.pop("dspark_force_verify_len", None)
+            if "dspark_force_verify_len" in server_args_dict:
+                self.draft_worker.set_dspark_forced_verify_len(
+                    None if verify_len is None else int(verify_len)
+                )
             if remaining.pop("dspark_clear_info_records", None):
                 self.draft_worker.clear_info_records()
             if remaining:
@@ -4183,6 +5125,35 @@ class Scheduler(
             logger.info(f"Config updated via context override: {remaining}")
 
         return SetInternalStateReqOutput(updated=if_success)
+
+    def handle_kt_expert_hotspot(
+        self, recv_req: KTExpertHotspotReqInput
+    ) -> KTExpertHotspotReqOutput:
+        """Apply an address-stable expert placement only at a quiescent boundary."""
+
+        if not self.is_fully_idle():
+            return KTExpertHotspotReqOutput(
+                success=False,
+                message=(
+                    "Hotspot placement rejected because the scheduler has running, "
+                    "waiting, or undrained requests"
+                ),
+            )
+        try:
+            from sglang.srt.layers.moe.kt_hotspot import apply_hotspot_plan
+
+            receipt = apply_hotspot_plan(
+                plan_path=recv_req.plan_path,
+                generation=recv_req.generation,
+                dry_run=recv_req.dry_run,
+            )
+            return KTExpertHotspotReqOutput(success=True, receipt=receipt)
+        except Exception as error:
+            logger.exception("KTransformers hotspot placement failed")
+            return KTExpertHotspotReqOutput(
+                success=False,
+                message=f"{type(error).__name__}: {error}",
+            )
 
     def save_remote_model(self, **kwargs):
         self.weight_updater.save_remote_model(kwargs)

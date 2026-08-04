@@ -68,6 +68,11 @@ def enable_tc_piecewise_cuda_graph():
 @dataclass
 class TcPiecewiseForwardContext:
     forward_batch: Optional[ForwardBatch] = None
+    # BCG body replay uses ``forward_batch`` for capture-stable, bucket-padded
+    # tensor addresses. Eager bridges that perform side effects (for example
+    # DSV4 cache writes) instead need the original serving batch with raw
+    # token-axis tensors. Other runners leave this unset.
+    runtime_forward_batch: Optional[ForwardBatch] = None
     attention_layers: Optional[List[Any]] = field(default=None)
     mha_companion_layers: Optional[List[Any]] = field(default=None)
     quant_config: Any = None
@@ -102,10 +107,12 @@ def set_tc_piecewise_forward_context(
     num_tokens: Optional[int] = None,
     raw_num_tokens: Optional[int] = None,
     full_graph: bool = False,
+    runtime_forward_batch: Optional[ForwardBatch] = None,
 ):
     global _tc_piecewise_forward_context
     _tc_piecewise_forward_context = TcPiecewiseForwardContext(
         forward_batch=forward_batch,
+        runtime_forward_batch=runtime_forward_batch,
         attention_layers=attention_layers,
         mha_companion_layers=mha_companion_layers,
         quant_config=quant_config,

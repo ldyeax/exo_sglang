@@ -30,8 +30,15 @@ def _jit_fused_store_module(
     input_dtype: torch.dtype,
     index_dtype: torch.dtype,
     page_size: int,
+    int4_store: bool,
 ):
-    args = make_cpp_args(input_dtype, index_dtype, page_size, is_arch_support_pdl())
+    args = make_cpp_args(
+        input_dtype,
+        index_dtype,
+        page_size,
+        is_arch_support_pdl(),
+        int4_store,
+    )
     cname = "FlashMLA" if name == "flashmla" else "Indexer"
     kernel_class = f"FusedStoreCache{cname}Kernel<{args}>"
     return load_jit(
@@ -58,17 +65,14 @@ def fused_store_cache(
     *,
     page_size: int,
     type: Literal["flashmla", "indexer"],
+    int4_store: bool = False,
 ) -> None:
     if is_hip_runtime():
+        if int4_store:
+            raise RuntimeError("DSV4 signed-INT4 cache storage is CUDA SM86 only")
         from sglang.kernels.ops.kvcache.triton_store_cache import (
             triton_fused_store_cache,
         )
-        # Force unsigned zero-extension: uint8→uint32→int32.
-        # .to(tl.int32) on a uint8 value may sign-extend bytes ≥128
-        # into negative int32, causing an out-of-bounds LUT access.
-        idx = raw.to(tl.uint32).to(tl.int32)
-        fp8_val = tl.load(lut_ptr + idx)
-        fp8_vals = fp8_val * fp8_scale
 
         triton_fused_store_cache(input, cache, indices, page_size=page_size, type=type)
     else:
@@ -77,6 +81,7 @@ def fused_store_cache(
             input_dtype=input.dtype,
             index_dtype=indices.dtype,
             page_size=page_size,
+            int4_store=int4_store,
         )
         module.run(input, cache, indices)
 
