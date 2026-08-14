@@ -60,7 +60,6 @@ deepseek_v4_moe_code_path_checker = _DeepSeekV4MoeCodePathChecker()
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
-
 from sglang.srt.utils.common import get_bool_env_var
 
 _USE_OFFICIAL_SHUFFLE = get_bool_env_var(
@@ -120,17 +119,17 @@ class PackTopkIds:
 
     @classmethod
     def triton(cls, topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
-        assert topk_ids.shape == topk_weights.shape, (
-            f"shape mismatch: {topk_ids.shape=} vs {topk_weights.shape=}"
-        )
+        assert (
+            topk_ids.shape == topk_weights.shape
+        ), f"shape mismatch: {topk_ids.shape=} vs {topk_weights.shape=}"
         assert topk_ids.ndim >= 1, f"expected >=1D, got {topk_ids.shape=}"
 
-        assert topk_ids.dtype == torch.int32, (
-            f"topk_ids must be int32, got {topk_ids.dtype}"
-        )
-        assert topk_weights.dtype == torch.float32, (
-            f"topk_weights must be float32, got {topk_weights.dtype}"
-        )
+        assert (
+            topk_ids.dtype == torch.int32
+        ), f"topk_ids must be int32, got {topk_ids.dtype}"
+        assert (
+            topk_weights.dtype == torch.float32
+        ), f"topk_weights must be float32, got {topk_weights.dtype}"
 
         assert topk_ids.is_contiguous(), "topk_ids must be contiguous"
         assert topk_weights.is_contiguous(), "topk_weights must be contiguous"
@@ -184,6 +183,7 @@ class DeepSeekMxfp4MoEMethod:
     # from Fp8Config.get_quant_method.
     _quant_wrapper_id = "mxfp4_deepseek"
     _supports_caller_owned_output = True
+    _supports_kt_fused_routing = True
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
@@ -308,13 +308,15 @@ class DeepSeekMxfp4MoEMethod:
         # Origin: sglang 本身.
         try:
             from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
-                use_v4_triton_kernels,
-                force_disable_v4_triton_kernels,
                 convert_v4_weights_to_triton_kernels,
+                force_disable_v4_triton_kernels,
+                fused_t5_moe_enabled,
+                use_v4_triton_kernels,
             )
         except Exception:
             use_v4_triton_kernels = lambda: False
             force_disable_v4_triton_kernels = lambda: False
+            fused_t5_moe_enabled = lambda: False
             convert_v4_weights_to_triton_kernels = None
 
         _force_tk = use_v4_triton_kernels()
@@ -369,6 +371,7 @@ class DeepSeekMxfp4MoEMethod:
             layer._v4_tk_w2_pcg = w2_pcg
             layer._v4_tk_intermediate_size = intermediate_size_tk
             layer._v4_tk_num_experts = w13_raw.shape[0]
+            layer._v4_tk_fused_t5_moe = fused_t5_moe_enabled()
             layer._v4_tk_path = True
             return
 
@@ -491,7 +494,13 @@ class DeepSeekMxfp4MoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-        return self._apply(layer, dispatch_output, caller_output=None)
+        return self._apply(
+            layer,
+            dispatch_output,
+            caller_output=None,
+            gpu_experts_mask=None,
+            logical_to_gpu_index=None,
+        )
 
     def apply_with_output(
         self,
@@ -506,7 +515,34 @@ class DeepSeekMxfp4MoEMethod:
         interface.  KTEPWrapperMethod calls it only for its opt-in compact-ID
         hybrid path, after staging the input for the CPU experts.
         """
-        return self._apply(layer, dispatch_output, caller_output=caller_output)
+        return self._apply(
+            layer,
+            dispatch_output,
+            caller_output=caller_output,
+            gpu_experts_mask=None,
+            logical_to_gpu_index=None,
+        )
+
+    def apply_with_kt_fused_routing(
+        self,
+        layer: Module,
+        dispatch_output: DispatchOutput,
+        *,
+        gpu_experts_mask: torch.Tensor,
+        logical_to_gpu_index: torch.Tensor,
+        caller_output: torch.Tensor | None = None,
+    ) -> CombineInput:
+        """Fuse KT logical-ID masking/remap into the tiny routing program."""
+
+        if not self._kt_compact_ids or not getattr(layer, "_v4_tk_path", False):
+            raise RuntimeError("KT fused routing requires compact V4 MXFP4 experts")
+        return self._apply(
+            layer,
+            dispatch_output,
+            caller_output=caller_output,
+            gpu_experts_mask=gpu_experts_mask,
+            logical_to_gpu_index=logical_to_gpu_index,
+        )
 
     def _apply(
         self,
@@ -514,6 +550,8 @@ class DeepSeekMxfp4MoEMethod:
         dispatch_output: DispatchOutput,
         *,
         caller_output: torch.Tensor | None,
+        gpu_experts_mask: torch.Tensor | None,
+        logical_to_gpu_index: torch.Tensor | None,
     ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -525,13 +563,13 @@ class DeepSeekMxfp4MoEMethod:
         # Must dispatch before accessing layer.w13_weight (we deleted it
         # during process_weights_after_loading on the triton_kernels path).
         if getattr(layer, "_v4_tk_path", False):
-            from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
-                apply_v4_triton_kernels_moe,
-            )
-
             # Extract topk_ids/weights from topk_output (mirror the trtllm
             # extraction below, which happens after this dispatch).
             from sglang.srt.layers.moe.topk import TopKOutputChecker
+            from sglang.srt.layers.quantization.v4_triton_kernels_moe import (
+                apply_v4_triton_kernels_moe,
+                fused_t5_moe_enabled,
+            )
 
             if TopKOutputChecker.format_is_standard(topk_output):
                 topk_ids = topk_output.topk_ids
@@ -543,7 +581,7 @@ class DeepSeekMxfp4MoEMethod:
                 raise NotImplementedError(
                     f"triton_kernels V4 path: unsupported topk format {topk_output.format}"
                 )
-            if not get_bool_env_var(
+            if gpu_experts_mask is None and not get_bool_env_var(
                 "SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING", default="false"
             ):
                 topk_ids = map_mxfp4_expert_ids_for_ep(
@@ -572,6 +610,18 @@ class DeepSeekMxfp4MoEMethod:
                 routed_scaling_factor=1.0,
                 swiglu_limit=layer.moe_runner_config.swiglu_limit,
                 caller_output=caller_output,
+                # Weight conversion and execution must use one process-wide
+                # predicate.  KT delegates through wrapper layers that do not
+                # reliably preserve arbitrary Python marker attributes even
+                # though the converted `_v4_tk_*` storages remain attached.
+                # Reading the marker here could therefore interleave W13 at
+                # load time but run the legacy half-split activation at graph
+                # capture, silently corrupting every routed expert.  The env
+                # predicate is also what conversion uses, so it is the only
+                # safe source of truth for both sides of the layout contract.
+                fused_t5_moe=fused_t5_moe_enabled(),
+                gpu_experts_mask=gpu_experts_mask,
+                logical_to_gpu_index=logical_to_gpu_index,
             )
             # rsf handled here (not inside kernel) to mirror the trtllm path
             # (line ~638) and avoid double-apply with FUSE_RSF_SHARED_ADD.
@@ -590,6 +640,8 @@ class DeepSeekMxfp4MoEMethod:
             raise RuntimeError(
                 "caller-owned MXFP4 output requires the V4 triton_kernels path"
             )
+        if gpu_experts_mask is not None or logical_to_gpu_index is not None:
+            raise RuntimeError("KT fused routing requires the V4 triton_kernels path")
 
         w13 = layer.w13_weight
         w2 = layer.w2_weight

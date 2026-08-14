@@ -44,6 +44,11 @@ from sglang.kernels.ops.attention.dsv4.oscar_int2_storage import (
     ARTIFACT_VERSION,
     C4_ROTATION_COMPOSITION,
     C4_ROTATION_OBJECTIVE,
+)
+from sglang.kernels.ops.attention.dsv4.oscar_int2_storage import (
+    CALIBRATION_DOMAIN as SHARED_LATENT_CALIBRATION_DOMAIN,
+)
+from sglang.kernels.ops.attention.dsv4.oscar_int2_storage import (
     CLIP_PER_ROW_QUANTILE,
     CONSUMER_SCOPE,
     OSCAR_CLIP_SOURCE_SHA256,
@@ -55,13 +60,11 @@ from sglang.kernels.ops.attention.dsv4.oscar_int2_storage import (
     _validate_heldout_metrics,
     tree_sha256,
 )
-from sglang.kernels.ops.attention.dsv4.oscar_int2_storage import (
-    CALIBRATION_DOMAIN as SHARED_LATENT_CALIBRATION_DOMAIN,
-)
 
 FORMAT_NAME = "oscar-int2-c4-asym-c128-fp32-adjacent4-v1"
 MASKED_WRITER_EXECUTION = "device-uniform-live-mask-row-v1"
 QUERY_ROTATION_EXECUTION = "once-per-query-stable-workspace-v1"
+FUSED_ROPE_ROTATION_EXECUTION = "rope-and-oscar-once-per-scored-query-v1"
 CALIBRATION_DOMAIN = "c4_scorer"
 CLIP_MODE = CLIP_PER_ROW_QUANTILE
 CLIP_SEMANTICS = ARTIFACT_CLIP_SEMANTICS
@@ -1156,14 +1159,26 @@ def _rotate_oscar_int2_c4_query_kernel(
     query_ptr,
     rotation_ptr,
     output_ptr,
+    freqs_real_ptr,
+    positions_ptr,
     rotation_stride_in,
     rotation_stride_out,
+    freqs_stride_position,
+    seq_lens_ptr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
+    rope_dim: tl.constexpr,
+    selection_topk: tl.constexpr,
+    fuse_rope: tl.constexpr,
 ):
-    """Rotate one query row exactly once before page-parallel scoring."""
+    """Apply optional RoPE and OSCAR once before page-parallel scoring."""
 
     batch_idx = tl.program_id(0)
+    if selection_topk > 0:
+        seq_len = tl.load(seq_lens_ptr + batch_idx)
+        needs_scoring = seq_len > selection_topk
+    else:
+        needs_scoring = True
     head_offsets = tl.arange(0, num_heads)
     dim_offsets = tl.arange(0, head_dim)
     query_offsets = (
@@ -1171,14 +1186,56 @@ def _rotate_oscar_int2_c4_query_kernel(
         + head_offsets[:, None] * head_dim
         + dim_offsets[None, :]
     )
-    query = tl.load(query_ptr + query_offsets)
-    rotation = tl.load(
-        rotation_ptr
-        + dim_offsets[:, None] * rotation_stride_in
-        + dim_offsets[None, :] * rotation_stride_out
-    )
-    rotated_query = tl.dot(query, rotation, out_dtype=tl.float32).to(tl.bfloat16)
-    tl.store(output_ptr + query_offsets, rotated_query)
+    if needs_scoring:
+        query = tl.load(query_ptr + query_offsets)
+        if fuse_rope:
+            nope_dim = head_dim - rope_dim
+            rope_offsets = dim_offsets - nope_dim
+            pair_offsets = rope_offsets & ~1
+            position = tl.load(positions_ptr + batch_idx)
+            frequency_base = position * freqs_stride_position + pair_offsets
+            cosine = tl.load(
+                freqs_real_ptr + frequency_base,
+                mask=dim_offsets >= nope_dim,
+                other=1.0,
+            )
+            sine = tl.load(
+                freqs_real_ptr + frequency_base + 1,
+                mask=dim_offsets >= nope_dim,
+                other=0.0,
+            )
+            paired_dims = tl.where(
+                (rope_offsets & 1) == 0,
+                dim_offsets + 1,
+                dim_offsets - 1,
+            )
+            paired_query = tl.load(
+                query_ptr
+                + batch_idx * num_heads * head_dim
+                + head_offsets[:, None] * head_dim
+                + paired_dims[None, :],
+                mask=dim_offsets[None, :] >= nope_dim,
+                other=0.0,
+            )
+            rope_query = tl.where(
+                (rope_offsets[None, :] & 1) == 0,
+                query * cosine[None, :] - paired_query * sine[None, :],
+                query * cosine[None, :] + paired_query * sine[None, :],
+            )
+            # Match the old fused_rope_inplace BF16 store/load boundary before
+            # the Oscar HMMA. This keeps graph acceptance stable.
+            query = tl.where(
+                dim_offsets[None, :] >= nope_dim,
+                rope_query,
+                query,
+            ).to(tl.bfloat16)
+        rotation = tl.load(
+            rotation_ptr
+            + dim_offsets[:, None] * rotation_stride_in
+            + dim_offsets[None, :] * rotation_stride_out
+        )
+        rotated_query = tl.dot(query, rotation, out_dtype=tl.float32).to(tl.bfloat16)
+        tl.store(output_ptr + query_offsets, rotated_query)
 
 
 def oscar_int2_c4_paged_mqa_logits_triton(
@@ -1195,6 +1252,9 @@ def oscar_int2_c4_paged_mqa_logits_triton(
     out: torch.Tensor,
     rotated_query_out: torch.Tensor,
     page_size: int = PAGE_SIZE,
+    freqs_cis_real: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
+    selection_topk: int = 0,
 ) -> torch.Tensor:
     """Rotate once, then fuse OSCAR page decode and C4 scoring.
 
@@ -1202,7 +1262,11 @@ def oscar_int2_c4_paged_mqa_logits_triton(
     Warm this exact shape/specialization eagerly before CUDA graph capture;
     thereafter the wrapper performs no device allocation.  The scorer's page
     programs consume the one rotated query instead of redundantly evaluating
-    ``query @ R`` once per program.
+    ``query @ R`` once per program.  Supplying ``freqs_cis_real`` and
+    ``positions`` fuses the preceding RoPE into that transform.  A positive
+    ``selection_topk`` elides both transforms and all scoring for rows whose
+    sequence length is no larger than top-k, because selection is exactly the
+    complete sequence in that case.
     """
 
     del deep_gemm_metadata
@@ -1264,21 +1328,68 @@ def oscar_int2_c4_paged_mqa_logits_triton(
         )
     if rotated_query_out.data_ptr() == query.data_ptr():
         raise ValueError("rotated_query_out must not alias query")
-    tensors = (storage, weight, seq_lens, page_table, out, rotated_query_out)
+    if (freqs_cis_real is None) != (positions is None):
+        raise ValueError("freqs_cis_real and positions must be supplied together")
+    fuse_rope = freqs_cis_real is not None
+    if fuse_rope:
+        assert freqs_cis_real is not None and positions is not None
+        if (
+            freqs_cis_real.dtype != torch.float32
+            or freqs_cis_real.ndim != 2
+            or freqs_cis_real.shape[1] != 64
+            or freqs_cis_real.stride(1) != 1
+        ):
+            raise ValueError("freqs_cis_real must be FP32 [max_position, 64]")
+        if (
+            positions.dtype not in (torch.int32, torch.int64)
+            or tuple(positions.shape) != (batch_size,)
+            or not positions.is_contiguous()
+        ):
+            raise ValueError("positions must be contiguous INT32/INT64 [B]")
+    if (
+        not isinstance(selection_topk, int)
+        or isinstance(selection_topk, bool)
+        or selection_topk < 0
+    ):
+        raise ValueError("selection_topk must be a non-negative integer")
+    tensors = (
+        storage,
+        weight,
+        seq_lens,
+        page_table,
+        out,
+        rotated_query_out,
+        *((freqs_cis_real, positions) if fuse_rope else ()),
+    )
     if any(tensor.device != query.device for tensor in tensors):
         raise ValueError("all scorer tensors must share one CUDA device")
     _validate_runtime_calibration(calibration, query.device)
     if clean_logits:
         out.zero_()
 
+    # Static graph tiers at or below top-k need neither scores nor a rotated
+    # query: the downstream transform returns every live token in page order.
+    # Avoid even launching no-op Triton programs for the common early-context
+    # decode graphs.  Larger tiers retain the device-side live-length guard so
+    # replay can move above and below the threshold without recapture.
+    if selection_topk > 0 and max_seq_len <= selection_topk:
+        return out
+
     _rotate_oscar_int2_c4_query_kernel[(batch_size,)](
         query,
         calibration.rotation,
         rotated_query_out,
+        query if freqs_cis_real is None else freqs_cis_real,
+        seq_lens if positions is None else positions,
         calibration.rotation.stride(0),
         calibration.rotation.stride(1),
+        0 if freqs_cis_real is None else freqs_cis_real.stride(0),
+        seq_lens.view(batch_size),
         num_heads=NUM_HEADS,
         head_dim=HEAD_DIM,
+        rope_dim=64,
+        selection_topk=selection_topk,
+        fuse_rope=fuse_rope,
         num_warps=8,
         num_stages=1,
     )
@@ -1307,6 +1418,7 @@ def oscar_int2_c4_paged_mqa_logits_triton(
         group_size=GROUP_SIZE,
         packed_bytes_per_token=CODES_BYTES_PER_TOKEN,
         metadata_values_per_token=METADATA_VALUES_PER_TOKEN,
+        selection_topk=selection_topk,
         num_warps=8,
         num_stages=1,
     )
@@ -1335,6 +1447,7 @@ def _oscar_int2_c4_paged_mqa_logits_kernel(
     group_size: tl.constexpr,
     packed_bytes_per_token: tl.constexpr,
     metadata_values_per_token: tl.constexpr,
+    selection_topk: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     program_idx = tl.program_id(1)
@@ -1342,7 +1455,7 @@ def _oscar_int2_c4_paged_mqa_logits_kernel(
     bounded_seq_len = tl.minimum(tl.maximum(seq_len, 0), max_seq_len)
     active_pages = tl.minimum(tl.cdiv(bounded_seq_len, page_size), page_table_width)
 
-    if program_idx < active_pages:
+    if (bounded_seq_len > selection_topk) & (program_idx < active_pages):
         head_offsets = tl.arange(0, num_heads)
         dim_offsets = tl.arange(0, head_dim)
         token_offsets = tl.arange(0, page_size)
@@ -1413,6 +1526,7 @@ __all__ = [
     "CODES_BYTES_PER_PAGE",
     "CODES_BYTES_PER_TOKEN",
     "FORMAT_NAME",
+    "FUSED_ROPE_ROTATION_EXECUTION",
     "GROUP_SIZE",
     "HEAD_DIM",
     "INT2_MAX",

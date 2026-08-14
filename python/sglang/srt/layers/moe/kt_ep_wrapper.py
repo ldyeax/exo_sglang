@@ -120,6 +120,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 _DSV4_KT_INPLACE_MOE_OUTPUT_ENV = "SGLANG_DSV4_KT_INPLACE_MOE_OUTPUT"
+_DSV4_KT_FUSED_T5_MOE_ENV = "SGLANG_V4_MXFP4_FUSED_T5_MOE"
 _KT_HOTSPOT_EXPERT_CACHE_ENV = "SGLANG_KT_HOTSPOT_EXPERT_CACHE"
 _DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU_ENV = "SGLANG_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU"
 
@@ -1407,9 +1408,9 @@ class SharedStagingBuffer:
 
     def get_slice(self, num_tokens: int) -> torch.Tensor:
         """Get a slice of the buffer for the given number of tokens."""
-        assert num_tokens <= self.max_tokens, (
-            f"Batch size {num_tokens} exceeds staging buffer max size {self.max_tokens}"
-        )
+        assert (
+            num_tokens <= self.max_tokens
+        ), f"Batch size {num_tokens} exceeds staging buffer max size {self.max_tokens}"
         return self.buffer[:num_tokens]
 
 
@@ -1515,6 +1516,7 @@ class SharedFullContext:
         # detection in kt_ep_wrapper).
         try:
             import os as _os_v4
+
             from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
             from sglang.srt.layers.quantization.mxfp4_deepseek import (
                 DeepSeekMxfp4MoEMethod,
@@ -2943,9 +2945,11 @@ def load_cpu_expert_shard_plan(
                 f"'expert_ids_by_rank': {real_path}"
             )
         shards = tuple(
-            shard.to(device="cpu", dtype=torch.int64).contiguous()
-            if isinstance(shard, torch.Tensor)
-            else torch.as_tensor(shard, dtype=torch.int64).contiguous()
+            (
+                shard.to(device="cpu", dtype=torch.int64).contiguous()
+                if isinstance(shard, torch.Tensor)
+                else torch.as_tensor(shard, dtype=torch.int64).contiguous()
+            )
             for shard in raw_shards
         )
         _KT_CPU_EXPERT_SHARD_PLANS[real_path] = shards
@@ -3120,11 +3124,13 @@ def load_hybrid_expert_shard_plan(
             cpu_shards = tuple(cpu_padded[rank] for rank in range(ep_size))
         else:
             cpu_shards = tuple(
-                shard.to(device="cpu", dtype=torch.int64).contiguous()
-                if isinstance(shard, torch.Tensor)
-                else torch.as_tensor(
-                    shard, dtype=torch.int64, device="cpu"
-                ).contiguous()
+                (
+                    shard.to(device="cpu", dtype=torch.int64).contiguous()
+                    if isinstance(shard, torch.Tensor)
+                    else torch.as_tensor(
+                        shard, dtype=torch.int64, device="cpu"
+                    ).contiguous()
+                )
                 for shard in raw_cpu_shards
             )
         cached = (gpu_masks, cpu_shards)
@@ -5125,9 +5131,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             w2_precision.weight_scale,
         )
         layouts = {
-            type(getattr(tensor, "storage", None).layout).__name__
-            if getattr(tensor, "storage", None) is not None
-            else "missing"
+            (
+                type(getattr(tensor, "storage", None).layout).__name__
+                if getattr(tensor, "storage", None) is not None
+                else "missing"
+            )
             for tensor in tensor_objects
         }
         if layouts != {"StridedLayout"}:
@@ -5659,9 +5667,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             dispatch_output: Dispatched tokens and routing information
             staged_hidden_states: Pre-copied hidden states in staging buffer
         """
-        assert self.moe_runner_config.activation == "silu", (
-            "Only SiLU activation is supported."
-        )
+        assert (
+            self.moe_runner_config.activation == "silu"
+        ), "Only SiLU activation is supported."
 
         if self.tp_rank != 0 or self.wrapper is None:
             return
@@ -5700,9 +5708,13 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # All-CPU draft layers and GPU methods without the V4 caller-output
         # adapter share this wrapper.  They retain the ordinary allocation
         # path; the opt-in applies only where every capability is present.
+        uses_portable_mxfp4_layout = bool(
+            getattr(layer, "_v4_tk_path", False)
+            or getattr(layer, "_dsv4_mxfp4_backend", None) == "triton_kernels"
+        )
         capability_requirements = (
             bool(getattr(self.gpu_method, "_kt_compact_ids", False)),
-            bool(getattr(layer, "_v4_tk_path", False)),
+            uses_portable_mxfp4_layout,
             bool(getattr(self.gpu_method, "_supports_caller_owned_output", False)),
             callable(getattr(self.gpu_method, "apply_with_output", None)),
         )
@@ -5894,9 +5906,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         remote_pending = None
         if self.tp_rank == 0 and self._cpu_stream is not None:
             # Use shared staging buffer (shared across all MoE layers to save GPU memory)
-            assert self._shared_staging_buffer is not None, (
-                "Shared staging buffer not initialized"
-            )
+            assert (
+                self._shared_staging_buffer is not None
+            ), "Shared staging buffer not initialized"
             staging_buffer = self._shared_staging_buffer.get_slice(x.shape[0])
 
             # Copy to staging buffer on main stream
@@ -5925,18 +5937,37 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 torch.cuda.synchronize(x.device)
             _kt_t_after_submit = time.perf_counter()
 
-        # Step 2: Prepare GPU computation by masking and remapping expert IDs
-        # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
+        # Step 2: Prepare GPU computation by masking and remapping expert IDs.
+        # The exact SM86 T<=6 V4 path consumes the logical IDs directly and
+        # folds this lookup into its one-program routing-data builder.
         topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_and_remap_expert_ids(
-            topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
+        use_fused_kt_routing = (
+            os.environ.get(_DSV4_KT_FUSED_T5_MOE_ENV) == "1"
+            and os.environ.get("SGLANG_V4_MXFP4_SMALL_ROW_ROUTING") == "1"
+            and bool(getattr(self.gpu_method, "_supports_kt_fused_routing", False))
+            and bool(
+                getattr(layer, "_v4_tk_path", False)
+                or getattr(layer, "_dsv4_mxfp4_backend", None) == "triton_kernels"
+            )
+            and 1 <= num_tokens <= 6
+            and topk_ids.ndim == 2
+            and topk_ids.shape[1] == 6
+            and topk_ids.dtype == torch.int32
+            and topk_output.topk_weights.dtype == torch.float32
         )
-
-        # Create modified dispatch output for GPU computation
-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
-        masked_dispatch_output = dispatch_output._replace(
-            topk_output=masked_topk_output
-        )
+        if use_fused_kt_routing:
+            masked_dispatch_output = dispatch_output
+        else:
+            masked_topk_ids = mask_and_remap_expert_ids(
+                topk_ids,
+                self.gpu_experts_mask_cuda,
+                self.logical_to_gpu_index_cuda,
+            )
+            # Create modified dispatch output for GPU computation.
+            masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
+            masked_dispatch_output = dispatch_output._replace(
+                topk_output=masked_topk_output
+            )
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -6005,7 +6036,18 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
                 deepseek_v4_moe_code_path_checker.observed += 1
         else:
-            if use_caller_owned_output:
+            if use_fused_kt_routing:
+                apply_with_fused_routing = getattr(
+                    self.gpu_method, "apply_with_kt_fused_routing"
+                )
+                gpu_combine_input = apply_with_fused_routing(
+                    layer,
+                    masked_dispatch_output,
+                    gpu_experts_mask=self.gpu_experts_mask_cuda,
+                    logical_to_gpu_index=self.logical_to_gpu_index_cuda,
+                    caller_output=x if use_caller_owned_output else None,
+                )
+            elif use_caller_owned_output:
                 apply_with_output = getattr(self.gpu_method, "apply_with_output")
                 gpu_combine_input = apply_with_output(
                     layer,

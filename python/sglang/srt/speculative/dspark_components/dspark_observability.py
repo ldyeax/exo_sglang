@@ -38,6 +38,9 @@ class InfoComponent(str, Enum):
     STEP_GPU_TIME = "step_gpu_time"
     DRAFT_GPU_TIME = "draft_gpu_time"
     TARGET_VERIFY_GPU_TIME = "target_verify_gpu_time"
+    # Fixed external-event ranges embedded in the target/draft CUDA graphs.
+    # Harvesting happens once after the whole cycle, never from replay.
+    INTERNAL_GPU_TIME = "internal_gpu_time"
     REQS = "reqs"
     # Compact, per-position greedy-verification evidence.  This intentionally
     # records only the winning logit and the proposed-token logit; dumping the
@@ -117,6 +120,7 @@ class DecodeStepRecord(msgspec.Struct, omit_defaults=True):
     step_gpu_ms: Optional[float] = None
     draft_gpu_ms: Optional[float] = None
     target_verify_gpu_ms: Optional[float] = None
+    internal_gpu_ms: Optional[dict[str, float]] = None
     reqs: Optional[list[ReqDetail]] = None
 
 
@@ -163,6 +167,7 @@ class _PendingStep(msgspec.Struct):
     rids: Optional[list[str]]
     future: Optional[FutureTensors]
     segment_events: dict[InfoSegment, tuple[torch.cuda.Event, torch.cuda.Event]]
+    internal_gpu_ms: Optional[dict[str, float]]
 
 
 def compact_greedy_logit_evidence(
@@ -291,6 +296,18 @@ class DsparkInfoDumper:
         step_cpu_ms = self._step_cpu_ms(now=now)
         self._drain_pending()
 
+        internal_gpu_ms = None
+        if InfoComponent.INTERNAL_GPU_TIME in self._components:
+            from sglang.srt.observability.dsv4_internal_timing import (
+                snapshot_dsv4_internal_timing,
+            )
+
+            # The target graph has completed its Python call and the next
+            # DSpark replay has not begun.  This is the only safe window to
+            # consume persistent external-event timestamps without allowing a
+            # later replay to overwrite them.
+            internal_gpu_ms = snapshot_dsv4_internal_timing()
+
         future = self._stage_reqs(obs) if self._stages_request_details else None
         self._pending = _PendingStep(
             forward_ct=int(obs.forward_ct),
@@ -308,6 +325,7 @@ class DsparkInfoDumper:
             rids=obs.rids,
             future=future,
             segment_events=self._current_segments,
+            internal_gpu_ms=internal_gpu_ms,
         )
         self._current_segments = {}
         self._prev_stamp = now
@@ -437,6 +455,8 @@ class DsparkInfoDumper:
             record.target_verify_gpu_ms = self._segment_ms(
                 pending, InfoSegment.TARGET_VERIFY
             )
+        if InfoComponent.INTERNAL_GPU_TIME in self._components:
+            record.internal_gpu_ms = pending.internal_gpu_ms
         if self._stages_request_details and pending.future is not None:
             record.reqs = self._build_reqs(
                 host=pending.future.wait(), bs=pending.bs, rids=pending.rids

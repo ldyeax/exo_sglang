@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 @lru_cache(maxsize=1)
 def _portable_kernel_module() -> ModuleType:
     """Load the current SGLang kernel, with an explicit file override for tests."""
@@ -60,6 +61,15 @@ def _portable_kernel_module() -> ModuleType:
 class Mxfp4TritonKernelsMoEMethod:
     """Native E2M1/UE8M0 MoE method using portable Triton gather/scatter GEMMs."""
 
+    # KTEPWrapperMethod uses these capability bits to select its graph-safe
+    # compact-routing and caller-owned-output paths.  This adapter is the
+    # production method selected by Fp8Config whenever V4 FP4 experts run with
+    # ``--moe-runner-backend triton``; keeping the capabilities only on the
+    # legacy DeepSeekMxfp4MoEMethod leaves production on the allocating,
+    # pre-remap path.
+    _supports_caller_owned_output = True
+    _supports_kt_fused_routing = True
+
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
@@ -68,6 +78,9 @@ class Mxfp4TritonKernelsMoEMethod:
         # This method owns the complete MoE pipeline, but the layer still
         # publishes its routing/clamp contract through MoeRunnerConfig.
         self.moe_runner_config = moe_runner_config
+        self._kt_compact_ids = (
+            moe_runner_config.kt_global_to_local_expert_mapping is not None
+        )
 
     def create_weights(
         self,
@@ -180,6 +193,57 @@ class Mxfp4TritonKernelsMoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
+        return self._apply(
+            layer,
+            dispatch_output,
+            caller_output=None,
+            gpu_experts_mask=None,
+            logical_to_gpu_index=None,
+        )
+
+    def apply_with_output(
+        self,
+        layer: Module,
+        dispatch_output: DispatchOutput,
+        *,
+        caller_output: torch.Tensor,
+    ) -> CombineInput:
+        return self._apply(
+            layer,
+            dispatch_output,
+            caller_output=caller_output,
+            gpu_experts_mask=None,
+            logical_to_gpu_index=None,
+        )
+
+    def apply_with_kt_fused_routing(
+        self,
+        layer: Module,
+        dispatch_output: DispatchOutput,
+        *,
+        gpu_experts_mask: torch.Tensor,
+        logical_to_gpu_index: torch.Tensor,
+        caller_output: torch.Tensor | None = None,
+    ) -> CombineInput:
+        if not self._kt_compact_ids:
+            raise RuntimeError("KT fused routing requires compact V4 MXFP4 experts")
+        return self._apply(
+            layer,
+            dispatch_output,
+            caller_output=caller_output,
+            gpu_experts_mask=gpu_experts_mask,
+            logical_to_gpu_index=logical_to_gpu_index,
+        )
+
+    def _apply(
+        self,
+        layer: Module,
+        dispatch_output: DispatchOutput,
+        *,
+        caller_output: torch.Tensor | None,
+        gpu_experts_mask: torch.Tensor | None,
+        logical_to_gpu_index: torch.Tensor | None,
+    ) -> CombineInput:
         from sglang.srt.layers.moe.token_dispatcher.standard import (
             StandardCombineInput,
         )
@@ -201,7 +265,16 @@ class Mxfp4TritonKernelsMoEMethod:
             num_experts=layer._dsv4_tk_num_experts,
             routed_scaling_factor=1.0,
             swiglu_limit=self.moe_runner_config.swiglu_limit,
+            caller_output=caller_output,
+            # Conversion and execution are one layout contract.  The same
+            # process-wide predicate interleaves W13 at load time and selects
+            # the matching reduce_n=2 activation epilogue here.
+            fused_t5_moe=kernel.fused_t5_moe_enabled(),
+            gpu_experts_mask=gpu_experts_mask,
+            logical_to_gpu_index=logical_to_gpu_index,
         )
+        if caller_output is not None and output.data_ptr() != caller_output.data_ptr():
+            raise RuntimeError("V4 MXFP4 GEMM2 did not preserve caller-owned output")
         # DeepseekV2MoE applies routed_scaling_factor after KTEPWrapperMethod,
         # so it must not be folded into this partial GPU contribution.
         return StandardCombineInput(hidden_states=output)

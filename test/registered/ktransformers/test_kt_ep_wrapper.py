@@ -9,9 +9,9 @@ import torch
 
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import (
-    KTEPWrapperMethod,
     _KT_HYBRID_TIMING_FILE_DESCRIPTORS,
     _KT_ROUTE_STATS_ERROR_LAST_LOGGED,
+    KTEPWrapperMethod,
     _collect_kt_cpu_route_stats,
     _emit_kt_hybrid_timing_receipt,
     _merge_hybrid_expert_outputs,
@@ -344,6 +344,30 @@ def test_caller_owned_output_is_limited_to_compact_local_hybrid(
     layer.dispatcher._pre_combine_hooks = object()
     with pytest.raises(RuntimeError, match="no deferred pre-combine input consumer"):
         method._use_caller_owned_moe_output(layer, remote_pending=None)
+
+
+def test_caller_owned_output_accepts_production_portable_layout(monkeypatch) -> None:
+    monkeypatch.setenv("SGLANG_DSV4_KT_INPLACE_MOE_OUTPUT", "1")
+    method = object.__new__(KTEPWrapperMethod)
+    method.num_gpu_experts = 2
+    method.cpu_expert_ids = torch.tensor([2, 3], dtype=torch.int64)
+    method.rank_local_logical_expert_ids = True
+    method.tp_rank = 0
+    method._cpu_stream = object()
+    method.remote_clients = ()
+    method.remote_expert_id_tiers = None
+    method.gpu_method = SimpleNamespace(
+        _kt_compact_ids=True,
+        _supports_caller_owned_output=True,
+        apply_with_output=lambda *args, **kwargs: None,
+    )
+    layer = SimpleNamespace(
+        _dsv4_mxfp4_backend="triton_kernels",
+        moe_runner_config=SimpleNamespace(inplace=True),
+        dispatcher=SimpleNamespace(_pre_combine_hooks=None),
+    )
+
+    assert method._use_caller_owned_moe_output(layer, remote_pending=None)
 
 
 def test_caller_owned_output_rejects_alt_stream_shared_expert_consumer(
@@ -1589,6 +1613,7 @@ def test_dspark_draft_stages_remain_all_cpu(monkeypatch, tmp_path) -> None:
 
 def test_mxfp4_marlin_quant_type_is_admitted_on_sm86() -> None:
     from sgl_kernel.scalar_type import scalar_types
+
     from sglang.srt.layers.quantization.marlin_utils import check_marlin_supported
 
     assert check_marlin_supported(

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 import torch
+
 from sglang.kernels.ops.attention.dsv4 import oscar_int2_c4_indexer as c4
 from sglang.kernels.ops.attention.dsv4.oscar_int2_c4_indexer import (
     ARTIFACT_FORMAT,
@@ -102,6 +103,12 @@ def _query(batch_size: int, *, seed: int, device: str) -> torch.Tensor:
     generator = torch.Generator().manual_seed(seed)
     values = torch.randn((batch_size, 1, NUM_HEADS, HEAD_DIM), generator=generator)
     return values.to(torch.bfloat16).to(device)
+
+
+def _rope_frequencies(max_positions: int, *, device: str) -> torch.Tensor:
+    generator = torch.Generator().manual_seed(20260804)
+    angles = torch.randn((max_positions, 32), generator=generator)
+    return torch.polar(torch.ones_like(angles), angles).to(torch.complex64).to(device)
 
 
 def _require_sm86() -> None:
@@ -554,6 +561,168 @@ def test_sm86_fused_scorer_matches_reference_without_cache_decode() -> None:
     )
     assert actual.data_ptr() == out.data_ptr()
     torch.testing.assert_close(actual, expected, rtol=2.0e-2, atol=0.75)
+
+
+def test_sm86_fused_rope_rotation_scorer_matches_two_kernel_path() -> None:
+    _require_sm86()
+    from sglang.kernels.ops.attention.dsv4.elementwise import fused_rope_inplace
+
+    calibration = _calibration(device="cuda:0", dense=False)
+    raw_pages = _keys(4 * PAGE_SIZE, seed=401, device="cuda:0").reshape(
+        4, PAGE_SIZE, HEAD_DIM
+    )
+    storage = pack_oscar_int2_c4_pages_reference(raw_pages, calibration)
+    query = _query(2, seed=403, device="cuda:0")
+    frequencies = _rope_frequencies(64, device="cuda:0")
+    frequencies_real = torch.view_as_real(frequencies).flatten(-2)
+    positions = torch.tensor([7, 41], dtype=torch.int64, device="cuda:0")
+    weight = torch.randn(
+        (2, NUM_HEADS), generator=torch.Generator().manual_seed(405)
+    ).to("cuda:0")
+    seq_lens = torch.tensor([239, 193], dtype=torch.int32, device="cuda:0")
+    page_table = torch.tensor(
+        [[3, 0, 1, 2], [2, 1, 0, -1]], dtype=torch.int32, device="cuda:0"
+    )
+
+    roped_query = query.clone()
+    fused_rope_inplace(
+        roped_query[..., -64:],
+        None,
+        frequencies,
+        positions,
+    )
+    baseline_out = torch.empty((2, 256), dtype=torch.float32, device="cuda:0")
+    baseline_rotated = torch.empty(
+        (2, NUM_HEADS, HEAD_DIM), dtype=torch.bfloat16, device="cuda:0"
+    )
+    oscar_int2_c4_paged_mqa_logits_triton(
+        roped_query,
+        storage,
+        weight,
+        seq_lens,
+        page_table,
+        None,
+        256,
+        True,
+        calibration=calibration,
+        out=baseline_out,
+        rotated_query_out=baseline_rotated,
+    )
+
+    fused_out = torch.empty_like(baseline_out)
+    fused_rotated = torch.empty_like(baseline_rotated)
+    oscar_int2_c4_paged_mqa_logits_triton(
+        query,
+        storage,
+        weight,
+        seq_lens,
+        page_table,
+        None,
+        256,
+        True,
+        calibration=calibration,
+        out=fused_out,
+        rotated_query_out=fused_rotated,
+        freqs_cis_real=frequencies_real,
+        positions=positions,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(fused_rotated, baseline_rotated, rtol=0, atol=0)
+    torch.testing.assert_close(fused_out, baseline_out, rtol=0, atol=0)
+
+
+def test_sm86_fused_pipeline_elides_short_rows_and_replays_live_threshold() -> None:
+    _require_sm86()
+    calibration = _calibration(device="cuda:0", dense=False)
+    max_seq_len = 640
+    selection_topk = 512
+    raw_pages = _keys(10 * PAGE_SIZE, seed=411, device="cuda:0").reshape(
+        10, PAGE_SIZE, HEAD_DIM
+    )
+    storage = pack_oscar_int2_c4_pages_reference(raw_pages, calibration)
+    query = _query(1, seed=413, device="cuda:0")
+    frequencies = _rope_frequencies(32, device="cuda:0")
+    frequencies_real = torch.view_as_real(frequencies).flatten(-2)
+    positions = torch.tensor([9], dtype=torch.int32, device="cuda:0")
+    weight = torch.randn(
+        (1, NUM_HEADS), generator=torch.Generator().manual_seed(415)
+    ).to("cuda:0")
+    seq_lens = torch.tensor([511], dtype=torch.int32, device="cuda:0")
+    page_table = torch.arange(10, dtype=torch.int32, device="cuda:0")[None, :]
+    out = torch.full((1, max_seq_len), 12345.0, device="cuda:0")
+    rotated = torch.full(
+        (1, NUM_HEADS, HEAD_DIM),
+        -321.0,
+        dtype=torch.bfloat16,
+        device="cuda:0",
+    )
+
+    def run() -> None:
+        oscar_int2_c4_paged_mqa_logits_triton(
+            query,
+            storage,
+            weight,
+            seq_lens,
+            page_table,
+            None,
+            max_seq_len,
+            False,
+            calibration=calibration,
+            out=out,
+            rotated_query_out=rotated,
+            freqs_cis_real=frequencies_real,
+            positions=positions,
+            selection_topk=selection_topk,
+        )
+
+    run()
+    torch.cuda.synchronize()
+    assert torch.all(out == 12345.0)
+    assert torch.all(rotated == -321.0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    seq_lens.fill_(513)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.all(torch.isfinite(out[:, :513]))
+    assert torch.any(out[:, :513] != 12345.0)
+    assert torch.any(rotated != -321.0)
+
+    out.fill_(777.0)
+    rotated.fill_(222.0)
+    seq_lens.fill_(512)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.all(out == 777.0)
+    assert torch.all(rotated == 222.0)
+
+    # Prefill graph tiers can be statically narrower than the configured C4
+    # selection width.  That is an all-live-token tier, not an invalid top-k.
+    short_max_seq_len = 256
+    short_out = torch.full((1, short_max_seq_len), 4567.0, device="cuda:0")
+    short_rotated = torch.full_like(rotated, -765.0)
+    oscar_int2_c4_paged_mqa_logits_triton(
+        query,
+        storage,
+        weight,
+        seq_lens,
+        page_table,
+        None,
+        short_max_seq_len,
+        False,
+        calibration=calibration,
+        out=short_out,
+        rotated_query_out=short_rotated,
+        freqs_cis_real=frequencies_real,
+        positions=positions,
+        selection_topk=2_048,
+    )
+    torch.cuda.synchronize()
+    assert torch.all(short_out == 4567.0)
+    assert torch.all(short_rotated == -765.0)
 
 
 def test_sm86_writer_and_scorer_replay_in_one_cuda_graph() -> None:

@@ -329,7 +329,9 @@ class TestServerInfoExistingFieldsPreserved(CustomTestCase):
 
 class TestServerInfoDsv4Sm86SmallBatchTelemetry(CustomTestCase):
     @staticmethod
-    def _worker_telemetry(tp_rank: int, selection_count: int) -> dict:
+    def _worker_telemetry(
+        tp_rank: int, selection_count: int, *, fused_t5: bool = False
+    ) -> dict:
         return {
             "dsv4_sm86_small_batch_gemm": {
                 "configured": True,
@@ -337,6 +339,10 @@ class TestServerInfoDsv4Sm86SmallBatchTelemetry(CustomTestCase):
                 "patch_installed": True,
                 "patch_error": None,
                 "selection_count": selection_count,
+                "fused_t5_moe_configured": fused_t5,
+                "fused_t5_moe_conversion_count": 43 if fused_t5 else 0,
+                "fused_t5_moe_apply_count": 6 if fused_t5 else 0,
+                "fused_t5_kt_routing_apply_count": 6 if fused_t5 else 0,
                 "observed_signatures": [],
                 "selected_config": {
                     "block_n": 128,
@@ -420,6 +426,35 @@ class TestServerInfoDsv4Sm86SmallBatchTelemetry(CustomTestCase):
             missing["dsv4_sm86_small_batch_gemm_reporting_worker_count"], 1
         )
         self.assertFalse(missing["dsv4_sm86_small_batch_gemm_all_workers_active"])
+
+    def test_fused_t5_requires_intent_and_rank_local_use(self):
+        args = ServerArgs(model_path="dummy", tp_size=2)
+        states = [
+            {
+                "dsv4_sm86_small_batch_gemm_workers": [
+                    self._worker_telemetry(0, 5, fused_t5=True)[
+                        "dsv4_sm86_small_batch_gemm"
+                    ],
+                    self._worker_telemetry(1, 7, fused_t5=True)[
+                        "dsv4_sm86_small_batch_gemm"
+                    ],
+                ]
+            }
+        ]
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_V4_MXFP4_SM86_SMALL_BATCH_GEMM": "1",
+                "SGLANG_V4_MXFP4_FUSED_T5_MOE": "1",
+                "SGLANG_DSV4_OSCAR_FUSED_C4_PIPELINE": "1",
+            },
+        ):
+            info = _call_server_info_with(args, internal_states=states)
+
+        self.assertTrue(info["dsv4_fused_t5_moe_configured"])
+        self.assertEqual(info["dsv4_fused_t5_moe_active_worker_count"], 2)
+        self.assertTrue(info["dsv4_fused_t5_moe_all_workers_active"])
+        self.assertTrue(info["dsv4_oscar_fused_c4_pipeline_configured"])
 
 
 class TestServerInfoDsv4OscarKernelTelemetry(CustomTestCase):

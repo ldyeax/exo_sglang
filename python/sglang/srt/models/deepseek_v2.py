@@ -974,6 +974,11 @@ class DeepseekV2MoE(nn.Module):
         # - dispose_tensor: disabled during capture (CaptureFlags.disable_dispose_tensor) so the routed
         #   deep_gemm does not free hidden_states, which the shared expert reads on the alt stream.
         use_flashinfer_trtllm_bypass = get_forward().flashinfer_trtllm_bypass
+        from sglang.srt.observability.dsv4_internal_timing import (
+            dsv4_timing_range,
+        )
+
+        timing_role = "draft" if self.is_nextn else "target"
         current_stream = torch.cuda.current_stream()
         # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE) must happen on the main
         # stream BEFORE the alt-stream fork so both consumers see it.
@@ -992,44 +997,52 @@ class DeepseekV2MoE(nn.Module):
             if get_exec().moe.enable_eplb and not self.is_nextn
             else None
         )
-        # router_logits: (num_tokens, n_experts)
-        router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-        if use_flashinfer_trtllm_bypass:
-            topk_output = BypassedTopKOutput(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_config=self.topk.topk_config,
+        with dsv4_timing_range(
+            "routed_moe",
+            layer_id=self.layer_id,
+            role=timing_role,
+            phase="route_experts_merge",
+        ):
+            # router_logits: (num_tokens, n_experts)
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            if use_flashinfer_trtllm_bypass:
+                topk_output = BypassedTopKOutput(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_config=self.topk.topk_config,
+                )
+            else:
+                topk_kwargs = (
+                    {"input_ids": input_ids_global}
+                    if getattr(self, "is_hash", False)
+                    else {}
+                )
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    expert_location_dispatch_info=dispatch_info,
+                    **topk_kwargs,
+                )
+            deferred_finalize = (
+                has_shared_output
+                and not self._shared_expert_tp1
+                and topk_output.format == TopKOutputFormat.BYPASSED
+                and self.experts.supports_deferred_finalize
             )
-        else:
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
-            )
-        deferred_finalize = (
-            has_shared_output
-            and not self._shared_expert_tp1
-            and topk_output.format == TopKOutputFormat.BYPASSED
-            and self.experts.supports_deferred_finalize
-        )
-        if deferred_finalize:
-            final_hidden_states = self.experts.forward_deferred_finalize(
-                hidden_states, topk_output
-            )
-        elif use_flashinfer_trtllm_bypass:
-            final_hidden_states = self.experts.forward_impl(hidden_states, topk_output)
-        elif pre_quant_input is not None:
-            final_hidden_states = self.experts(
-                hidden_states, topk_output, pre_quant_input=pre_quant_input
-            )
-        else:
-            final_hidden_states = self.experts(hidden_states, topk_output)
+            if deferred_finalize:
+                final_hidden_states = self.experts.forward_deferred_finalize(
+                    hidden_states, topk_output
+                )
+            elif use_flashinfer_trtllm_bypass:
+                final_hidden_states = self.experts.forward_impl(
+                    hidden_states, topk_output
+                )
+            elif pre_quant_input is not None:
+                final_hidden_states = self.experts(
+                    hidden_states, topk_output, pre_quant_input=pre_quant_input
+                )
+            else:
+                final_hidden_states = self.experts(hidden_states, topk_output)
         if (
             not _is_cuda
             and not _is_musa
@@ -1076,7 +1089,15 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            with dsv4_timing_range(
+                "collectives",
+                layer_id=self.layer_id,
+                role=timing_role,
+                phase="moe_all_reduce",
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if self._shared_expert_tp1:
@@ -1095,6 +1116,11 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
+        from sglang.srt.observability.dsv4_internal_timing import (
+            dsv4_timing_range,
+        )
+
+        timing_role = "draft" if self.is_nextn else "target"
         server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
@@ -1106,6 +1132,7 @@ class DeepseekV2MoE(nn.Module):
         # hidden in the decoder layer (before the dp gather) and added after the
         # reduce_scatterv. When set, never compute/add it here (on the global buffer).
         shared_output = None
+        routed_timing = None
         if hidden_states.shape[0] > 0:
             # Quantize-once (SGLANG_OPT_MOE_QUANT_ONCE): only worthwhile when
             # the shared expert also runs here on the same tensor.
@@ -1124,6 +1151,13 @@ class DeepseekV2MoE(nn.Module):
                     gemm_output_zero_allocator,
                     pre_quant_input=pre_quant_input,
                 )
+            routed_timing = dsv4_timing_range(
+                "routed_moe",
+                layer_id=self.layer_id,
+                role=timing_role,
+                phase="route_experts_merge",
+            )
+            routed_timing.__enter__()
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
             topk_kwargs = (
@@ -1185,6 +1219,8 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states,
                 topk_output,
             )
+        if routed_timing is not None:
+            routed_timing.__exit__(None, None, None)
         if (
             not _is_cuda
             and not _is_musa
@@ -1217,7 +1253,15 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            with dsv4_timing_range(
+                "collectives",
+                layer_id=self.layer_id,
+                role=timing_role,
+                phase="moe_all_reduce",
+            ):
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
@@ -1526,19 +1570,29 @@ class DeepseekV2MoE(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         pre_quant_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
-        if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
-            if pre_quant_input is not None:
-                # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
-                # multiple of 4; the padded rows flow through the MLP (all ops
-                # are row-local) and are sliced off here.
-                out = self.shared_experts(
-                    hidden_states, gateup_pre_quant=pre_quant_input
+        from sglang.srt.observability.dsv4_internal_timing import (
+            dsv4_timing_range,
+        )
+
+        with dsv4_timing_range(
+            "shared_moe",
+            layer_id=self.layer_id,
+            role="draft" if self.is_nextn else "target",
+            phase="experts",
+        ):
+            if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
+                if pre_quant_input is not None:
+                    # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
+                    # multiple of 4; the padded rows flow through the MLP (all ops
+                    # are row-local) and are sliced off here.
+                    out = self.shared_experts(
+                        hidden_states, gateup_pre_quant=pre_quant_input
+                    )
+                    return out[: hidden_states.shape[0]]
+                return self.shared_experts(
+                    hidden_states,
+                    gemm_output_zero_allocator=gemm_output_zero_allocator,
                 )
-                return out[: hidden_states.shape[0]]
-            return self.shared_experts(
-                hidden_states, gemm_output_zero_allocator=gemm_output_zero_allocator
-            )
-        else:
             return None
 
     def _moe_quant_once_enabled(self) -> bool:

@@ -6,6 +6,8 @@ from typing import Iterable, List, Optional, Tuple
 import msgspec
 import torch
 import torch.nn.functional as F
+from torch import nn
+
 from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inplace
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     BuildStepLocal,
@@ -52,7 +54,6 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.utils import add_prefix, is_blackwell_supported
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
-from torch import nn
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +104,9 @@ class DSparkAttention(MqaAttentionBase):
             wo_b_reduce_results=True,
             rope_original_seq_len=0,
         )
-        assert self.compress_ratio == 0, (
-            "DSpark draft attention requires compress_ratio == 0."
-        )
+        assert (
+            self.compress_ratio == 0
+        ), "DSpark draft attention requires compress_ratio == 0."
         self.window_size = int(
             getattr(config, "sliding_window", None) or config.window_size
         )
@@ -524,22 +525,55 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        residual = hidden_states
-        x, post, comb = self._hc_pre_block(
-            hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        from sglang.srt.observability.dsv4_internal_timing import (
+            dsv4_timing_range,
         )
-        x = self.input_layernorm(x)
-        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
-            x = self.self_attn(positions, x, forward_batch)
-        x = self._hc_post_block(x, residual, post, comb)
 
-        residual = x
-        x, post, comb = self._hc_pre_block(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
-        )
-        x = self.post_attention_layernorm(x)
+        with dsv4_timing_range(
+            "projections_norms",
+            layer_id=self.layer_id,
+            role="draft",
+            phase="decoder_input",
+        ):
+            residual = hidden_states
+            x, post, comb = self._hc_pre_block(
+                hidden_states,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+            )
+            x = self.input_layernorm(x)
+        with (
+            self.self_attn.maybe_use_decode_attn_tp(forward_batch),
+            dsv4_timing_range(
+                "attention_indexer",
+                layer_id=self.layer_id,
+                role="draft",
+                phase="swa_attention",
+            ),
+        ):
+            x = self.self_attn(positions, x, forward_batch)
+
+        with dsv4_timing_range(
+            "projections_norms",
+            layer_id=self.layer_id,
+            role="draft",
+            phase="decoder_ffn_prepare",
+        ):
+            x = self._hc_post_block(x, residual, post, comb)
+            residual = x
+            x, post, comb = self._hc_pre_block(
+                x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+            )
+            x = self.post_attention_layernorm(x)
         x = self._run_ffn(x, forward_batch)
-        x = self._hc_post_block(x, residual, post, comb)
+        with dsv4_timing_range(
+            "projections_norms",
+            layer_id=self.layer_id,
+            role="draft",
+            phase="decoder_output",
+        ):
+            x = self._hc_post_block(x, residual, post, comb)
         return x
 
     def _run_ffn(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
@@ -731,16 +765,21 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DeepseekV4ForCausalLMDSpark requires the target lm_head "
                 "(call attach_shared_modules first)."
             )
-        last = self.stages[-1]
-        x = last.norm(x_post_hc)
-        weight = self.lm_head.weight
-        if self._use_fp32_lm_head:
-            local_logits = F.linear(x.float(), weight.float())
-        else:
-            local_logits = torch.matmul(x.to(weight.dtype), weight.T)
-        if self._opt_markov_w2_tp_shard:
-            return local_logits
-        return gather_and_crop_vocab(local_logits, self.lm_head)
+        from sglang.srt.observability.dsv4_internal_timing import (
+            dsv4_timing_range,
+        )
+
+        with dsv4_timing_range("final_head", role="draft", phase="logits"):
+            last = self.stages[-1]
+            x = last.norm(x_post_hc)
+            weight = self.lm_head.weight
+            if self._use_fp32_lm_head:
+                local_logits = F.linear(x.float(), weight.float())
+            else:
+                local_logits = torch.matmul(x.to(weight.dtype), weight.T)
+            if self._opt_markov_w2_tp_shard:
+                return local_logits
+            return gather_and_crop_vocab(local_logits, self.lm_head)
 
     def compute_confidence(
         self,

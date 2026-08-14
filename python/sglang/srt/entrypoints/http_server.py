@@ -229,9 +229,9 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args: PortArgs
 
     # API key authentication is not supported in multi-tokenizer mode
-    assert server_args.api_key is None, (
-        "API key is not supported in multi-tokenizer mode"
-    )
+    assert (
+        server_args.api_key is None
+    ), "API key is not supported in multi-tokenizer mode"
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -755,6 +755,7 @@ def _summarize_dsv4_sm86_small_batch_gemm(
     internal_states: List[Dict[Any, Any]],
     configured: bool,
     expected_worker_count: int,
+    fused_t5_configured: bool,
 ) -> Dict[str, Any]:
     """Aggregate worker-local patch/selection proof for `/server_info`."""
 
@@ -799,6 +800,12 @@ def _summarize_dsv4_sm86_small_batch_gemm(
         and int(telemetry.get("selection_count", 0)) > 0
         for telemetry in worker_telemetry
     )
+    fused_t5_active_worker_count = sum(
+        telemetry.get("fused_t5_moe_configured") is True
+        and int(telemetry.get("fused_t5_moe_conversion_count", 0)) > 0
+        and int(telemetry.get("fused_t5_moe_apply_count", 0)) > 0
+        for telemetry in worker_telemetry
+    )
     return {
         "dsv4_sm86_small_batch_gemm_worker_telemetry": worker_telemetry,
         "dsv4_sm86_small_batch_gemm_expected_worker_count": expected_worker_count,
@@ -809,6 +816,13 @@ def _summarize_dsv4_sm86_small_batch_gemm(
             and expected_worker_count > 0
             and len(worker_telemetry) == expected_worker_count
             and active_worker_count == expected_worker_count
+        ),
+        "dsv4_fused_t5_moe_active_worker_count": fused_t5_active_worker_count,
+        "dsv4_fused_t5_moe_all_workers_active": (
+            fused_t5_configured
+            and expected_worker_count > 0
+            and len(worker_telemetry) == expected_worker_count
+            and fused_t5_active_worker_count == expected_worker_count
         ),
     }
 
@@ -1805,14 +1819,10 @@ def _summarize_kt_single_numa_inline_dispatch(
         for record in worker_records
     )
     rank_fields_are_valid = all(
-        _kt_normalized_worker_identity(record) is not None
-        for record in worker_records
+        _kt_normalized_worker_identity(record) is not None for record in worker_records
     )
     normalized_rank_coverage = (
-        {
-            _kt_normalized_worker_identity(record)
-            for record in worker_records
-        }
+        {_kt_normalized_worker_identity(record) for record in worker_records}
         if rank_fields_are_valid
         else set()
     )
@@ -1882,9 +1892,7 @@ def _summarize_kt_mxfp4_avx_scale_fold(
         "kt_mxfp4_avx_scale_fold_duplicate_worker_count": 0,
         "kt_mxfp4_avx_scale_fold_rank_coverage_valid": False,
         "kt_mxfp4_avx_scale_fold_topology": topology,
-        "kt_mxfp4_avx_scale_fold_supported_topology_valid": (
-            supported_topology_valid
-        ),
+        "kt_mxfp4_avx_scale_fold_supported_topology_valid": (supported_topology_valid),
         "kt_mxfp4_avx_scale_fold_ep2_topology_valid": topology == "tp2-ep2",
         "kt_mxfp4_avx_scale_fold_all_workers_active": False,
     }
@@ -1946,14 +1954,10 @@ def _summarize_kt_mxfp4_avx_scale_fold(
         for record in worker_records
     )
     rank_fields_are_valid = all(
-        _kt_normalized_worker_identity(record) is not None
-        for record in worker_records
+        _kt_normalized_worker_identity(record) is not None for record in worker_records
     )
     normalized_rank_coverage = (
-        {
-            _kt_normalized_worker_identity(record)
-            for record in worker_records
-        }
+        {_kt_normalized_worker_identity(record) for record in worker_records}
         if rank_fields_are_valid
         else set()
     )
@@ -1986,9 +1990,7 @@ def _summarize_kt_mxfp4_avx_scale_fold(
         "kt_mxfp4_avx_scale_fold_duplicate_worker_count": duplicate_worker_count,
         "kt_mxfp4_avx_scale_fold_rank_coverage_valid": rank_coverage_valid,
         "kt_mxfp4_avx_scale_fold_topology": topology,
-        "kt_mxfp4_avx_scale_fold_supported_topology_valid": (
-            supported_topology_valid
-        ),
+        "kt_mxfp4_avx_scale_fold_supported_topology_valid": (supported_topology_valid),
         "kt_mxfp4_avx_scale_fold_ep2_topology_valid": topology == "tp2-ep2",
         "kt_mxfp4_avx_scale_fold_all_workers_active": (
             configured
@@ -2004,9 +2006,9 @@ def _summarize_kt_mxfp4_avx_scale_fold(
 async def server_info():
     """Get the server information."""
     # Returns internal states per DP.
-    internal_states: List[
-        Dict[Any, Any]
-    ] = await _global_state.tokenizer_manager.get_internal_state()
+    internal_states: List[Dict[Any, Any]] = (
+        await _global_state.tokenizer_manager.get_internal_state()
+    )
 
     server_args = _global_state.tokenizer_manager.server_args
 
@@ -2119,10 +2121,12 @@ async def server_info():
     sm86_small_batch_gemm_configured = (
         os.environ.get("SGLANG_V4_MXFP4_SM86_SMALL_BATCH_GEMM", "0") == "1"
     )
+    fused_t5_moe_configured = os.environ.get("SGLANG_V4_MXFP4_FUSED_T5_MOE", "0") == "1"
     sm86_small_batch_gemm_info = _summarize_dsv4_sm86_small_batch_gemm(
         internal_states,
         sm86_small_batch_gemm_configured,
         int(server_args.tp_size) * int(server_args.pp_size) * int(server_args.dp_size),
+        fused_t5_moe_configured,
     )
     kt_task_queue_affinity_configured = (
         os.environ.get("KT_TASK_QUEUE_PIN_FIRST_CORE") == "1"
@@ -2174,6 +2178,11 @@ async def server_info():
             == "1",
             "dsv4_sm86_small_batch_gemm_configured": (sm86_small_batch_gemm_configured),
             **sm86_small_batch_gemm_info,
+            "dsv4_fused_t5_moe_configured": fused_t5_moe_configured,
+            "dsv4_oscar_fused_c4_pipeline_configured": os.environ.get(
+                "SGLANG_DSV4_OSCAR_FUSED_C4_PIPELINE", "0"
+            )
+            == "1",
             "kt_task_queue_affinity_configured": (kt_task_queue_affinity_configured),
             **kt_task_queue_affinity_info,
             "kt_single_numa_inline_dispatch_configured": (
@@ -3709,9 +3718,9 @@ def _execute_server_warmup(server_args: ServerArgs):
 
         else:
             # TODO: @rainj-me fix this when Rust server supports disaggregation
-            assert not envs.SGLANG_RUST_SERVER.get(), (
-                "Rust server is not supported for disaggregation warmup for now"
-            )
+            assert (
+                not envs.SGLANG_RUST_SERVER.get()
+            ), "Rust server is not supported for disaggregation warmup for now"
             logger.info(f"Start of pd disaggregation warmup ...")
             status_codes = asyncio.run(
                 _send_disaggregation_warmup_requests(

@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -342,7 +343,28 @@ def _pending(*, bs, budget, num_verify_tokens, predicted_step_ms):
         rids=None,
         future=None,
         segment_events={},
+        internal_gpu_ms=None,
     )
+
+
+class TestInternalGpuTiming(CustomTestCase):
+    def test_snapshot_is_attached_to_the_same_decode_cycle(self):
+        expected = {
+            "target.attention_indexer.layer_02.c4_indexer": 1.25,
+            "target.routed_moe.layer_02.route_experts_merge": 3.5,
+        }
+        dumper, _ = make_dumper({"core", "internal_gpu_time"})
+        with patch(
+            "sglang.srt.observability.dsv4_internal_timing."
+            "snapshot_dsv4_internal_timing",
+            return_value=expected,
+        ) as snapshot:
+            dumper.observe_decode_step(make_obs(forward_ct=11))
+            record = dumper.dump()["records"][0]
+
+        snapshot.assert_called_once_with()
+        self.assertEqual(record["forward_ct"], 11)
+        self.assertEqual(record["internal_gpu_ms"], expected)
 
 
 class TestOnlineSpsReporter(CustomTestCase):

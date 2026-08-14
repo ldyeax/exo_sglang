@@ -58,6 +58,7 @@ _SMALL_ROW_ROUTING_PADDED_TOP_K = 8
 _SMALL_ROW_ROUTING_MAX_ROWS = 6
 _SMALL_ROW_ROUTING_BLOCK_M_VALUES = (16, 32, 64, 128)
 _SM86_SMALL_BATCH_GEMM_ENV = "SGLANG_V4_MXFP4_SM86_SMALL_BATCH_GEMM"
+_SM86_FUSED_T5_MOE_ENV = "SGLANG_V4_MXFP4_FUSED_T5_MOE"
 _SM86_SMALL_BATCH_GEMM_BLOCK_N = 128
 _SM86_SMALL_BATCH_GEMM_SPLIT_K = 2
 _SM86_SMALL_BATCH_GEMM_NUM_STAGES = 4
@@ -84,10 +85,85 @@ _SM86_SMALL_BATCH_GEMM_EXPECTED_PARAMETERS = (
 _sm86_small_batch_gemm_patch_state = "not_attempted"
 _sm86_small_batch_gemm_patch_error: Optional[str] = None
 _sm86_small_batch_gemm_selection_counts: dict[tuple[int, int, int, int], int] = {}
+_fused_t5_moe_conversion_count = 0
+_fused_t5_moe_apply_count = 0
+_fused_t5_kt_routing_apply_count = 0
 
 
 def _sm86_small_batch_gemm_enabled() -> bool:
     return os.environ.get(_SM86_SMALL_BATCH_GEMM_ENV) == "1"
+
+
+def fused_t5_moe_enabled() -> bool:
+    """Return whether W13 uses the interleaved fused-SiLU layout."""
+
+    return os.environ.get(_SM86_FUSED_T5_MOE_ENV) == "1"
+
+
+def _interleave_gate_up_rows(tensor: torch.Tensor) -> torch.Tensor:
+    """Convert ``[gate..., up...]`` rows to ``[gate0, up0, ...]``."""
+
+    if tensor.ndim != 3 or tensor.shape[1] % 2 != 0:
+        raise ValueError("V4 W13 tensor must be rank 3 with an even row count")
+    # CUDA has no cat/stack implementation for the native E8M0 scale dtype.
+    # Interleaving is a pure byte permutation, so use its exact one-byte
+    # carrier and restore the dtype without numerical conversion.
+    original_dtype = tensor.dtype
+    values = (
+        tensor.view(torch.uint8) if original_dtype == torch.float8_e8m0fnu else tensor
+    )
+    intermediate_size = tensor.shape[1] // 2
+    interleaved = (
+        torch.stack(
+            (
+                values[:, :intermediate_size],
+                values[:, intermediate_size:],
+            ),
+            dim=2,
+        )
+        .flatten(1, 2)
+        .contiguous()
+    )
+    return (
+        interleaved.view(original_dtype)
+        if original_dtype == torch.float8_e8m0fnu
+        else interleaved
+    )
+
+
+@triton.jit
+def _dsv4_fused_silu_mul(input_values, limit):
+    """DeepSeek SiLU(gate) * up epilogue for interleaved W13 columns."""
+
+    gate, up = tl.split(
+        tl.reshape(
+            input_values,
+            (input_values.shape[0], input_values.shape[1] // 2, 2),
+        )
+    )
+    # The unfused path stores W13 to BF16 before sgl_kernel.silu_and_mul.
+    # Preserve that rounding boundary so enabling fusion does not silently
+    # change routing/acceptance through a higher-precision activation input.
+    gate = gate.to(tl.bfloat16).to(tl.float32)
+    up = up.to(tl.bfloat16).to(tl.float32)
+    if limit is not None:
+        gate = tl.minimum(gate, limit)
+        up = tl.maximum(tl.minimum(up, limit), -limit)
+    return (gate / (1.0 + tl.exp(-gate))) * up
+
+
+def _make_dsv4_fused_activation(swiglu_limit: Optional[float]):
+    from triton_kernels.matmul_ogs import FnSpecs, FusedActivation
+
+    return FusedActivation(
+        specs=FnSpecs(
+            "dsv4_silu_mul",
+            _dsv4_fused_silu_mul,
+            ("limit",),
+        ),
+        fn_args=(swiglu_limit,),
+        reduction_n=2,
+    )
 
 
 def _set_sm86_small_batch_gemm_patch_failure(
@@ -126,6 +202,10 @@ def get_sm86_small_batch_gemm_telemetry() -> dict[str, object]:
         "patch_installed": _sm86_small_batch_gemm_patch_state == "installed",
         "patch_error": _sm86_small_batch_gemm_patch_error,
         "selection_count": sum(_sm86_small_batch_gemm_selection_counts.values()),
+        "fused_t5_moe_configured": fused_t5_moe_enabled(),
+        "fused_t5_moe_conversion_count": _fused_t5_moe_conversion_count,
+        "fused_t5_moe_apply_count": _fused_t5_moe_apply_count,
+        "fused_t5_kt_routing_apply_count": _fused_t5_kt_routing_apply_count,
         "observed_signatures": observed_signatures,
         "selected_config": {
             "block_n": _SM86_SMALL_BATCH_GEMM_BLOCK_N,
@@ -395,11 +475,14 @@ def _pack_small_row_routing_v4(
     token_offsets_raw_ptr,
     token_offsets_pad_ptr,
     block_pid_map_ptr,
+    gpu_experts_mask_ptr,
+    logical_to_gpu_index_ptr,
     stride_ids_m,
     stride_ids_k,
     stride_weights_m,
     stride_weights_k,
     NUM_EXPERTS: tl.constexpr,
+    NUM_GLOBAL_EXPERTS: tl.constexpr,
     INPUT_TOP_K: tl.constexpr,
     ROUTING_TOP_K: tl.constexpr,
     NUM_GATES: tl.constexpr,
@@ -407,6 +490,7 @@ def _pack_small_row_routing_v4(
     BLOCK_G: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    HAS_KT_REMAP: tl.constexpr,
 ):
     """Build every tiny grouped-MoE routing tensor in one CUDA program."""
     gate_positions = tl.arange(0, BLOCK_G)
@@ -419,6 +503,19 @@ def _pack_small_row_routing_v4(
         mask=input_mask,
         other=-1,
     ).to(tl.int32)
+    if HAS_KT_REMAP:
+        global_valid = input_mask & (route_ids >= 0) & (route_ids < NUM_GLOBAL_EXPERTS)
+        safe_global_ids = tl.where(global_valid, route_ids, 0)
+        is_gpu_expert = tl.load(
+            gpu_experts_mask_ptr + safe_global_ids,
+            mask=global_valid,
+            other=0,
+        ).to(tl.int1)
+        route_ids = tl.load(
+            logical_to_gpu_index_ptr + safe_global_ids,
+            mask=global_valid & is_gpu_expert,
+            other=-1,
+        ).to(tl.int32)
     valid_routes = gate_mask & (route_ids >= 0) & (route_ids < NUM_EXPERTS)
 
     # Sorting the combined (expert, original-position) key is stable by
@@ -514,9 +611,11 @@ def _small_row_routing_is_eligible(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_local_experts: int,
+    gpu_experts_mask: torch.Tensor | None = None,
+    logical_to_gpu_index: torch.Tensor | None = None,
 ) -> bool:
     """Return whether the opt-in fixed SM86 target-verify router applies."""
-    return (
+    base_eligible = (
         os.environ.get(_SMALL_ROW_ROUTING_ENV) == "1"
         and 1 <= num_local_experts <= _SMALL_ROW_ROUTING_MAX_EXPERTS
         and topk_ids.ndim == 2
@@ -532,12 +631,31 @@ def _small_row_routing_is_eligible(
         and topk_ids.dtype == torch.int32
         and topk_weights.dtype == torch.float32
     )
+    if not base_eligible:
+        return False
+    if (gpu_experts_mask is None) != (logical_to_gpu_index is None):
+        return False
+    if gpu_experts_mask is None:
+        return True
+    return (
+        gpu_experts_mask.device == topk_ids.device
+        and logical_to_gpu_index.device == topk_ids.device
+        and gpu_experts_mask.dtype == torch.bool
+        and logical_to_gpu_index.dtype == torch.int32
+        and gpu_experts_mask.ndim == 1
+        and logical_to_gpu_index.shape == gpu_experts_mask.shape
+        and gpu_experts_mask.is_contiguous()
+        and logical_to_gpu_index.is_contiguous()
+    )
 
 
 def _make_small_row_routing_data_v4(
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
     num_local_experts: int,
+    *,
+    gpu_experts_mask: torch.Tensor | None = None,
+    logical_to_gpu_index: torch.Tensor | None = None,
 ):
     """Build exact top-6 routing in the baseline's padded top-8 geometry."""
     from triton_kernels.routing import (
@@ -591,11 +709,16 @@ def _make_small_row_routing_data_v4(
         token_offsets_raw,
         token_offsets_pad_storage,
         block_pid_map_storage,
+        topk_ids if gpu_experts_mask is None else gpu_experts_mask,
+        topk_ids if logical_to_gpu_index is None else logical_to_gpu_index,
         topk_ids.stride(0),
         topk_ids.stride(1),
         topk_weights.stride(0),
         topk_weights.stride(1),
         NUM_EXPERTS=num_local_experts,
+        NUM_GLOBAL_EXPERTS=(
+            0 if gpu_experts_mask is None else gpu_experts_mask.shape[0]
+        ),
         INPUT_TOP_K=input_top_k,
         ROUTING_TOP_K=routing_top_k,
         NUM_GATES=num_gates,
@@ -603,6 +726,7 @@ def _make_small_row_routing_data_v4(
         BLOCK_G=triton.next_power_of_2(num_gates),
         BLOCK_E=triton.next_power_of_2(num_local_experts),
         BLOCK_T=triton.next_power_of_2(max_tiles),
+        HAS_KT_REMAP=gpu_experts_mask is not None,
         num_warps=1,
     )
     token_offsets_pad = {
@@ -636,6 +760,9 @@ def _make_routing_data_v4(
     topk_ids: torch.Tensor,  # [M, n_topk] int (any int dtype)
     topk_weights: torch.Tensor,  # [M, n_topk] float
     num_local_experts: int,
+    *,
+    gpu_experts_mask: torch.Tensor | None = None,
+    logical_to_gpu_index: torch.Tensor | None = None,
 ):
     """Convert sglang's standard (topk_ids, topk_weights) to triton_kernels'
     (RoutingData, GatherIndx, ScatterIndx) via the bitmatrix path.
@@ -656,11 +783,20 @@ def _make_routing_data_v4(
         topk_ids,
         topk_weights,
         num_local_experts,
+        gpu_experts_mask,
+        logical_to_gpu_index,
     ):
         return _make_small_row_routing_data_v4(
             topk_ids,
             topk_weights,
             num_local_experts,
+            gpu_experts_mask=gpu_experts_mask,
+            logical_to_gpu_index=logical_to_gpu_index,
+        )
+
+    if gpu_experts_mask is not None or logical_to_gpu_index is not None:
+        raise RuntimeError(
+            "KT fused routing was requested outside the exact small-row specialization"
         )
 
     try:
@@ -986,6 +1122,22 @@ def convert_v4_weights_to_triton_kernels(
 
     _patch_strided_mxfp()
 
+    if fused_t5_moe_enabled():
+        global _fused_t5_moe_conversion_count
+
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability(
+            w13.device
+        ) != (8, 6):
+            raise RuntimeError(
+                f"{_SM86_FUSED_T5_MOE_ENV}=1 requires exact SM86 CUDA weights"
+            )
+        # FusedActivation.reduce_n=2 pairs adjacent accumulator columns.
+        # Interleave both packed codes and their per-output-row ue8m0 scales
+        # before wrapping either tensor in the immutable strided layout.
+        w13 = _interleave_gate_up_rows(w13)
+        w13_scale = _interleave_gate_up_rows(w13_scale)
+        _fused_t5_moe_conversion_count += 1
+
     # Wrap raw scale as float8_e8m0fnu if it came in as uint8/float32.
     if w13_scale.dtype != torch.float8_e8m0fnu:
         if w13_scale.dtype == torch.uint8:
@@ -1052,6 +1204,9 @@ def apply_v4_triton_kernels_moe(
     routed_scaling_factor: float = 1.0,
     swiglu_limit: Optional[float] = None,
     caller_output: Optional[torch.Tensor] = None,
+    fused_t5_moe: bool = False,
+    gpu_experts_mask: torch.Tensor | None = None,
+    logical_to_gpu_index: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run V4 sparse MoE through `triton_kernels.matmul_ogs`.
 
@@ -1069,7 +1224,6 @@ def apply_v4_triton_kernels_moe(
     Origin: sglang 本身 (matches `moe_runner/deep_gemm.py:_apply_swiglu_limit`).
     """
     from triton_kernels.matmul_ogs import matmul_ogs
-    from sgl_kernel import silu_and_mul
 
     # Refresh strided-layout patch (cheap idempotent guard) in case apply
     # runs in a process where target_info was re-imported.
@@ -1101,33 +1255,64 @@ def apply_v4_triton_kernels_moe(
     # GatherIndx, ScatterIndx). Note: this rebuilds per-call. Cheap
     # (O(M * n_topk)) compared to the gemms themselves.
     routing_data, gather_indx, scatter_indx = _make_routing_data_v4(
-        topk_ids, topk_weights, num_experts
+        topk_ids,
+        topk_weights,
+        num_experts,
+        gpu_experts_mask=gpu_experts_mask,
+        logical_to_gpu_index=logical_to_gpu_index,
     )
 
     # gemm1: hidden_states (M, K) @ w13 → (M*topk, 2*N) bf16
-    intermediate1 = matmul_ogs(
-        hidden_states,
-        w13_swiz,
-        None,  # bias
-        routing_data,
-        gather_indx=gather_indx,
-        precision_config=w13_pcg,
-    )
-    # intermediate1 shape: [M*topk, 2*N]; layout = [gate, up] along last dim.
-    # We skipped reorder_w1w3_to_w3w1 for this path so the natural [w1, w3]
-    # = [gate, up] order from the checkpoint is preserved.
-    if swiglu_limit is not None:
-        # 2604B asymmetric SwiGLU clamp. View slices and clamp_ in place to
-        # avoid chunk+cat copy; safe because intermediate1 is a fresh
-        # matmul_ogs output, not a cached buffer.
-        N_int = intermediate1.shape[-1] // 2
-        intermediate1[..., :N_int].clamp_(max=swiglu_limit)
-        intermediate1[..., N_int:].clamp_(min=-swiglu_limit, max=swiglu_limit)
-    M_topk = intermediate1.shape[0]
-    intermediate2 = torch.empty(
-        (M_topk, N), device=hidden_states.device, dtype=hidden_states.dtype
-    )
-    silu_and_mul(intermediate1.view(-1, 2 * N), intermediate2)
+    if fused_t5_moe:
+        global _fused_t5_kt_routing_apply_count
+        global _fused_t5_moe_apply_count
+
+        if not fused_t5_moe_enabled():
+            raise RuntimeError(
+                "fused T5 MoE weights were selected without the matching runtime opt-in"
+            )
+        _fused_t5_moe_apply_count += 1
+        if gpu_experts_mask is not None:
+            _fused_t5_kt_routing_apply_count += 1
+        # With split-K, matmul_ogs moves this epilogue into its deterministic
+        # grouped reduction.  The reduction writes only N BF16 values rather
+        # than materializing 2*N BF16 W13 output plus a second activation
+        # buffer/kernel.  With split-K=1 it executes in the W13 matmul epilogue.
+        intermediate2 = matmul_ogs(
+            hidden_states,
+            w13_swiz,
+            None,
+            routing_data,
+            gather_indx=gather_indx,
+            precision_config=w13_pcg,
+            fused_activation=_make_dsv4_fused_activation(swiglu_limit),
+        )
+    else:
+        from sgl_kernel import silu_and_mul
+
+        intermediate1 = matmul_ogs(
+            hidden_states,
+            w13_swiz,
+            None,  # bias
+            routing_data,
+            gather_indx=gather_indx,
+            precision_config=w13_pcg,
+        )
+        # intermediate1 shape: [M*topk, 2*N]; layout = [gate, up] along last dim.
+        # We skipped reorder_w1w3_to_w3w1 for this path so the natural [w1, w3]
+        # = [gate, up] order from the checkpoint is preserved.
+        if swiglu_limit is not None:
+            # 2604B asymmetric SwiGLU clamp. View slices and clamp_ in place to
+            # avoid chunk+cat copy; safe because intermediate1 is a fresh
+            # matmul_ogs output, not a cached buffer.
+            N_int = intermediate1.shape[-1] // 2
+            intermediate1[..., :N_int].clamp_(max=swiglu_limit)
+            intermediate1[..., N_int:].clamp_(min=-swiglu_limit, max=swiglu_limit)
+        M_topk = intermediate1.shape[0]
+        intermediate2 = torch.empty(
+            (M_topk, N), device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        silu_and_mul(intermediate1.view(-1, 2 * N), intermediate2)
 
     # gemm2: (M*topk, N) @ w2 → (M, K), with gammas=topk_weights for combine
     output = matmul_ogs(

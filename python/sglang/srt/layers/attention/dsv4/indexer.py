@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
 
 
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+_OSCAR_FUSED_C4_PIPELINE_ENV = "SGLANG_DSV4_OSCAR_FUSED_C4_PIPELINE"
 
 
 IndexerQuery: TypeAlias = Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -314,9 +316,9 @@ def fp8_paged_mqa_logits_torch_sm120(
         )
 
     assert head_dim == 128, "Vectorized torch impl hardcodes DSV4 indexer head_dim=128"
-    assert block_size == 64, (
-        "Vectorized torch impl hardcodes block_size=64 cache layout"
-    )
+    assert (
+        block_size == 64
+    ), "Vectorized torch impl hardcodes block_size=64 cache layout"
     assert q_fp8.shape == (batch_size, 1, num_heads, head_dim)
     assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
     assert weight.shape == (batch_size, num_heads)
@@ -536,14 +538,14 @@ def _build_bf16_direct_paged_mqa_logits_kernel(
 
     @_tl.jit(pass_configs=pass_configs)
     def bf16_direct_paged_mqa_logits(
-        q: T.Tensor[(batch_size, heads, dim), "bfloat16"],
+        q: T.Tensor[(batch_size, heads, dim), T.bfloat16],
         kvcache: T.StridedTensor[
-            (num_blocks, block, dim), (block_stride, dim, 1), "bfloat16"
+            (num_blocks, block, dim), (block_stride, dim, 1), T.bfloat16
         ],
-        weight: T.Tensor[(batch_size, heads), "float32"],
-        seq_lens: T.Tensor[(batch_size,), "int32"],
-        page_table: T.Tensor[(batch_size, max_table_length), "int32"],
-        output: T.Tensor[(batch_size, max_seq_len), "float32"],
+        weight: T.Tensor[(batch_size, heads), T.float32],
+        seq_lens: T.Tensor[(batch_size,), T.int32],
+        page_table: T.Tensor[(batch_size, max_table_length), T.int32],
+        output: T.Tensor[(batch_size, max_seq_len), T.float32],
     ) -> None:
         _ = (
             batch_size,
@@ -1087,6 +1089,29 @@ class C4IndexerBackendMixin:
                     c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
                 )
             if use_oscar_int2_indexer_storage:
+                fused_c4_pipeline = c4_indexer.use_oscar_fused_c4_pipeline
+                selection_topk = (
+                    c4_sparse_page_indices.shape[1] if fused_c4_pipeline else 0
+                )
+                if (
+                    fused_c4_pipeline
+                    and indexer_metadata.max_c4_seq_len > selection_topk
+                ):
+                    # The combined RoPE + Oscar HMMA kernel is retained as a
+                    # tested experimental primitive, but it is slower on SM86
+                    # once scoring is required.  Use the original narrow RoPE
+                    # kernel for long tiers and reserve fusion for the static
+                    # <=top-k path, where both transforms disappear entirely.
+                    from sglang.kernels.ops.attention.dsv4.elementwise import (
+                        fused_rope_inplace,
+                    )
+
+                    fused_rope_inplace(
+                        q[..., -c4_indexer.rope_head_dim :],
+                        None,
+                        c4_indexer.freqs_cis,
+                        positions,
+                    )
                 logits_out = self._oscar_c4_logits_workspace.acquire(
                     q,
                     query_rows=query_rows,
@@ -1111,6 +1136,7 @@ class C4IndexerBackendMixin:
                     out=logits_out,
                     rotated_query_out=rotated_query_out,
                     page_size=indexer_metadata.c4_page_size,
+                    selection_topk=selection_topk,
                 )
             else:
                 logits = fn(
@@ -1264,6 +1290,9 @@ class C4Indexer(nn.Module):
         self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
+        self.use_oscar_fused_c4_pipeline = (
+            os.environ.get(_OSCAR_FUSED_C4_PIPELINE_ENV) == "1"
+        )
 
         self.use_fp4_indexer = get_exec().kernel.enable_deepseek_v4_fp4_indexer
         self.alt_streams = alt_streams
@@ -1300,17 +1329,18 @@ class C4Indexer(nn.Module):
         if envs.SGLANG_DSV4_OSCAR_INT2_KV_STORAGE.get():
             if self.use_fp4_indexer:
                 raise RuntimeError("OSCAR C4 scoring is incompatible with FP4")
-            from sglang.kernels.ops.attention.dsv4.elementwise import (
-                fused_rope_inplace,
-            )
-
             q = q.contiguous()
-            fused_rope_inplace(
-                q[..., -self.rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions,
-            )
+            if not self.use_oscar_fused_c4_pipeline:
+                from sglang.kernels.ops.attention.dsv4.elementwise import (
+                    fused_rope_inplace,
+                )
+
+                fused_rope_inplace(
+                    q[..., -self.rope_head_dim :],
+                    None,
+                    self.freqs_cis,
+                    positions,
+                )
             effective_weights = weight.float().mul_(self.weight_scale).unsqueeze(-1)
             return q, effective_weights
         if self.use_fp4_indexer:
@@ -1337,13 +1367,26 @@ class C4Indexer(nn.Module):
         q_lora_ready: Optional[torch.cuda.Event] = None,
         skip_compressor: bool = False,
     ) -> None:
-        return attn_backend.forward_c4_indexer(
-            x=x,
-            q_lora=q_lora,
-            forward_batch=forward_batch,
-            c4_indexer=self,
-            alt_streams=self.alt_streams,
-            enable_multi_stream=enable_multi_stream,
-            q_lora_ready=q_lora_ready,
-            skip_compressor=skip_compressor,
+        from sglang.srt.observability.dsv4_internal_timing import (
+            dsv4_timing_range,
         )
+
+        role = (
+            "target" if getattr(self, "_dsv4_oscar_capture_target", False) else "draft"
+        )
+        with dsv4_timing_range(
+            "attention_indexer",
+            layer_id=self.layer_id,
+            role=role,
+            phase="c4_indexer",
+        ):
+            return attn_backend.forward_c4_indexer(
+                x=x,
+                q_lora=q_lora,
+                forward_batch=forward_batch,
+                c4_indexer=self,
+                alt_streams=self.alt_streams,
+                enable_multi_stream=enable_multi_stream,
+                q_lora_ready=q_lora_ready,
+                skip_compressor=skip_compressor,
+            )

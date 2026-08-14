@@ -19,10 +19,11 @@ from typing import (
     Union,
 )
 
-import sglang.srt.models.deepseek_v2 as deepseek_v2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.kernels.ops.attention.dsv4 import (
     fused_norm_rope_inplace,
     fused_q_norm_rope,
@@ -330,6 +331,7 @@ def _fold_dsv4_oscar_output_rotation_into_wo_a_weight_(
         torch.mm(input_workspace, rotation, out=output_workspace)
         weight_by_head[group_id, :, :, :nope_dim].copy_(output_by_head)
 
+
 DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
@@ -495,9 +497,9 @@ def deepseek_v4_attention_with_output(
     finally:
         forward_batch.out_cache_loc = original_out_cache_loc
 
-    assert output[:real_num_tokens].numel() == ret.numel(), (
-        f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
-    )
+    assert (
+        output[:real_num_tokens].numel() == ret.numel()
+    ), f"Output tensor element mismatch: {output[:real_num_tokens].numel()} != {ret.numel()}"
 
     output[:real_num_tokens].view(ret.shape).copy_(ret)
     return
@@ -509,8 +511,8 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 
 
 def _get_bcg_static_forward_batch(
-    captured_forward_batch: "ForwardBatch",
-) -> "ForwardBatch":
+    captured_forward_batch: ForwardBatch,
+) -> ForwardBatch:
     """Prefer the current bucket-padded batch during BCG replay.
 
     Eager-break closures retain their capture-time Python arguments. Tensor
@@ -526,8 +528,8 @@ def _get_bcg_static_forward_batch(
 
 
 def _get_bcg_runtime_forward_batch(
-    captured_forward_batch: "ForwardBatch",
-) -> "ForwardBatch":
+    captured_forward_batch: ForwardBatch,
+) -> ForwardBatch:
     """Return the original unpadded serving batch when one is published."""
     context = get_tc_piecewise_forward_context()
     if context is not None:
@@ -543,7 +545,7 @@ def deepseek_v4_attention_bcg(
     output: torch.Tensor,
     attention_backend,
     attention_layer,
-    forward_batch: "ForwardBatch",
+    forward_batch: ForwardBatch,
     compress_ratio: int,
     attn_sink: torch.Tensor,
     save_kv_cache: bool,
@@ -592,7 +594,7 @@ def deepseek_v4_attention_module_bcg(
     x: torch.Tensor,
     positions: torch.Tensor,
     output: torch.Tensor,
-    forward_batch: "ForwardBatch",
+    forward_batch: ForwardBatch,
     x_quant: Optional[torch.Tensor],
 ) -> None:
     """Run the complete live-token attention module at one BCG break.
@@ -631,7 +633,7 @@ bcg_deepseek_v4_attention_module = eager_on_graph(True)(
 def deepseek_v4_moe_ffn_bcg(
     decoder_layer: nn.Module,
     hidden_states: torch.Tensor,
-    forward_batch: "ForwardBatch",
+    forward_batch: ForwardBatch,
     input_ids: torch.Tensor,
     input_ids_global: torch.Tensor,
 ) -> torch.Tensor:
@@ -780,9 +782,9 @@ class MqaAttentionBase(nn.Module):
         if fp8:
             from sglang.srt.layers import deep_gemm_wrapper
 
-            assert hasattr(self.wo_a, "weight_scale_inv"), (
-                "FP8 quant_config must create weight_scale_inv"
-            )
+            assert hasattr(
+                self.wo_a, "weight_scale_inv"
+            ), "FP8 quant_config must create weight_scale_inv"
             self.wo_a.weight_scale_inv.format_ue8m0 = (
                 deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             )
@@ -958,6 +960,7 @@ class MQALayer(MqaAttentionBase):
             quant_config=quant_config,
             prefix=add_prefix("attn_mqa", prefix),
         )
+        self.attn_mqa._dsv4_timing_role = "target"
 
         self.use_fused_qk_norm_rope = (
             _is_hip and envs.SGLANG_OPT_USE_FUSED_QK_NORM_ROPE.get()
@@ -1507,6 +1510,21 @@ class MQALayer(MqaAttentionBase):
             q_out = q_padded[:, tp_slice, :]
         attn_sink = self._local_attn_sink()
 
+        from sglang.srt.observability.dsv4_internal_timing import (
+            dsv4_timing_range,
+        )
+
+        timing_role = (
+            "target" if getattr(self, "_dsv4_oscar_capture_target", False) else "draft"
+        )
+        projection_timing = dsv4_timing_range(
+            "projections_norms",
+            layer_id=self.layer_id,
+            role=timing_role,
+            phase="qkv_prepare_inclusive",
+        )
+        projection_timing.__enter__()
+
         if enable_multi_stream:
             # Multi-stream path always fuses cache write into the K kernel,
             # so the bf16 KV intermediate is gone.
@@ -1538,6 +1556,7 @@ class MQALayer(MqaAttentionBase):
                 q_out,
                 x_quant=x_quant,
             )
+        projection_timing.__exit__(None, None, None)
 
         from sglang.srt.layers.attention.dsv4.oscar_int2_capture import (
             capture_configured,
@@ -1564,6 +1583,13 @@ class MQALayer(MqaAttentionBase):
         )
 
         if is_unified_kv_triton():
+            attention_timing = dsv4_timing_range(
+                "attention_indexer",
+                layer_id=self.layer_id,
+                role=timing_role,
+                phase="sparse_attention",
+            )
+            attention_timing.__enter__()
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
                 k=attn_k,
@@ -1574,9 +1600,17 @@ class MQALayer(MqaAttentionBase):
                 attn_sink=self.attn_sink,
                 save_kv_cache=kv is not None,
             )
+            attention_timing.__exit__(None, None, None)
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
+            attention_timing = dsv4_timing_range(
+                "attention_indexer",
+                layer_id=self.layer_id,
+                role=timing_role,
+                phase="sparse_attention",
+            )
+            attention_timing.__enter__()
             if is_in_breakable_cuda_graph() and not _CAPTURE_DSV4_ATTENTION_IN_BCG:
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
@@ -1604,6 +1638,15 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
+            attention_timing.__exit__(None, None, None)
+
+        output_projection_timing = dsv4_timing_range(
+            "projections_norms",
+            layer_id=self.layer_id,
+            role=timing_role,
+            phase="attention_output",
+        )
+        output_projection_timing.__enter__()
         if _is_npu:
             cos4, sin4 = self._get_npu_rope_position_cache(
                 positions, o.dtype, inverse=True
@@ -1628,6 +1671,7 @@ class MQALayer(MqaAttentionBase):
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
+
             from sglang.srt.layers import deep_gemm_wrapper
 
             T, G, D = o.shape
@@ -1660,8 +1704,15 @@ class MQALayer(MqaAttentionBase):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
+        output_projection_timing.__exit__(None, None, None)
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
-            o = attn_tp_all_reduce(o)
+            with dsv4_timing_range(
+                "collectives",
+                layer_id=self.layer_id,
+                role=timing_role,
+                phase="attention_all_reduce",
+            ):
+                o = attn_tp_all_reduce(o)
 
         return o
 
@@ -1697,6 +1748,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
+        self._dsv4_timing_role = "draft" if is_nextn else "target"
         self.self_attn = self._build_self_attn(
             config=config,
             layer_id=layer_id,
@@ -1966,7 +2018,18 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
         Optional[torch.Tensor],
     ]:
+        from sglang.srt.observability.dsv4_internal_timing import (
+            dsv4_timing_range,
+        )
+
         use_fused = self.use_fused_mhc_post_pre
+        input_norm_timing = dsv4_timing_range(
+            "projections_norms",
+            layer_id=self.layer_id,
+            role=self._dsv4_timing_role,
+            phase="decoder_input",
+        )
+        input_norm_timing.__enter__()
 
         if prev_residual is not None and use_fused:
             residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
@@ -2012,6 +2075,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     x_quant = None
             else:
                 x_quant = None
+        input_norm_timing.__exit__(None, None, None)
 
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             if (
@@ -2037,6 +2101,13 @@ class DeepseekV4DecoderLayer(nn.Module):
                     x_quant=x_quant,
                 )
 
+        ffn_norm_timing = dsv4_timing_range(
+            "projections_norms",
+            layer_id=self.layer_id,
+            role=self._dsv4_timing_role,
+            phase="decoder_ffn_prepare",
+        )
+        ffn_norm_timing.__enter__()
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
                 hidden_states,
@@ -2090,6 +2161,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
+        ffn_norm_timing.__exit__(None, None, None)
 
         if is_in_breakable_cuda_graph():
             hidden_states = bcg_deepseek_v4_moe_ffn(
@@ -2108,7 +2180,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if not use_fused:
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            with dsv4_timing_range(
+                "projections_norms",
+                layer_id=self.layer_id,
+                role=self._dsv4_timing_role,
+                phase="decoder_output",
+            ):
+                hidden_states = self.hc_post(hidden_states, residual, post, comb)
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
@@ -2998,12 +3076,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         if _FP8_WO_A_GEMM:
             raise RuntimeError("OSCAR SM86 wo_a absorption requires the BF16 wo_a path")
 
-        artifact_sha256 = str(
-            getattr(token_to_kv_pool, "oscar_artifact_sha256", "")
-        )
-        admission_sha256 = str(
-            getattr(token_to_kv_pool, "oscar_admission_sha256", "")
-        )
+        artifact_sha256 = str(getattr(token_to_kv_pool, "oscar_artifact_sha256", ""))
+        admission_sha256 = str(getattr(token_to_kv_pool, "oscar_admission_sha256", ""))
         if len(artifact_sha256) != 64 or len(admission_sha256) != 64:
             raise RuntimeError(
                 "OSCAR wo_a absorption requires admitted SHA-256 bindings"
@@ -3044,9 +3118,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             if torch.cuda.get_device_capability(weight.device) != (8, 6):
                 raise RuntimeError("OSCAR wo_a absorption is implemented only on SM86")
             if not isinstance(attention.wo_a.quant_method, UnquantizedLinearMethod):
-                raise TypeError(
-                    "OSCAR wo_a absorption requires unquantized BF16 wo_a"
-                )
+                raise TypeError("OSCAR wo_a absorption requires unquantized BF16 wo_a")
             if calibration.rotation.dtype != torch.bfloat16:
                 raise RuntimeError("OSCAR shared-latent rotation must be BF16")
             if calibration.rotation.device != weight.device:
@@ -3109,9 +3181,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                 weight_version=plan.weight._version,
                 consumer_role=_DSV4_OSCAR_TARGET_CONSUMER_ROLE,
             )
-            plan.attention.attn_mqa._dsv4_oscar_wo_a_output_rotation_binding = (
-                binding
-            )
+            plan.attention.attn_mqa._dsv4_oscar_wo_a_output_rotation_binding = binding
             bindings[plan.layer_id] = binding
 
         self._dsv4_oscar_wo_a_pool = token_to_kv_pool
@@ -3212,16 +3282,21 @@ class DeepseekV4ForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
-        return self.logits_processor(
-            input_ids,
-            hidden_states,
-            self.lm_head,
-            forward_batch,
-            aux_hidden_states,
-            hidden_states_before_norm=(
-                None if aux_hidden_states is not None else pre_hc_head
-            ),
+        from sglang.srt.observability.dsv4_internal_timing import (
+            dsv4_timing_range,
         )
+
+        with dsv4_timing_range("final_head", role="target", phase="logits"):
+            return self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
+                hidden_states_before_norm=(
+                    None if aux_hidden_states is not None else pre_hc_head
+                ),
+            )
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from sglang.srt.layers import deep_gemm_wrapper
@@ -3661,9 +3736,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 )
                                 bucket = cache_wqkv_a_weight.setdefault(param_name, {})
                                 shard_key = "q" if is_q else "kv"
-                                assert shard_key not in bucket, (
-                                    f"duplicate shard {shard_key} for {param_name}"
-                                )
+                                assert (
+                                    shard_key not in bucket
+                                ), f"duplicate shard {shard_key} for {param_name}"
                                 bucket[shard_key] = _clone_if_runai_streamed_tensor(
                                     loaded_weight
                                 )
@@ -3778,9 +3853,9 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     from einops import rearrange
 
-    assert weight.dtype == torch.float8_e4m3fn, (
-        f"expected fp8_e4m3fn, got {weight.dtype}"
-    )
+    assert (
+        weight.dtype == torch.float8_e4m3fn
+    ), f"expected fp8_e4m3fn, got {weight.dtype}"
     assert scale.dtype in (
         torch.float8_e8m0fnu,
         torch.float32,
