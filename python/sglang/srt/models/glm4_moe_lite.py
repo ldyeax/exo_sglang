@@ -404,8 +404,8 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
-        # This class inherits DeepseekV2MoE's forward methods but constructs
-        # GLM's score-based TopK, which never accepts hash-routing inputs.
+        # This standalone GLM MoE uses score-based TopK throughout, so it never
+        # accepts the hash-routing inputs supported by DeepSeek's MoE path.
         self.is_hash = False
 
         if self.tp_size > config.n_routed_experts:
