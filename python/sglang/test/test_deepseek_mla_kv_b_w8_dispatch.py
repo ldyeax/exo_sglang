@@ -103,24 +103,40 @@ def test_compact_w8_dispatch_allows_absorbed_mla(
     "selected_method",
     [
         AttnForwardMethod.MHA,
+        AttnForwardMethod.MHA_CHUNKED_KV,
+        AttnForwardMethod.MHA_ONE_SHOT,
+    ],
+)
+def test_compact_w8_dispatch_forces_mha_heuristics_to_absorbed_mla(
+    monkeypatch: pytest.MonkeyPatch,
+    selected_method: AttnForwardMethod,
+) -> None:
+    attention = _attention(compact_w8=True)
+    _select_method(monkeypatch, selected_method)
+
+    selected = attention.dispatch_attn_forward_method(
+        SimpleNamespace(forward_mode=_DecodeForwardMode())
+    )
+
+    assert selected == AttnForwardMethod.MLA
+    assert attention.current_attention_backend == "test_decode"
+
+
+@pytest.mark.parametrize(
+    "selected_method",
+    [
         AttnForwardMethod.MLA_FUSED_ROPE_ROCM,
         AttnForwardMethod.MLA_FUSED_ROPE_CPU,
     ],
 )
-def test_compact_w8_dispatch_rejects_mha_and_platform_fused_paths(
+def test_compact_w8_dispatch_rejects_platform_fused_paths(
     monkeypatch: pytest.MonkeyPatch,
     selected_method: AttnForwardMethod,
 ) -> None:
-    # The old generic MLA_FUSED_ROPE path was GPU-agnostic. In the modern
-    # split, the only fused variants are ROCm and CPU, while compact W8 is a
-    # CUDA-only format, so neither is a compatible specialist.
     attention = _attention(compact_w8=True)
     _select_method(monkeypatch, selected_method)
 
-    with pytest.raises(
-        RuntimeError,
-        match="compact MLA kv_b W8 requires the absorbed MLA attention path",
-    ):
+    with pytest.raises(RuntimeError, match="compact MLA kv_b W8 requires"):
         attention.dispatch_attn_forward_method(
             SimpleNamespace(forward_mode=_DecodeForwardMode())
         )
