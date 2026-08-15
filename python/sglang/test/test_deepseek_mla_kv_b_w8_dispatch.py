@@ -189,3 +189,32 @@ def test_model_runner_configures_runtime_metadata_before_backend_init(
         "flashinfer_mla_disable_ragged": True,
     }
     assert attention.flashinfer_mla_disable_ragged
+
+
+def test_model_runner_synchronizes_mixed_mla_attention_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compact_attention = _attention(compact_w8=True)
+    ordinary_attention = _attention(compact_w8=False)
+    model = torch.nn.Module()
+    model.add_module("compact_attention", compact_attention)
+    model.add_module("ordinary_attention", ordinary_attention)
+
+    class _RuntimeContext:
+        @staticmethod
+        def override(source: str, **fields: object) -> None:
+            assert source == "compact_mla_kv_b_w8"
+            assert fields == {"flashinfer_mla_disable_ragged": True}
+
+    runner = object.__new__(ModelRunner)
+    runner.model = model
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_context",
+        lambda: _RuntimeContext(),
+    )
+
+    runner.configure_compact_mla_kv_b_attention()
+
+    assert compact_attention.flashinfer_mla_disable_ragged
+    assert ordinary_attention.flashinfer_mla_disable_ragged
