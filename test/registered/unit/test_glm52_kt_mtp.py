@@ -13,6 +13,8 @@ from sglang.srt.speculative.kt_mtp import (
     KTMTPAdmission,
     KTMTPAdmissionError,
     admit_glm52_kt_mtp,
+    get_glm52_kt_mtp_shared_modules,
+    glm52_kt_mtp_shared_modules,
     select_glm52_mtp_nonexpert_weights,
     validate_loaded_glm52_kt_mtp,
 )
@@ -87,9 +89,7 @@ def test_non_glm_draft_retains_gpu_only_behavior():
     config = _glm52_config()
     config.architectures = ["DeepseekV3ForCausalLM"]
 
-    admission = admit_glm52_kt_mtp(
-        _server_args(), config, validate_artifacts=False
-    )
+    admission = admit_glm52_kt_mtp(_server_args(), config, validate_artifacts=False)
 
     assert not admission.enabled
     assert admission.physical_layer_index is None
@@ -111,9 +111,7 @@ def test_glm52_candidate_rejects_unsupported_runtime_values(field: str, value):
     setattr(server_args, field, value)
 
     with pytest.raises(KTMTPAdmissionError, match=field):
-        admit_glm52_kt_mtp(
-            server_args, _glm52_config(), validate_artifacts=False
-        )
+        admit_glm52_kt_mtp(server_args, _glm52_config(), validate_artifacts=False)
 
 
 def test_glm52_candidate_requires_same_checkpoint_for_target_and_draft():
@@ -121,9 +119,7 @@ def test_glm52_candidate_requires_same_checkpoint_for_target_and_draft():
     server_args.speculative_draft_model_path = "/models/other"
 
     with pytest.raises(KTMTPAdmissionError, match="must resolve"):
-        admit_glm52_kt_mtp(
-            server_args, _glm52_config(), validate_artifacts=False
-        )
+        admit_glm52_kt_mtp(server_args, _glm52_config(), validate_artifacts=False)
 
 
 def test_speculative_context_maps_only_local_layer_zero_and_restores():
@@ -135,6 +131,19 @@ def test_speculative_context_maps_only_local_layer_zero_and_restores():
             get_kt_ep_weight_layer_index(1)
 
     assert get_kt_ep_weight_layer_index(7) == 7
+
+
+def test_shared_module_context_exposes_exact_target_modules_and_restores():
+    embed_tokens = object()
+    lm_head = object()
+    assert get_glm52_kt_mtp_shared_modules() is None
+
+    with glm52_kt_mtp_shared_modules(embed_tokens, lm_head) as shared:
+        assert shared.embed_tokens is embed_tokens
+        assert shared.lm_head is lm_head
+        assert get_glm52_kt_mtp_shared_modules() is shared
+
+    assert get_glm52_kt_mtp_shared_modules() is None
 
 
 class _Scalar:
@@ -153,7 +162,12 @@ class _Mask:
         return _Scalar(self.count)
 
 
-def _loaded_draft(*, layer_index: int = 78, gpu_expert_count: int = 0):
+def _loaded_draft(
+    *,
+    layer_index: int = 78,
+    gpu_expert_count: int = 0,
+    shared_at_construction: bool = True,
+):
     kt_config = SimpleNamespace(
         layer_idx=layer_index,
         gpu_experts_mask=_Mask(gpu_expert_count),
@@ -162,7 +176,10 @@ def _loaded_draft(*, layer_index: int = 78, gpu_expert_count: int = 0):
     experts = SimpleNamespace(quant_method=quant_method)
     mlp = SimpleNamespace(experts=experts)
     decoder = SimpleNamespace(mlp=mlp)
-    return SimpleNamespace(model=SimpleNamespace(decoder=decoder))
+    return SimpleNamespace(
+        model=SimpleNamespace(decoder=decoder),
+        kt_mtp_shared_embed_and_head_at_construction=shared_at_construction,
+    )
 
 
 def test_loaded_draft_receipt_proves_physical_layer_and_cpu_ownership():
@@ -176,6 +193,7 @@ def test_loaded_draft_receipt_proves_physical_layer_and_cpu_ownership():
         "physical_layer_index": 78,
         "gpu_expert_count": 0,
         "wrapper_id": "kt_ep",
+        "shared_embed_and_head_at_construction": True,
     }
 
 
@@ -183,6 +201,14 @@ def test_loaded_draft_receipt_rejects_local_layer_zero_mapping():
     with pytest.raises(KTMTPAdmissionError, match="physical_layer_index=0"):
         validate_loaded_glm52_kt_mtp(
             _loaded_draft(layer_index=0),
+            KTMTPAdmission(enabled=True, physical_layer_index=78),
+        )
+
+
+def test_loaded_draft_receipt_requires_construction_time_weight_sharing():
+    with pytest.raises(KTMTPAdmissionError, match="not shared at draft construction"):
+        validate_loaded_glm52_kt_mtp(
+            _loaded_draft(shared_at_construction=False),
             KTMTPAdmission(enabled=True, physical_layer_index=78),
         )
 
@@ -248,8 +274,7 @@ def _make_artifacts(root: Path) -> tuple[Path, Path]:
         for expert_index in range(256):
             for numa_slot in range(2):
                 stem = (
-                    f"blk.78.ffn_{projection}_exps.{expert_index}."
-                    f"numa.{numa_slot}"
+                    f"blk.78.ffn_{projection}_exps.{expert_index}." f"numa.{numa_slot}"
                 )
                 kt_names.extend((stem + ".weight", stem + ".scale"))
     _write_json(weight_path / "config.json", _config_json())

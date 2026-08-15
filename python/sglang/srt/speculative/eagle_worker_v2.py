@@ -83,7 +83,9 @@ from sglang.srt.speculative.eagle_worker_common import (
 )
 from sglang.srt.speculative.kt_mtp import (
     KTMTPAdmission,
+    KTMTPAdmissionError,
     admit_glm52_kt_mtp,
+    glm52_kt_mtp_shared_modules,
     validate_loaded_glm52_kt_mtp,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -177,6 +179,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
             self._kt_mtp_context(),
+            self._kt_mtp_shared_modules_context(),
         ):
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
@@ -211,6 +214,19 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             enabled=admission.enabled,
             physical_layer_index=admission.physical_layer_index,
         )
+
+    def _kt_mtp_shared_modules_context(self):
+        if not self.kt_mtp_admission.enabled:
+            return empty_context()
+        target_model = self.target_worker.model_runner.model
+        try:
+            embed_tokens = target_model.model.embed_tokens
+            lm_head = target_model.lm_head
+        except AttributeError as error:
+            raise KTMTPAdmissionError(
+                "GLM-5.2 KT MTP target does not expose model.embed_tokens and lm_head"
+            ) from error
+        return glm52_kt_mtp_shared_modules(embed_tokens, lm_head)
 
     def alloc_memory_pool(
         self,

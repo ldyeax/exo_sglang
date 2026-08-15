@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 GLM52_ARCHITECTURE = "GlmMoeDsaForCausalLM"
 GLM52_MODEL_TYPE = "glm_moe_dsa"
@@ -29,6 +31,51 @@ class KTMTPAdmission:
     enabled: bool = False
     physical_layer_index: int | None = None
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class KTMTPSharedModules:
+    """Target modules reused while constructing the one-layer draft model."""
+
+    embed_tokens: Any
+    lm_head: Any
+
+
+_ACTIVE_SHARED_MODULES: ContextVar[KTMTPSharedModules | None] = ContextVar(
+    "glm52_kt_mtp_shared_modules",
+    default=None,
+)
+
+
+@contextmanager
+def glm52_kt_mtp_shared_modules(
+    embed_tokens: Any,
+    lm_head: Any,
+) -> Iterator[KTMTPSharedModules]:
+    """Expose target embed/head modules during draft construction.
+
+    SGLang normally allocates a second vocabulary embedding and LM head and
+    replaces their weights only after the draft model has loaded. GLM-5.2's
+    TP2 BF16 vocabulary matrices are roughly 908 MiB each per rank, so that
+    transient duplication exceeds the RTX 3090 headroom.
+    """
+
+    if embed_tokens is None or lm_head is None:
+        raise KTMTPAdmissionError(
+            "GLM-5.2 KT MTP shared modules must provide embedding and LM head"
+        )
+    shared = KTMTPSharedModules(embed_tokens=embed_tokens, lm_head=lm_head)
+    token: Token[KTMTPSharedModules | None] = _ACTIVE_SHARED_MODULES.set(shared)
+    try:
+        yield shared
+    finally:
+        _ACTIVE_SHARED_MODULES.reset(token)
+
+
+def get_glm52_kt_mtp_shared_modules() -> KTMTPSharedModules | None:
+    """Return construction-scoped target modules, if the exact path is active."""
+
+    return _ACTIVE_SHARED_MODULES.get()
 
 
 def _get(config: Any, name: str, default: Any = None) -> Any:
@@ -193,12 +240,8 @@ def select_glm52_mtp_nonexpert_weights(
         if name.startswith(prefix) and ".mlp.experts." not in name
     }
     if not names:
-        raise KTMTPAdmissionError(
-            f"No non-routed MTP tensors with prefix {prefix!r}"
-        )
-    invalid_shards = [
-        name for name in names if not isinstance(weight_map[name], str)
-    ]
+        raise KTMTPAdmissionError(f"No non-routed MTP tensors with prefix {prefix!r}")
+    invalid_shards = [name for name in names if not isinstance(weight_map[name], str)]
     if invalid_shards:
         raise KTMTPAdmissionError(
             f"MTP weight map has non-string shard values for {invalid_shards[:3]}"
@@ -289,9 +332,7 @@ def admit_glm52_kt_mtp(
             + ", ".join(configured_environment)
         )
     if os.environ.get("SGLANG_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU", "0") != "0":
-        mismatches.append(
-            "SGLANG_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU must be disabled"
-        )
+        mismatches.append("SGLANG_DSV4_SPLIT_MXFP4_GPU_AMXINT4_CPU must be disabled")
     if int(os.environ.get("SGLANG_KT_DRAFT_GPU_EXPERTS", "0")) != 0:
         mismatches.append("SGLANG_KT_DRAFT_GPU_EXPERTS must be 0")
     if int(os.environ.get("SGLANG_KT_GPU_PREFILL_TOKEN_THRESHOLD", "0")) != 0:
@@ -375,6 +416,13 @@ def validate_loaded_glm52_kt_mtp(
         )
     if gpu_expert_count != 0:
         errors.append(f"gpu_expert_count={gpu_expert_count!r} (expected 0)")
+    shared_at_construction = getattr(
+        draft_model,
+        "kt_mtp_shared_embed_and_head_at_construction",
+        False,
+    )
+    if shared_at_construction is not True:
+        errors.append("embed/head modules were not shared at draft construction")
     if errors:
         raise KTMTPAdmissionError(
             "Loaded GLM-5.2 KT MTP proof failed: " + "; ".join(errors)
@@ -384,4 +432,5 @@ def validate_loaded_glm52_kt_mtp(
         "physical_layer_index": physical_layer_index,
         "gpu_expert_count": gpu_expert_count,
         "wrapper_id": wrapper_id,
+        "shared_embed_and_head_at_construction": shared_at_construction,
     }

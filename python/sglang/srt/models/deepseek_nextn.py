@@ -21,9 +21,6 @@ from typing import Iterable, Optional, Tuple
 
 import torch
 from safetensors.torch import load_file
-from torch import nn
-from transformers import PretrainedConfig
-
 from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
 from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed import get_pp_group
@@ -65,7 +62,10 @@ from sglang.srt.runtime_context import (
     get_server_args,
     get_spec,
 )
+from sglang.srt.speculative.kt_mtp import get_glm52_kt_mtp_shared_modules
 from sglang.srt.utils import BumpAllocator, add_prefix, is_cuda, is_npu
+from torch import nn
+from transformers import PretrainedConfig
 
 
 def _gather_dsa_topk_indices_for_cp(
@@ -128,12 +128,16 @@ class DeepseekModelNextN(nn.Module):
 
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=add_prefix("embed_tokens", prefix),
-            **get_embedding_tp_kwargs(),
-        )
+        kt_mtp_shared_modules = get_glm52_kt_mtp_shared_modules()
+        if kt_mtp_shared_modules is None:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=add_prefix("embed_tokens", prefix),
+                **get_embedding_tp_kwargs(),
+            )
+        else:
+            self.embed_tokens = kt_mtp_shared_modules.embed_tokens
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -383,12 +387,19 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=add_prefix("model.shared_head.head", prefix),
-            use_attn_tp_group=get_server_args().enable_dp_lm_head,
+        kt_mtp_shared_modules = get_glm52_kt_mtp_shared_modules()
+        if kt_mtp_shared_modules is None:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("model.shared_head.head", prefix),
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+            )
+        else:
+            self.lm_head = kt_mtp_shared_modules.lm_head
+        self.kt_mtp_shared_embed_and_head_at_construction = (
+            kt_mtp_shared_modules is not None
         )
         self.logits_processor = LogitsProcessor(config)
 
