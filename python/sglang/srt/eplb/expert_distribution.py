@@ -337,18 +337,18 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     def dump_record(self, output_mode: _OutputMode = "file"):
         """Dump the expert distribution record and reset the recorder after dumping."""
-        output = self._accumulator.dump(output_mode=output_mode)
+        extra_output = None
         if self._record_kt_gpu_expert_distribution:
-            gpu_expert_masks = self._gpu_expert_mask_accumulator.dump()
-            if output_mode == "file":
-                _dump_to_file(
-                    f"gpu_expert_distribution_{time.time()}.pt",
-                    {"gpu_expert_masks": gpu_expert_masks},
-                )
-            elif output_mode == "object":
-                if output is None:
-                    output = {}
-                output["gpu_expert_masks"] = gpu_expert_masks
+            extra_output = {
+                "gpu_expert_masks": self._gpu_expert_mask_accumulator.dump()
+            }
+        # Keep the mask beside its matching logical counts. In PP mode the
+        # accumulator also supplies the global-rank suffix that prevents
+        # stage-local profiles from colliding.
+        output = self._accumulator.dump(
+            output_mode=output_mode,
+            extra_output=extra_output,
+        )
         self._reset()
         return output
 
@@ -802,7 +802,11 @@ class _Accumulator(ABC):
     def reset(self):
         pass
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(
+        self,
+        output_mode: _OutputMode,
+        extra_output: Optional[Dict[str, Any]] = None,
+    ):
         pass
 
 
@@ -974,13 +978,19 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._records.clear()
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(
+        self,
+        output_mode: _OutputMode,
+        extra_output: Optional[Dict[str, Any]] = None,
+    ):
         assert output_mode == "file"
         output = dict(
             records=self._records,
             # NOTE: This may change during recording, so here we say it is the "last" one
             last_physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
         )
+        if extra_output is not None:
+            output.update(extra_output)
         _dump_to_file(
             f"expert_distribution_recorder_{time.time()}_{self._rank}.pt", output
         )
@@ -1021,7 +1031,11 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         super().reset()
         self._global_physical_count_of_buffered_step.reset()
 
-    def dump(self, output_mode: _OutputMode):
+    def dump(
+        self,
+        output_mode: _OutputMode,
+        extra_output: Optional[Dict[str, Any]] = None,
+    ):
         logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count(
             self._global_physical_count_of_buffered_step.get_all(),
             num_layers=self._expert_location_metadata.num_layers,
@@ -1049,6 +1063,8 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             logical_count=logical_count_of_buffered_step,
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
+        if extra_output is not None:
+            output.update(extra_output)
 
         if output_mode == "file":
             if pipeline_parallel_dump:

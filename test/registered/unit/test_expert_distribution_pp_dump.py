@@ -2,7 +2,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-
 from sglang.srt.eplb.expert_distribution import _StatAccumulator
 
 
@@ -28,6 +27,7 @@ def _make_accumulator(*, pp_size: int, global_rank: int) -> _StatAccumulator:
 def test_stat_dump_writes_rank_local_profile_without_collective_under_pp():
     accumulator = _make_accumulator(pp_size=3, global_rank=2)
     logical_count = torch.full((2, 61, 384), 7, dtype=torch.int32)
+    gpu_expert_masks = torch.ones((2, 61, 384), dtype=torch.bool)
 
     with (
         patch(
@@ -39,7 +39,10 @@ def test_stat_dump_writes_rank_local_profile_without_collective_under_pp():
         patch("sglang.srt.eplb.expert_distribution._dump_to_file") as dump,
         patch("sglang.srt.eplb.expert_distribution.time.time", return_value=12.5),
     ):
-        accumulator.dump(output_mode="file")
+        accumulator.dump(
+            output_mode="file",
+            extra_output={"gpu_expert_masks": gpu_expert_masks},
+        )
 
     all_reduce.assert_not_called()
     dump.assert_called_once()
@@ -47,6 +50,7 @@ def test_stat_dump_writes_rank_local_profile_without_collective_under_pp():
     assert filename == "expert_distribution_recorder_12.5_2.pt"
     assert output["rank"] == 2
     assert output["logical_count"] is logical_count
+    assert output["gpu_expert_masks"] is gpu_expert_masks
 
 
 def test_stat_dump_preserves_world_reduction_without_pp():

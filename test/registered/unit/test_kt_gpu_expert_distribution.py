@@ -59,7 +59,13 @@ def test_real_recorder_dumps_gpu_masks_with_logical_counts() -> None:
     main_output = {"logical_count": torch.ones(1, 2, 4, dtype=torch.int32)}
     main_accumulator = Mock()
     main_accumulator.get_single_pass_gatherer_keys.return_value = []
-    main_accumulator.dump.return_value = main_output
+
+    def dump(*, output_mode, extra_output):
+        assert output_mode == "object"
+        main_output.update(extra_output)
+        return main_output
+
+    main_accumulator.dump.side_effect = dump
     server_args = SimpleNamespace(
         record_kt_gpu_expert_distribution=True,
         expert_distribution_recorder_buffer_size=-1,
@@ -91,6 +97,7 @@ def test_real_recorder_dumps_gpu_masks_with_logical_counts() -> None:
         ]
     ]
     assert recorder._gpu_expert_mask_accumulator.dump().shape == (0, 2, 4)
+    main_accumulator.dump.assert_called_once()
     main_accumulator.append.assert_not_called()
 
 
