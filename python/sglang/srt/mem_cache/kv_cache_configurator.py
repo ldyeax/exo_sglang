@@ -82,6 +82,30 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 
+def _preinitialize_pipeline_communicators(*, pp_group: Any, device: str) -> None:
+    """Materialize the forward PP edges before profiling free KV-cache memory."""
+
+    if pp_group.world_size == 1:
+        return
+
+    warmup = torch.empty(1, dtype=torch.uint8, device=device)
+    if pp_group.rank_in_group > 0:
+        torch.distributed.recv(
+            warmup,
+            src=pp_group.ranks[pp_group.rank_in_group - 1],
+            group=pp_group.device_group,
+        )
+    if pp_group.rank_in_group + 1 < pp_group.world_size:
+        torch.distributed.send(
+            warmup,
+            dst=pp_group.ranks[pp_group.rank_in_group + 1],
+            group=pp_group.device_group,
+        )
+    del warmup
+    current_platform.synchronize()
+    logger.info("Preinitialized forward pipeline communication edge before KV profiling")
+
+
 def _resolve_dsv4_worker_compression_ratios(
     *,
     is_draft_worker: bool,
@@ -1596,11 +1620,21 @@ class KVCacheConfigurator:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
+        # PP point-to-point communicators allocate persistent buffers lazily. Make
+        # those allocations visible to the profile instead of risking an OOM on
+        # the first real request after the KV pool consumes the remaining memory.
+        _preinitialize_pipeline_communicators(
+            pp_group=self.pp_group, device=self.device
+        )
+        world_group = get_world_group()
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
-            distributed=get_world_group().world_size > 1,
-            cpu_group=get_world_group().cpu_group,
+            # PP stages can have different KV bytes/token. Reducing raw free
+            # bytes first is dimensionally wrong; profile each stage locally and
+            # reduce the derived token capacity in _apply_token_constraints.
+            distributed=world_group.world_size > 1 and self.pp_group.world_size == 1,
+            cpu_group=world_group.cpu_group,
         )
 
         slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
