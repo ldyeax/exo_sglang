@@ -107,10 +107,13 @@ def test_compact_w8_dispatch_allows_absorbed_mla(
         AttnForwardMethod.MLA_FUSED_ROPE_CPU,
     ],
 )
-def test_compact_w8_dispatch_rejects_non_plain_mla(
+def test_compact_w8_dispatch_rejects_mha_and_platform_fused_paths(
     monkeypatch: pytest.MonkeyPatch,
     selected_method: AttnForwardMethod,
 ) -> None:
+    # The old generic MLA_FUSED_ROPE path was GPU-agnostic. In the modern
+    # split, the only fused variants are ROCm and CPU, while compact W8 is a
+    # CUDA-only format, so neither is a compatible specialist.
     attention = _attention(compact_w8=True)
     _select_method(monkeypatch, selected_method)
 
