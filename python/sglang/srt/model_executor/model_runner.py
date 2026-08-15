@@ -579,6 +579,7 @@ class ModelRunner:
         self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
+        self.configure_compact_mla_kv_b_attention()
         prepare_moe_topk(
             model=self.model,
             model_config=self.model_config,
@@ -611,6 +612,46 @@ class ModelRunner:
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+
+    def configure_compact_mla_kv_b_attention(self) -> None:
+        """Keep attention metadata on absorbed MLA for compact ``kv_b``."""
+
+        compact_attention_modules: list[torch.nn.Module] = []
+        for module in self.model.modules():
+            kv_b_projection = getattr(module, "kv_b_proj", None)
+            quant_method = getattr(kv_b_projection, "quant_method", None)
+            if not getattr(quant_method, "is_mla_kv_b_w8", False):
+                continue
+            if not getattr(quant_method, "requires_mla_absorb", False):
+                raise RuntimeError(
+                    "compact MLA kv_b W8 method does not declare its absorbed-MLA "
+                    "requirement"
+                )
+            if not hasattr(module, "flashinfer_mla_disable_ragged"):
+                raise RuntimeError(
+                    "compact MLA kv_b W8 is attached outside a DeepSeek MLA "
+                    "attention module"
+                )
+            compact_attention_modules.append(module)
+
+        if not compact_attention_modules:
+            return
+
+        # Metadata planners read the resolved runtime config before individual
+        # model layers dispatch. Override that single source of truth before
+        # attention backends are constructed, then synchronize layer dispatch.
+        get_context().override(
+            source="compact_mla_kv_b_w8",
+            flashinfer_mla_disable_ragged=True,
+        )
+        for module in compact_attention_modules:
+            module.flashinfer_mla_disable_ragged = True
+
+        logger.info(
+            "Compact MLA kv_b W8 requires absorbed MLA; disabled FlashInfer "
+            "ragged MHA prefill for %d attention modules",
+            len(compact_attention_modules),
+        )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(

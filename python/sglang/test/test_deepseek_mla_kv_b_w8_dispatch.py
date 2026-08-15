@@ -3,7 +3,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sglang.srt.model_executor.model_runner as model_runner_module
 import sglang.srt.models.deepseek_v2 as deepseek_v2
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.deepseek_common.attention_forward_methods import (
     AttnForwardMethod,
 )
@@ -35,8 +37,12 @@ def _attention(*, compact_w8: bool) -> DeepseekV2AttentionMLA:
     attention = object.__new__(DeepseekV2AttentionMLA)
     torch.nn.Module.__init__(attention)
     attention.kv_b_proj = SimpleNamespace(
-        quant_method=SimpleNamespace(is_mla_kv_b_w8=compact_w8)
+        quant_method=SimpleNamespace(
+            is_mla_kv_b_w8=compact_w8,
+            requires_mla_absorb=compact_w8,
+        )
     )
+    attention.flashinfer_mla_disable_ragged = False
     return attention
 
 
@@ -107,19 +113,17 @@ def test_compact_w8_dispatch_allows_absorbed_mla(
         AttnForwardMethod.MHA_ONE_SHOT,
     ],
 )
-def test_compact_w8_dispatch_forces_mha_heuristics_to_absorbed_mla(
+def test_compact_w8_dispatch_rejects_mha_after_metadata_planning(
     monkeypatch: pytest.MonkeyPatch,
     selected_method: AttnForwardMethod,
 ) -> None:
     attention = _attention(compact_w8=True)
     _select_method(monkeypatch, selected_method)
 
-    selected = attention.dispatch_attn_forward_method(
-        SimpleNamespace(forward_mode=_DecodeForwardMode())
-    )
-
-    assert selected == AttnForwardMethod.MLA
-    assert attention.current_attention_backend == "test_decode"
+    with pytest.raises(RuntimeError, match="compact MLA kv_b W8 requires"):
+        attention.dispatch_attn_forward_method(
+            SimpleNamespace(forward_mode=_DecodeForwardMode())
+        )
 
 
 @pytest.mark.parametrize(
@@ -153,3 +157,35 @@ def test_other_quant_methods_keep_fused_rope_dispatch(
     )
 
     assert selected == AttnForwardMethod.MLA_FUSED_ROPE_ROCM
+
+
+def test_model_runner_configures_runtime_metadata_before_backend_init(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attention = _attention(compact_w8=True)
+    model = torch.nn.Module()
+    model.add_module("attention", attention)
+
+    override_receipt: dict[str, object] = {}
+
+    class _RuntimeContext:
+        @staticmethod
+        def override(source: str, **fields: object) -> None:
+            override_receipt["source"] = source
+            override_receipt.update(fields)
+
+    runner = object.__new__(ModelRunner)
+    runner.model = model
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_context",
+        lambda: _RuntimeContext(),
+    )
+
+    runner.configure_compact_mla_kv_b_attention()
+
+    assert override_receipt == {
+        "source": "compact_mla_kv_b_w8",
+        "flashinfer_mla_disable_ragged": True,
+    }
+    assert attention.flashinfer_mla_disable_ragged

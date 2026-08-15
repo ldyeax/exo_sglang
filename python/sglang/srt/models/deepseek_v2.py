@@ -2224,22 +2224,10 @@ class DeepseekV2AttentionMLA(
 
         handler = AttentionBackendRegistry.get_handler(attention_backend)
         attn_forward_method = handler(self, forward_batch)
-        # The compact layout has no ordinary Linear orientation. Prefill
-        # heuristics may choose an MHA variant, but that is only an optimization
-        # choice: force those variants back to the CUDA absorbed-MLA path.
-        if (
-            self._get_mla_kv_b_w8_method() is not None
-            and attn_forward_method
-            in {
-                AttnForwardMethod.MHA,
-                AttnForwardMethod.MHA_CHUNKED_KV,
-                AttnForwardMethod.MHA_ONE_SHOT,
-            }
-        ):
-            return AttnForwardMethod.MLA
-
-        # CPU, ROCm, and NPU variants still dereference legacy kv_b weights,
-        # so reject them explicitly instead of crossing tensor ABIs.
+        # The compact layout has no ordinary Linear orientation. Metadata is
+        # configured before backend construction to keep CUDA on absorbed MLA;
+        # reject any incompatible late selection instead of crossing tensor
+        # ABIs after the backend planned a different layout.
         if (
             self._get_mla_kv_b_w8_method() is not None
             and attn_forward_method != AttnForwardMethod.MLA
