@@ -15,7 +15,7 @@ def test_caller_owned_gemm2_output_matches_allocating_path(monkeypatch) -> None:
     monkeypatch.setattr(
         v4_triton_kernels_moe,
         "_make_routing_data_v4",
-        lambda *args: (routing_data, gather_index, scatter_index),
+        lambda *args, **kwargs: (routing_data, gather_index, scatter_index),
     )
     monkeypatch.setattr(v4_triton_kernels_moe, "_patch_strided_mxfp", lambda: None)
 

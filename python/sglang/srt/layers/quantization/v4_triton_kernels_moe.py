@@ -59,6 +59,8 @@ _SMALL_ROW_ROUTING_MAX_ROWS = 6
 _SMALL_ROW_ROUTING_BLOCK_M_VALUES = (16, 32, 64, 128)
 _SM86_SMALL_BATCH_GEMM_ENV = "SGLANG_V4_MXFP4_SM86_SMALL_BATCH_GEMM"
 _SM86_FUSED_T5_MOE_ENV = "SGLANG_V4_MXFP4_FUSED_T5_MOE"
+_COMPACT_GPU_ROUTES_ENV = "SGLANG_V4_COMPACT_GPU_ROUTES"
+_COMPACT_GPU_ROUTE_MIN_TOKENS_ENV = "SGLANG_V4_COMPACT_GPU_ROUTE_MIN_TOKENS"
 _SM86_SMALL_BATCH_GEMM_BLOCK_N = 128
 _SM86_SMALL_BATCH_GEMM_SPLIT_K = 2
 _SM86_SMALL_BATCH_GEMM_NUM_STAGES = 4
@@ -944,6 +946,132 @@ def _make_routing_data_v4(
     )
 
 
+@triton.jit
+def _reduce_compact_routes_kernel(
+    compact_output_ptr,
+    compact_lookup_ptr,
+    output_ptr,
+    output_columns,
+    TOP_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """Reduce compact GPU-route rows back to tokens in original slot order."""
+    token_idx = tl.program_id(0)
+    column_offsets = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    column_mask = column_offsets < output_columns
+    accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for slot_idx in range(TOP_K):
+        compact_idx = tl.load(compact_lookup_ptr + token_idx * TOP_K + slot_idx)
+        route_mask = (compact_idx >= 0) & column_mask
+        route_values = tl.load(
+            compact_output_ptr + compact_idx * output_columns + column_offsets,
+            mask=route_mask,
+            other=0.0,
+        )
+        accumulator += route_values.to(tl.float32)
+    tl.store(
+        output_ptr + token_idx * output_columns + column_offsets,
+        accumulator,
+        mask=column_mask,
+    )
+
+
+def _compact_gpu_routes_are_eligible(num_tokens: int) -> bool:
+    if os.environ.get(_COMPACT_GPU_ROUTES_ENV) != "1":
+        return False
+
+    try:
+        threshold = int(os.environ.get(_COMPACT_GPU_ROUTE_MIN_TOKENS_ENV, "512"))
+    except ValueError as error:
+        raise ValueError(
+            f"{_COMPACT_GPU_ROUTE_MIN_TOKENS_ENV} must be an integer"
+        ) from error
+    if threshold < 1:
+        raise ValueError(f"{_COMPACT_GPU_ROUTE_MIN_TOKENS_ENV} must be positive")
+
+    # nonzero() and the resulting route-sized allocations are intentionally
+    # eager-only. Decode/speculative graph capture keeps the fixed top-8 path.
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_is_capture_mode,
+    )
+
+    return num_tokens >= threshold and not get_is_capture_mode()
+
+
+def _make_compact_routing_data_v4(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_local_experts: int,
+):
+    """Build top-1 routing over valid GPU routes while gathering input tokens."""
+    from triton_kernels.routing import GatherIndx
+
+    flat_ids = topk_ids.reshape(-1)
+    flat_weights = topk_weights.reshape(-1)
+    valid_flat_indices = torch.nonzero(flat_ids >= 0, as_tuple=False).flatten()
+    top_k = topk_ids.shape[1]
+    compact_lookup = torch.full(
+        (flat_ids.numel(),),
+        -1,
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    if valid_flat_indices.numel() == 0:
+        return None, None, None, compact_lookup.view_as(topk_ids)
+
+    token_indices = torch.div(valid_flat_indices, top_k, rounding_mode="floor").to(
+        torch.int32
+    )
+    compact_ids = flat_ids[valid_flat_indices].reshape(-1, 1)
+    compact_weights = flat_weights[valid_flat_indices].reshape(-1, 1)
+    routing_data, gather_indx, scatter_indx = _make_routing_data_v4(
+        compact_ids,
+        compact_weights,
+        num_local_experts,
+    )
+
+    # The top-1 gather refers to compact-route rows. Point it directly at the
+    # corresponding original token so the large hidden-state tensor is never
+    # compact-copied.
+    original_token_gather = token_indices[gather_indx.src_indx.to(torch.int64)]
+    gather_indx = GatherIndx(
+        src_indx=original_token_gather.to(gather_indx.src_indx.dtype),
+        dst_indx=gather_indx.dst_indx,
+    )
+    compact_lookup[valid_flat_indices] = torch.arange(
+        valid_flat_indices.numel(),
+        dtype=torch.int32,
+        device=topk_ids.device,
+    )
+    return (
+        routing_data,
+        gather_indx,
+        scatter_indx,
+        compact_lookup.view_as(topk_ids),
+    )
+
+
+def _reduce_compact_routes(
+    compact_output: torch.Tensor,
+    compact_lookup: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Restore compact route rows into a caller-owned or fresh token output."""
+    output_columns = output.shape[1]
+    block_n = 256
+    _reduce_compact_routes_kernel[
+        (output.shape[0], triton.cdiv(output_columns, block_n))
+    ](
+        compact_output,
+        compact_lookup,
+        output,
+        output_columns,
+        TOP_K=compact_lookup.shape[1],
+        BLOCK_N=block_n,
+    )
+    return output
+
+
 # -----------------------------------------------------------------------------
 # Weight conversion: raw V4 MXFP4 → triton_kernels-format
 # -----------------------------------------------------------------------------
@@ -1232,7 +1360,6 @@ def apply_v4_triton_kernels_moe(
     M, K = hidden_states.shape
     N = intermediate_size
 
-    gemm2_output = None
     if caller_output is not None:
         if (
             caller_output.shape != hidden_states.shape
@@ -1244,22 +1371,46 @@ def apply_v4_triton_kernels_moe(
                 "V4 MXFP4 caller-owned output must be a contiguous tensor "
                 "matching hidden_states shape, dtype, and device"
             )
-        # matmul_ogs uses a leading batch dimension for caller-owned output,
-        # then returns a squeezed view.  The KT hybrid path intentionally
-        # supplies hidden_states here: its CPU staging copy was enqueued first,
-        # and GEMM1 consumes the input before GEMM2 overwrites it on the same
-        # CUDA stream.
-        gemm2_output = caller_output.unsqueeze(0)
 
     # Build routing data from sglang topk → triton_kernels (RoutingData,
     # GatherIndx, ScatterIndx). Note: this rebuilds per-call. Cheap
     # (O(M * n_topk)) compared to the gemms themselves.
-    routing_data, gather_indx, scatter_indx = _make_routing_data_v4(
-        topk_ids,
-        topk_weights,
-        num_experts,
-        gpu_experts_mask=gpu_experts_mask,
-        logical_to_gpu_index=logical_to_gpu_index,
+    compact_lookup = None
+    if _compact_gpu_routes_are_eligible(M):
+        if gpu_experts_mask is not None or logical_to_gpu_index is not None:
+            raise RuntimeError(
+                "compact GPU routes require pre-masked local expert ids"
+            )
+        routing_data, gather_indx, scatter_indx, compact_lookup = (
+            _make_compact_routing_data_v4(
+                topk_ids,
+                topk_weights,
+                num_experts,
+            )
+        )
+        if routing_data is None:
+            output = (
+                caller_output
+                if caller_output is not None
+                else torch.empty_like(hidden_states)
+            )
+            return output.zero_()
+    else:
+        routing_data, gather_indx, scatter_indx = _make_routing_data_v4(
+            topk_ids,
+            topk_weights,
+            num_experts,
+            gpu_experts_mask=gpu_experts_mask,
+            logical_to_gpu_index=logical_to_gpu_index,
+        )
+
+    # matmul_ogs uses a leading batch dimension for caller-owned output, then
+    # returns a squeezed view. Compact routing instead produces one row per
+    # valid route and reduces those rows into the final token-shaped output.
+    gemm2_output = (
+        caller_output.unsqueeze(0)
+        if caller_output is not None and compact_lookup is None
+        else None
     )
 
     # gemm1: hidden_states (M, K) @ w13 → (M*topk, 2*N) bf16
@@ -1325,7 +1476,14 @@ def apply_v4_triton_kernels_moe(
         gammas=routing_data.gate_scal,
         y=gemm2_output,
     )
-    if caller_output is not None and output.data_ptr() != caller_output.data_ptr():
+    if compact_lookup is not None:
+        final_output = (
+            caller_output
+            if caller_output is not None
+            else torch.empty_like(hidden_states)
+        )
+        output = _reduce_compact_routes(output, compact_lookup, final_output)
+    elif caller_output is not None and output.data_ptr() != caller_output.data_ptr():
         raise RuntimeError("V4 MXFP4 GEMM2 did not preserve caller-owned output")
 
     # routed_scaling_factor is NOT applied here; the caller
