@@ -37,7 +37,10 @@ if TYPE_CHECKING:
 if is_flashinfer_available() and is_sm120_supported():
     from flashinfer import fp4_quantize
 elif is_cuda_alike():
-    from sgl_kernel import scaled_fp4_quant as fp4_quantize
+    try:
+        from sgl_kernel import scaled_fp4_quant as fp4_quantize
+    except ImportError:
+        fp4_quantize = None
 else:
     fp4_quantize = None
 

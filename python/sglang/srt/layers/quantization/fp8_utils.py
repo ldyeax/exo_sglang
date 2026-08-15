@@ -63,7 +63,12 @@ if _use_aiter:
 
 
 if _is_cuda:
-    from sgl_kernel import fp8_blockwise_scaled_mm, fp8_scaled_mm
+    from sgl_kernel import fp8_scaled_mm
+
+    try:
+        from sgl_kernel import fp8_blockwise_scaled_mm
+    except ImportError:
+        fp8_blockwise_scaled_mm = None
 
     @torch.library.register_fake("sgl_kernel::fp8_scaled_mm")
     def _fp8_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
@@ -72,12 +77,13 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    @torch.library.register_fake("sgl_kernel::fp8_blockwise_scaled_mm")
-    def _fp8_blockwise_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype):
-        # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
-        M = mat_a.shape[-2]
-        N = mat_b.shape[-1]
-        return mat_a.new_empty((M, N), dtype=out_dtype)
+    if fp8_blockwise_scaled_mm is not None:
+        @torch.library.register_fake("sgl_kernel::fp8_blockwise_scaled_mm")
+        def _fp8_blockwise_scaled_mm_abstract(mat_a, mat_b, scales_a, scales_b, out_dtype):
+            # mat_a: [M, K], mat_b: [K, N] or [N, K] depending on callsite layout; output is [M, N].
+            M = mat_a.shape[-2]
+            N = mat_b.shape[-1]
+            return mat_a.new_empty((M, N), dtype=out_dtype)
 
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
@@ -435,7 +441,7 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     # TODO: add more robust shape check here
     shape_supported = weight.shape[0] % 128 == 0 and weight.shape[1] % 128 == 0
 
-    if not shape_supported:
+    if not shape_supported or fp8_blockwise_scaled_mm is None:
         # fallback to triton
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
