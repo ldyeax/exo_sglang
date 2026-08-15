@@ -3501,6 +3501,7 @@ class ServerArgs:
         # direct handler invocations can rely on it even when
         # _handle_model_specific_adjustments never runs.
         self._resolved_overrides = []
+        self._handle_kt_method_aliases()
 
         if self.model_path.lower() in ["none", "dummy"]:
             return
@@ -4008,6 +4009,19 @@ class ServerArgs:
                         f"mm_process_config['{key}'] must be a dict, "
                         f"but got {type(self.mm_process_config[key])}"
                     )
+
+    def _handle_kt_method_aliases(self) -> None:
+        aliases = {"RAWFP8": "FP8"}
+        normalized = aliases.get((self.kt_method or "").upper())
+        if normalized is None:
+            return
+        logger.warning(
+            "--kt-method %s is deprecated; using %s. Use --kt-method %s in new scripts.",
+            self.kt_method,
+            normalized,
+            normalized,
+        )
+        self.kt_method = normalized
 
     def _handle_deprecated_args(self):
         if self.kt_lora_path:
