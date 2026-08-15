@@ -25,7 +25,7 @@ buffers to keep break-point tensors at stable addresses.
 import logging
 import threading
 from contextvars import ContextVar
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import torch
 
@@ -219,7 +219,7 @@ def _copy_output(dst: Any, src: Any) -> Any:
     return src
 
 
-def eager_on_graph(enable: bool):
+def eager_on_graph(enable: bool, capture_stub: Optional[Callable] = None):
     def decorator(inner: Callable):
         if not enable:
             return inner
@@ -238,9 +238,18 @@ def eager_on_graph(enable: bool):
             # End the segment that captured up to this break point.
             capture._end_current_segment()
 
-            # Run the eager function once so it allocates its outputs and
-            # writes real data into them.
-            output = inner(*args, **kwargs)
+            # Segment teardown is variable across ranks. Re-synchronize before
+            # eager breaks that contain rank-coupled collectives and timeouts.
+            if capture._barrier_fn is not None:
+                capture._barrier_fn()
+
+            # A capture-only stub may allocate compatible outputs without
+            # executing a rank-coupled body. Replay still calls the real body.
+            output = (
+                capture_stub(*args, **kwargs)
+                if capture_stub is not None
+                else inner(*args, **kwargs)
+            )
 
             # Weak-ref captured inputs produced by graph segments. Their storage
             # is pinned by the segment CUDAGraphs' mempool use-count, so Python
@@ -317,6 +326,7 @@ class BreakableCUDAGraphCapture:
         pool=None,
         stream: torch.cuda.Stream | None = None,
         capture_error_mode: str = "global",
+        barrier_fn: Callable[[], None] | None = None,
     ):
         assert isinstance(
             cuda_graph, BreakableCUDAGraph
@@ -325,6 +335,7 @@ class BreakableCUDAGraphCapture:
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream
         self._capture_error_mode = capture_error_mode
+        self._barrier_fn = barrier_fn
         self._stream_ctx = None
         self._capture_token = None
         self._stream_token = None

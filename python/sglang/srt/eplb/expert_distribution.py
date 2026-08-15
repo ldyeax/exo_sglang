@@ -258,12 +258,17 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._recording or torch.get_device_module().is_current_stream_capturing()
         ):
             return
+        layer_idx = self._current_layer_idx.value
+        # DSpark draft routing has no target-layer scope. Recording it as target
+        # demand corrupts route-ranked placement and can also index with None.
+        if layer_idx is None:
+            return
         gatherer = self._single_pass_gatherers[
             self._accumulator.get_single_pass_gatherer_key(
                 self._current_debug_name.value
             )
         ]
-        getattr(gatherer, hook_name)(layer_idx=self._current_layer_idx.value, **kwargs)
+        getattr(gatherer, hook_name)(layer_idx=layer_idx, **kwargs)
 
     def _reset(self):
         """Reset the expert distribution recorder."""

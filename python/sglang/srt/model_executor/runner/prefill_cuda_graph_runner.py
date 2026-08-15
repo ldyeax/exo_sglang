@@ -101,6 +101,13 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 
+try:
+    from kt_kernel import KTMoEWrapper
+
+    KTRANSFORMERS_AVAILABLE = True
+except ImportError:
+    KTRANSFORMERS_AVAILABLE = False
+
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions.
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
 logger = logging.getLogger(__name__)
@@ -170,6 +177,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         capture_tokens = model_runner.server_args.cuda_graph_config.prefill.bs
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = sorted(capture_tokens)
+        if KTRANSFORMERS_AVAILABLE:
+            # Breakable prefill graphs record transfers to pinned KT buffers.
+            # Preserve one buffer set per physical token tier across captures.
+            KTMoEWrapper.set_capture_batch_sizes(self.capture_num_tokens)
         self.max_num_tokens = (
             max(self.capture_num_tokens) if self.capture_num_tokens else 8192
         )

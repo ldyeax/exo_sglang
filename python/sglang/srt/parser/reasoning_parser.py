@@ -1,6 +1,14 @@
 import inspect
 from typing import Dict, List, Optional, Tuple, Type
 
+from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
+from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
+from sglang.srt.entrypoints.openai.encoding_dsv4 import (
+    thinking_end_token as dsv4_thinking_end_token,
+)
+from sglang.srt.entrypoints.openai.encoding_dsv4 import (
+    thinking_start_token as dsv4_thinking_start_token,
+)
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.parser.harmony_parser import HarmonyParser
@@ -644,6 +652,40 @@ class _DeepSeekV3Detector(Qwen3Detector):
         self.reasoning_default = "explicit_thinking"
 
 
+class DeepSeekV4Detector(BaseReasoningFormatDetector):
+    """DeepSeek V4 reasoning using the checkpoint's native control tokens."""
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            dsv4_thinking_start_token,
+            dsv4_thinking_end_token,
+            think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="explicit_thinking",
+        )
+        self._force_nonempty_content = force_nonempty_content
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        result = super().detect_and_parse(text)
+        if self._force_nonempty_content and not result.normal_text:
+            result.normal_text, result.reasoning_text = (
+                result.reasoning_text,
+                result.normal_text,
+            )
+        return result
+
+
 class _MimoDetector(Qwen3Detector):
     """MIMO reuses Qwen3 tokens but requires explicit enable_thinking=True to enable."""
 
@@ -1130,7 +1172,7 @@ class ReasoningParser:
         "apertus2509": Apertus2509Detector,
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
-        "deepseek-v4": _DeepSeekV3Detector,
+        "deepseek-v4": DeepSeekV4Detector,
         "glm45": Glm45Detector,
         "hunyuan": HunyuanDetector,
         "gpt-oss": GptOssDetector,

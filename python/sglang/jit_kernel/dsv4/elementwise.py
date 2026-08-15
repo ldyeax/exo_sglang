@@ -122,6 +122,12 @@ def fused_rope_inplace(
         positions: [batch_size] int32 or int64, indices into freqs_cis
         inverse: if True, apply inverse rotation (conjugate freqs)
     """
+    if q.ndim == 4:
+        assert q.shape[1] == 1
+        q = q.squeeze(1)
+    if k is not None and k.ndim == 4:
+        assert k.shape[1] == 1
+        k = k.squeeze(1)
     if _is_hip or _is_xpu:
         from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 
