@@ -843,6 +843,9 @@ class Envs:
     # Spec Config
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Disable only the DeepSeek-V4 DSpark draft decode graph. The target verify
+    # graph remains governed by ServerArgs and can stay enabled.
+    SGLANG_DSV4_DRAFT_DISABLE_CUDA_GRAPH = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_DSPARK_CONFIDENCE_RELAY_LAG_STEPS = EnvInt(2)
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)

@@ -326,7 +326,19 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        capture_decode_cuda_graph = not get_exec().graph.disable_cuda_graph
+        disable_dsv4_draft_graph = (
+            envs.SGLANG_DSV4_DRAFT_DISABLE_CUDA_GRAPH.get()
+        )
+        capture_decode_cuda_graph = (
+            not get_exec().graph.disable_cuda_graph
+            and not disable_dsv4_draft_graph
+        )
+        if disable_dsv4_draft_graph and self.ps.tp_rank == 0:
+            logger.info(
+                "Disable DSpark draft CUDA graph by "
+                "SGLANG_DSV4_DRAFT_DISABLE_CUDA_GRAPH=1; "
+                "target verify CUDA graph remains enabled."
+            )
         if is_cuda() and capture_decode_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
             # The V4 DSpark verify graph at batch size 1 uses about 70 MiB on
