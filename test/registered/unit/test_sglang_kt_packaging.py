@@ -41,16 +41,16 @@ def test_primary_package_metadata_matches_the_kt_runtime_contract() -> None:
 
     requirements = [Requirement(value) for value in project["dependencies"]]
     by_name = {canonicalize_name(requirement.name): requirement for requirement in requirements}
-    assert "transformers" not in by_name
-    assert str(by_name["transformers-kt"].specifier) == "==5.6.0.post1"
-    assert str(by_name["torch"].specifier) == "==2.9.1"
-    assert str(by_name["torchaudio"].specifier) == "==2.9.1"
-    assert str(by_name["torchvision"].specifier) == "==0.24.1"
-    assert str(by_name["torchcodec"].specifier) == "==0.8.0"
-    assert str(by_name["torchao"].specifier) == "==0.9.0"
-    assert str(by_name["flashinfer-python"].specifier) == "==0.6.9"
-    assert str(by_name["flashinfer-cubin"].specifier) == "==0.6.9"
-    assert str(by_name["sglang-kernel"].specifier) == "==0.3.21"
+    assert "transformers-kt" not in by_name
+    assert str(by_name["transformers"].specifier) == "==5.12.1"
+    assert str(by_name["torch"].specifier) == "==2.11.0"
+    assert str(by_name["torchaudio"].specifier) == "==2.11.0"
+    assert not by_name["torchvision"].specifier
+    assert str(by_name["torchcodec"].specifier) == "==0.11.1"
+    assert str(by_name["torchao"].specifier) == "==0.17.0"
+    assert str(by_name["flashinfer-python"].specifier) == "==0.6.15.post1"
+    assert "flashinfer-cubin" not in by_name
+    assert str(by_name["sglang-kernel"].specifier) == "==0.4.5"
 
     extras = project["optional-dependencies"]
     self_references = [
@@ -120,6 +120,6 @@ def test_built_wheel_exposes_kt_name_version_and_dependencies(tmp_path: Path) ->
     assert metadata["Version"] == "0.6.3.post1"
     requirements = [Requirement(value) for value in metadata.get_all("Requires-Dist", [])]
     requirement_names = {canonicalize_name(requirement.name) for requirement in requirements}
-    assert "transformers-kt" in requirement_names
-    assert "transformers" not in requirement_names
+    assert "transformers" in requirement_names
+    assert "transformers-kt" not in requirement_names
     assert "sglang" not in requirement_names
