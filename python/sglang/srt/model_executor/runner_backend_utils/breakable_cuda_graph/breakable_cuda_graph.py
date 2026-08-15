@@ -238,8 +238,11 @@ def eager_on_graph(enable: bool):
             # End the segment that captured up to this break point.
             capture._end_current_segment()
 
-            # Run the eager function once so it allocates its outputs and
-            # writes real data into them.
+            # Segment teardown is variable across ranks. Re-synchronize before
+            # eager breaks that contain rank-coupled collectives and timeouts.
+            if capture._barrier_fn is not None:
+                capture._barrier_fn()
+
             output = inner(*args, **kwargs)
 
             # Weak-ref captured inputs produced by graph segments. Their storage
@@ -317,6 +320,7 @@ class BreakableCUDAGraphCapture:
         pool=None,
         stream: torch.cuda.Stream | None = None,
         capture_error_mode: str = "global",
+        barrier_fn: Callable[[], None] | None = None,
     ):
         assert isinstance(
             cuda_graph, BreakableCUDAGraph
@@ -325,6 +329,7 @@ class BreakableCUDAGraphCapture:
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream
         self._capture_error_mode = capture_error_mode
+        self._barrier_fn = barrier_fn
         self._stream_ctx = None
         self._capture_token = None
         self._stream_token = None

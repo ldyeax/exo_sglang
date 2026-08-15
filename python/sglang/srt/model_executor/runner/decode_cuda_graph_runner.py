@@ -273,8 +273,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.capture_bs, self.compile_bs = get_batch_sizes_to_capture(
             model_runner, self.num_tokens_per_bs
         )
-        if KTRANSFORMERS_AVAILABLE:
-            KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
         self.ragged_verify_mode = (
             ragged_verify_compact_graphs_enabled(self.model_runner.spec_algorithm)
@@ -286,6 +284,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.ragged_verify_mode
             else None
         )
+        if KTRANSFORMERS_AVAILABLE:
+            # KT keys pinned host buffers by physical token count, not request
+            # count. Retain every tier before capture so later tiers cannot
+            # replace a temporary buffer still referenced by an earlier graph.
+            physical_capture_sizes = (
+                self.capture_num_tokens
+                if self.capture_num_tokens is not None
+                else [bs * self.num_tokens_per_bs for bs in self.capture_bs]
+            )
+            KTMoEWrapper.set_capture_batch_sizes(physical_capture_sizes)
         self._ragged_graph_size = 0
         if self.ragged_verify_mode and (
             self.enable_two_batch_overlap

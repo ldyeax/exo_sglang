@@ -137,6 +137,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             cuda_graph=graph,
             pool=self._pool,
             stream=self._capture_stream,
+            barrier_fn=self._tp_group.barrier,
         ):
             out = captured_fn()
             if not self._single_capture_shape:

@@ -104,6 +104,14 @@ def topk_transform_512_v2(
     the output is all -1.
     """
     module = _jit_topk_v2_module()
+    if (
+        out_raw_indices is None
+        or out_raw_indices.numel() == 0
+        or out_raw_indices.device != out_page_indices.device
+        or out_raw_indices.dtype != torch.int32
+        or out_raw_indices.shape != out_page_indices.shape
+    ):
+        out_raw_indices = torch.empty_like(out_page_indices)
     module.topk_transform(
         scores,
         seq_lens,

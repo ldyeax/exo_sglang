@@ -2,9 +2,13 @@
 
 import unittest
 
+from sglang.srt.entrypoints.openai.encoding_dsv4 import (
+    thinking_start_token as dsv4_thinking_start_token,
+)
 from sglang.srt.parser.reasoning_parser import (
     BaseReasoningFormatDetector,
     DeepSeekR1Detector,
+    DeepSeekV4Detector,
     Gemma4Detector,
     Glm45Detector,
     HunyuanDetector,
@@ -163,6 +167,35 @@ class TestQwen3Detector(CustomTestCase):
         result = self.detector.detect_and_parse(text)
         self.assertEqual(result.normal_text, text)
         self.assertEqual(result.reasoning_text, "")
+
+
+class TestDeepSeekV4Detector(CustomTestCase):
+    def test_strict_thinking_uses_deepseek_control_tokens(self):
+        detector = ReasoningParser(model_type="deepseek-v4").detector
+        self.assertIsInstance(detector, DeepSeekV4Detector)
+        self.assertEqual(
+            detector.think_excluded_tokens,
+            ["<｜end▁of▁sentence｜>", "｜DSML｜"],
+        )
+        self.assertEqual(detector.reasoning_default, "explicit_thinking")
+        self.assertTrue(detector.thinks_internally)
+
+    def test_force_nonempty_content_remains_supported(self):
+        detector = DeepSeekV4Detector(force_nonempty_content=True)
+        result = detector.detect_and_parse("<think>reasoning only")
+        self.assertEqual(result.normal_text, "reasoning only")
+        self.assertEqual(result.reasoning_text, "")
+
+
+    def test_force_nonempty_content_flushes_an_open_stream(self):
+        detector = DeepSeekV4Detector(force_nonempty_content=True)
+        incremental = detector.parse_streaming_increment(
+            dsv4_thinking_start_token + "reasoning only"
+        )
+        self.assertEqual(incremental.normal_text, "")
+        flushed = detector.finish()
+        self.assertEqual(flushed.normal_text, "reasoning only")
+        self.assertEqual(flushed.reasoning_text, "")
 
 
 class TestKimiDetector(CustomTestCase):
