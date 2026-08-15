@@ -2984,6 +2984,14 @@ class ServerArgs:
         "[experimental ktransformers parameter] Update resident GPU experts from observed routes.",
         NS("exec.moe"),
     ] = False
+    record_kt_gpu_expert_distribution: A[
+        bool,
+        (
+            "[ktransformers parameter] Record the resident GPU expert mask "
+            "for each forward pass alongside expert-distribution statistics."
+        ),
+        NS("exec.moe"),
+    ] = False
     kt_expert_placement_strategy: A[
         str,
         Arg(choices=["uniform", "front-loading", "frequency", "random"]),
@@ -7037,10 +7045,16 @@ class ServerArgs:
         # ===== END TO BE REFACTORED ====
 
     def _handle_expert_distribution_metrics(self):
-        if self.enable_expert_distribution_metrics and (
-            self.expert_distribution_recorder_mode is None
-        ):
+        if (
+            self.enable_expert_distribution_metrics
+            or self.record_kt_gpu_expert_distribution
+        ) and self.expert_distribution_recorder_mode is None:
             self.expert_distribution_recorder_mode = "stat"
+            if self.record_kt_gpu_expert_distribution:
+                logger.warning(
+                    "KT GPU expert-mask recording requires expert routes; "
+                    "--expert-distribution-recorder-mode is automatically set to stat."
+                )
 
         if self.expert_distribution_recorder_buffer_size is None:
             if (x := self.eplb_rebalance_num_iterations) is not None:

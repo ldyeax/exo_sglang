@@ -7,9 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
-
 import sglang.srt.speculative.kt_mtp as kt_mtp_module
+import torch
 from sglang.srt.layers.moe.utils import (
     get_kt_ep_weight_layer_index,
     speculative_kt_ep_context,
@@ -118,6 +117,7 @@ def _server_args(model_path: str = "/models/glm52") -> SimpleNamespace:
         disable_cuda_graph=True,
         enable_dp_attention=False,
         enable_eplb=False,
+        record_kt_gpu_expert_distribution=False,
         enable_two_batch_overlap=False,
         enable_single_batch_overlap=False,
         init_expert_location="trivial",
@@ -167,6 +167,7 @@ def test_non_glm_draft_retains_gpu_only_behavior():
         ("kt_method", "BF16"),
         ("speculative_num_steps", 2),
         ("disable_cuda_graph", False),
+        ("record_kt_gpu_expert_distribution", True),
         ("load_format", None),
         ("speculative_draft_load_format", None),
         ("kt_threadpool_count", True),
@@ -227,6 +228,7 @@ def test_remote_admission_binds_two_logical_slots_to_fwuff_numa_zero(
         ("kt_numa_nodes", [0, 1]),
         ("kt_numa_nodes", [False, 0]),
         ("kt_enable_dynamic_expert_update", True),
+        ("record_kt_gpu_expert_distribution", True),
         ("kt_stream_prefill", True),
     ],
 )

@@ -6036,10 +6036,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         try:
             if self.tp_rank == 0:
                 recorder = get_global_expert_distribution_recorder()
-                if hasattr(recorder, "on_gpu_expert_mask"):
-                    recorder.on_gpu_expert_mask(
-                        self.kt_config.layer_idx, self.gpu_experts_mask_cuda
-                    )
+                recorder.on_gpu_expert_mask(
+                    self.kt_config.layer_idx, self.gpu_experts_mask_cuda
+                )
 
             # Preserve the cumulative branch's layerwise full-GPU fallback.
             # It is synchronous (and therefore supplies no CPU-overlap window),
@@ -6246,10 +6245,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Use gpu_experts_mask_cuda which is already on GPU for CUDA graph compatibility
         if self.tp_rank == 0:
             recorder = get_global_expert_distribution_recorder()
-            if hasattr(recorder, "on_gpu_expert_mask"):
-                recorder.on_gpu_expert_mask(
-                    self.kt_config.layer_idx, self.gpu_experts_mask_cuda
-                )
+            recorder.on_gpu_expert_mask(
+                self.kt_config.layer_idx, self.gpu_experts_mask_cuda
+            )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
