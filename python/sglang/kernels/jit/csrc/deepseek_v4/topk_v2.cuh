@@ -105,6 +105,7 @@ struct TopKLaunchParams {
  * \brief Persistent cluster kernel for the long items. It will handle long inputs.
  * The short items are handled by the separate topk_kernel.
  */
+#if SGL_CUDA_ARCH >= 900
 template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
@@ -120,6 +121,7 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
     __syncthreads();
   }
 }
+#endif
 
 template <typename F>
 SGL_DEVICE void for_each_item(uint32_t topk, const F& f) {
@@ -201,6 +203,7 @@ TOPK_KERNEL void topk_main_kernel(const __grid_constant__ TopKLaunchParams param
   problem_transform(problem, params.get_output_ptr(blockIdx.x));
 }
 
+#if SGL_CUDA_ARCH >= 900
 template <bool kPDL>
 CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLaunchParams params) {
   device::enable_smem_spilling();
@@ -229,6 +232,7 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_kernel(const __grid_constant__ TopKLau
   __syncthreads();
   if (blockIdx.y == worker_rank) problem_transform(problem, params.get_output_ptr(blockIdx.x));
 }
+#endif
 
 // --- Plan: choose cluster_threshold from the seq_len distribution -----------
 __global__ __launch_bounds__(kBlockSize, 1) void topk_plan(
@@ -425,6 +429,7 @@ struct TopKKernel {
 
     const bool use_cluster = (max_seq_len > params.cluster_floor) && (batch_size <= kClusterMaxBatch);
     constexpr bool kUsePDL = true;
+#if SGL_CUDA_ARCH >= 900
     if (use_cluster) {
       if (batch_size <= kNumPersistentClusters) {
         LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
@@ -439,7 +444,9 @@ struct TopKKernel {
             .config({.use_pdl = kUsePDL})
             .launch(topk_main_kernel<kUsePDL, /*kLevel=*/3>, params);
       }
-    } else if (max_seq_len <= kReg2MaxSeqLen) {
+    } else
+#endif
+    if (max_seq_len <= kReg2MaxSeqLen) {
       LaunchKernel(batch_size, kBlockSize, device)
           .config({.use_pdl = kUsePDL})
           .launch(topk_main_kernel<kUsePDL, /*kLevel=*/0>, params);

@@ -188,8 +188,20 @@ class CompressorBackendMixin:
                 cache_k=new_compressed_kv,
             )
         else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
-            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
+            # Triton fp8e4nv only works on SM >= 90; use torch path on older GPUs
+            import torch
+
+            cc = torch.cuda.get_device_capability()
+            kv_bf16 = new_compressed_kv.bfloat16()
+            if cc < (8, 9):
+                # SM_86: all-bf16 cache, no FP8 quant
+                pack_bf16 = quant_to_nope_bf16_rope_bf16_pack(kv_bf16)
+                token_to_kv_pool.set_extra_key_buffer(
+                    layer_id, out_loc, cache_bf16_pack=pack_bf16,
+                )
+            elif cc >= (8, 9):
+                pack = quant_to_nope_fp8_rope_bf16_pack_triton(kv_bf16)
+                token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
     def forward_indexer_compressor(
         self,

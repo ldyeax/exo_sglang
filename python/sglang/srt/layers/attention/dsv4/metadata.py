@@ -121,11 +121,18 @@ class PagedIndexerMetadata:
     )
 
     def __post_init__(self):
-        if (
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-            or is_xpu()
-            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
-        ) and not self.force_deep_gemm_metadata:
+        use_bf16_ampere_indexer = (
+            torch.cuda.is_available()
+            and torch.cuda.get_device_capability() < (8, 9)
+        )
+        if use_bf16_ampere_indexer or (
+            (
+                envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
+                or is_xpu()
+                or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
+            )
+            and not self.force_deep_gemm_metadata
+        ):
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
@@ -154,7 +161,8 @@ class PagedIndexerMetadata:
 
         from sglang.kernels.ops.attention.dsv4 import plan_topk_v2
 
-        if envs.SGLANG_OPT_USE_TOPK_V2.get():
+        use_topk_v2 = envs.SGLANG_OPT_USE_TOPK_V2.get()
+        if use_topk_v2:
             self.topk_metadata = plan_topk_v2(self.c4_seq_lens)
         else:
             self.topk_metadata = torch.empty((0,))

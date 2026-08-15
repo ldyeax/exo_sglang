@@ -617,6 +617,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        self.use_bf16_cache = self.kv_cache_dtype_str in {"bf16", "bfloat16"}
         cfg = kvc.model_config
         self.qk_nope_head_dim = cfg.qk_nope_head_dim
         self.qk_rope_head_dim = cfg.qk_rope_head_dim
@@ -707,12 +708,16 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
                 )
 
     def _get_bytes_per_full_token(self) -> float:
-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
-
-        quant_block_size = 128
-        indexer_bytes = (
-            self.indexer_head_dim + self.indexer_head_dim // quant_block_size * 4
-        )
+        if self.use_bf16_cache:
+            kv_bytes = self.qk_nope_head_dim * 2 + self.qk_rope_head_dim * 2
+            indexer_bytes = self.indexer_head_dim * 2
+        else:
+            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+            quant_block_size = 128
+            indexer_bytes = (
+                self.indexer_head_dim
+                + self.indexer_head_dim // quant_block_size * 4
+            )
 
         attn_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         c4_state_dtype_size, c128_state_dtype_size = (
@@ -854,6 +859,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         sizes = self._compute_dsv4_sizes(full_token, page_size)
         logger.info(
             f"DSV4 memory calculation: "
+            f"mode={'BF16' if self.use_bf16_cache else 'FP8'}, "
             f"bytes_per_full_token={self.bytes_per_full_token:.2f}, "
             f"available_bytes={available_bytes / (1 << 30):.2f} GB, "
             f"c128_state_fixed={c128_state_fixed_bytes / (1 << 30):.2f} GB, "

@@ -149,6 +149,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 "kt_kernel is not installed. To use KTransformers EP wrapper, please install kt_kernel."
             )
 
+        kt_method = getattr(
+            kt_config, "method", getattr(kt_config, "kt_method", "")
+        )
+        if (
+            kt_config.num_gpu_experts > 0
+            and str(kt_method).upper() == "MXFP4"
+            and gpu_method.__class__.__name__ == "Fp8MoEMethod"
+        ):
+            from sglang.srt.layers.quantization.mxfp4_deepseek import (
+                DeepSeekMxfp4MoEMethod,
+            )
+
+            gpu_method = DeepSeekMxfp4MoEMethod(gpu_method, prefix="")
+
         self.gpu_method = gpu_method
         self.kt_config = kt_config
         self.num_gpu_experts = kt_config.num_gpu_experts
@@ -216,13 +230,15 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
+            gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
+            gpu_experts_mask[: self.num_gpu_experts] = True
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
+                gpu_experts_mask=gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 weight_path=self.kt_config.weight_path,
@@ -348,6 +364,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 1: Submit CPU expert computation (non-blocking)
         if self.tp_rank == 0:
             self.submit(layer, dispatch_output)
+
+        # With all routed experts on CPU, do not invoke the generic GPU MoE
+        # runner with a zero-expert weight tensor. Shared experts are a
+        # separate model branch and remain on GPU.
+        if self.num_gpu_experts == 0:
+            if self.tp_rank == 0:
+                output = self.sync(x)
+            else:
+                output = torch.zeros_like(x)
+            return StandardCombineInput(hidden_states=output)
 
         # Step 2: Prepare GPU computation by masking CPU expert IDs
         # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them

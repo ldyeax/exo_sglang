@@ -114,6 +114,13 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
 
+try:
+    from kt_kernel import KTMoEWrapper
+
+    KTRANSFORMERS_AVAILABLE = True
+except ImportError:
+    KTRANSFORMERS_AVAILABLE = False
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -261,6 +268,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         assert capture_tokens is not None, "cuda_graph_config[prefill].bs is not set"
         self.capture_num_tokens = sorted(capture_tokens)
         assert self.capture_num_tokens, "cuda_graph_config[prefill].bs is empty"
+        if KTRANSFORMERS_AVAILABLE:
+            # KT's CUDA-stream bridge records copies to and from pinned host
+            # buffers in every prefill graph. Persist one buffer set per graph
+            # tier; otherwise capturing the next tier replaces the temporary
+            # set and leaves previously captured graphs with dangling host
+            # pointers at replay.
+            KTMoEWrapper.set_capture_batch_sizes(self.capture_num_tokens)
 
         # --- runner bounds --------------------------------------------
         self.max_num_tokens = max(self.capture_num_tokens)

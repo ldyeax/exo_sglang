@@ -235,6 +235,7 @@ class CompressorBackendMixin:
             if compressor.is_in_indexer:
                 kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
                 page_size = token_to_kv_pool.get_index_k_page_size()
+                bf16_store = token_to_kv_pool.c4_indexer_kv_pool.use_bf16_cache
             elif is_unified_kv_triton():
                 kv_cache = token_to_kv_pool.get_unified_kv(layer_id)
                 page_size = 1
@@ -248,6 +249,7 @@ class CompressorBackendMixin:
                 assert compress_kv_pool is not None
                 kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+                bf16_store = compress_kv_pool.use_bf16_cache
                 if hasattr(compress_kv_pool, "translate_loc_to_hisparse_device"):
                     out_loc = compress_kv_pool._translate_loc_to_hisparse_device(
                         out_loc
@@ -259,7 +261,7 @@ class CompressorBackendMixin:
                 head_dim=compressor.head_dim,
                 norm=compressor.norm,
                 freqs_cis_cache=compressor.freqs_cis,
-                kv_cache=kv_cache.view(dtype=torch.uint8),
+                kv_cache=kv_cache.view(dtype=torch.uint8).view(kv_cache.shape[0], -1),
                 is_indexer=compressor.is_in_indexer,
                 rotate=compressor.rotate,
                 compress_ratio=compressor.ratio,

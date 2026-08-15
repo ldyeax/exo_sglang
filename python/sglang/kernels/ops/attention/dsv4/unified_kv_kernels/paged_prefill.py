@@ -357,3 +357,134 @@ def sparse_attn_v4_paged_prefill(
         attn_sink,
         softmax_scale,
     )
+
+
+@triton.jit
+def _sparse_attn_v4_flat_prefill_kernel(
+    q_ptr,
+    kv_ptr,
+    indices_ptr,
+    lengths_ptr,
+    sink_ptr,
+    out_ptr,
+    q_stride_t: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    kv_stride_n: tl.constexpr,
+    kv_stride_d: tl.constexpr,
+    indices_stride_t: tl.constexpr,
+    out_stride_t: tl.constexpr,
+    out_stride_h: tl.constexpr,
+    out_stride_d: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    softmax_scale: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """SM86-capable sparse prefill over a gathered native-BF16 KV workspace."""
+    t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    d_offs = tl.arange(0, BLOCK_D)
+    h_mask = h_offs < H
+    d_mask = d_offs < D
+    q = tl.load(
+        q_ptr
+        + t * q_stride_t
+        + h_offs[:, None] * q_stride_h
+        + d_offs[None, :] * q_stride_d,
+        mask=h_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )
+
+    neg_large = -3.4028234663852886e38
+    m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+    l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
+    row_len = tl.load(lengths_ptr + t)
+    k_offs = tl.arange(0, BLOCK_K)
+
+    for k_start in tl.range(0, row_len, BLOCK_K):
+        positions = k_start + k_offs
+        in_range = positions < row_len
+        slot = tl.load(
+            indices_ptr + t * indices_stride_t + positions,
+            mask=in_range,
+            other=-1,
+        )
+        valid = in_range & (slot >= 0)
+        slot = tl.maximum(slot, 0)
+        kv = tl.load(
+            kv_ptr + slot[:, None] * kv_stride_n + d_offs[None, :] * kv_stride_d,
+            mask=valid[:, None] & d_mask[None, :],
+            other=0.0,
+        )
+        scores = tl.dot(q, tl.trans(kv)) * softmax_scale
+        scores = tl.where(h_mask[:, None] & valid[None, :], scores, neg_large)
+        m_block = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, m_block)
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        p = tl.where(h_mask[:, None] & valid[None, :], p, 0.0)
+        acc = acc * alpha[:, None] + tl.dot(p.to(kv.dtype), kv)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+
+    sink = tl.load(sink_ptr + h_offs, mask=h_mask, other=neg_large).to(tl.float32)
+    m_final = tl.maximum(m_i, sink)
+    alpha = tl.exp(m_i - m_final)
+    l_final = l_i * alpha + tl.exp(sink - m_final)
+    result = (acc * alpha[:, None]) / tl.maximum(l_final, 1.0e-30)[:, None]
+    tl.store(
+        out_ptr
+        + t * out_stride_t
+        + h_offs[:, None] * out_stride_h
+        + d_offs[None, :] * out_stride_d,
+        result,
+        mask=h_mask[:, None] & d_mask[None, :],
+    )
+
+
+def sparse_attn_v4_flat_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Sparse native-BF16 prefill for the gathered workspace used by DSV4."""
+    if kv.ndim == 3:
+        kv = kv.squeeze(1)
+    if indices.ndim == 3:
+        indices = indices.squeeze(1)
+    t, h, d = q.shape
+    out = torch.empty_like(q)
+    block_h = 8
+    _sparse_attn_v4_flat_prefill_kernel[(t, triton.cdiv(h, block_h))](
+        q,
+        kv,
+        indices,
+        lengths,
+        attn_sink,
+        out,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        kv.stride(0),
+        kv.stride(1),
+        indices.stride(0),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        h,
+        d,
+        float(softmax_scale),
+        BLOCK_H=block_h,
+        BLOCK_D=triton.next_power_of_2(d),
+        BLOCK_K=16,
+        num_warps=8,
+    )
+    return out

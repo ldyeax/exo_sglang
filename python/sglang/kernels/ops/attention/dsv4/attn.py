@@ -63,6 +63,12 @@ def fused_store_cache(
         from sglang.kernels.ops.kvcache.triton_store_cache import (
             triton_fused_store_cache,
         )
+        # Force unsigned zero-extension: uint8→uint32→int32.
+        # .to(tl.int32) on a uint8 value may sign-extend bytes ≥128
+        # into negative int32, causing an out-of-bounds LUT access.
+        idx = raw.to(tl.uint32).to(tl.int32)
+        fp8_val = tl.load(lut_ptr + idx)
+        fp8_vals = fp8_val * fp8_scale
 
         triton_fused_store_cache(input, cache, indices, page_size=page_size, type=type)
     else:
