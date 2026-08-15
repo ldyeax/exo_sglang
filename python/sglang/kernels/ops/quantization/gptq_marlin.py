@@ -7,6 +7,11 @@ import torch
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 
+try:
+    from sgl_kernel import gptq_marlin_gemm as _aot_gptq_marlin_gemm
+except ImportError:
+    _aot_gptq_marlin_gemm = None
+
 if TYPE_CHECKING:
     from sgl_kernel.scalar_type import ScalarType
     from tvm_ffi.module import Module
@@ -52,6 +57,30 @@ def gptq_marlin_gemm(
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
 ) -> torch.Tensor:
+    # Prefer the matching prebuilt operator. This avoids loading another CUDA
+    # runtime stub while the server is entering graph capture on Ampere; keep
+    # the JIT implementation as the compatibility fallback for older wheels.
+    if _aot_gptq_marlin_gemm is not None:
+        return _aot_gptq_marlin_gemm(
+            a,
+            c,
+            b_q_weight,
+            b_scales,
+            global_scale,
+            b_zeros,
+            g_idx,
+            perm,
+            workspace,
+            b_q_type,
+            size_m,
+            size_n,
+            size_k,
+            is_k_full,
+            use_atomic_add,
+            use_fp32_reduce,
+            is_zp_float,
+        )
+
     device = a.device
 
     # Allocate output if not provided

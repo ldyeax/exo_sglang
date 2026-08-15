@@ -7,6 +7,11 @@ import torch
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.kernels.jit.utils import cache_once, load_jit
 
+try:
+    from sgl_kernel import gptq_marlin_repack as _aot_gptq_marlin_repack
+except ImportError:
+    _aot_gptq_marlin_repack = None
+
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
@@ -31,6 +36,17 @@ def gptq_marlin_repack(
     size_n: int,
     num_bits: int,
 ) -> torch.Tensor:
+    # Prefer the prebuilt implementation to avoid redundant startup
+    # compilation and CUDA-runtime stub interposition on Ampere.
+    if _aot_gptq_marlin_repack is not None:
+        return _aot_gptq_marlin_repack(
+            b_q_weight,
+            perm,
+            size_k,
+            size_n,
+            num_bits,
+        )
+
     pack_factor = 32 // num_bits
 
     # Allocate output tensor

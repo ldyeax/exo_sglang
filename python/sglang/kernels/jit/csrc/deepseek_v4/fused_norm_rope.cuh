@@ -242,9 +242,9 @@ struct FusedNormRopeKernel {
     const auto num_blocks = div_ceil(num_compress_tokens, kNumWarps);
     using KernelType = std::decay_t<decltype(fused_norm_rope<DType, kHeadDim, kRopeDim, CompressExtend, kUsePDL>)>;
     static constexpr KernelType kernel_table[3] = {
-        [static_cast<int>(CompressExtend)] = fused_kernel<CompressExtend>,
-        [static_cast<int>(CompressDecode)] = fused_kernel<CompressDecode>,
-        [static_cast<int>(DefaultForward)] = fused_kernel<DefaultForward>,
+        fused_kernel<CompressExtend>,
+        fused_kernel<CompressDecode>,
+        fused_kernel<DefaultForward>,
     };
     const auto kernel = kernel_table[static_cast<int>(mode)];
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(kernel, params);
