@@ -45,7 +45,7 @@ def test_primary_package_metadata_matches_the_kt_runtime_contract() -> None:
     assert str(by_name["transformers"].specifier) == "==5.12.1"
     assert str(by_name["torch"].specifier) == "==2.11.0"
     assert str(by_name["torchaudio"].specifier) == "==2.11.0"
-    assert not by_name["torchvision"].specifier
+    assert str(by_name["torchvision"].specifier) == "==0.26.0"
     assert str(by_name["torchcodec"].specifier) == "==0.11.1"
     assert str(by_name["torchao"].specifier) == "==0.17.0"
     assert str(by_name["flashinfer-python"].specifier) == "==0.6.15.post1"
