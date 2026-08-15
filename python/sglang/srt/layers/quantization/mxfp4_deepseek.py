@@ -25,8 +25,8 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import next_power_of_2
 
 if is_flashinfer_available():
-    # V4-Flash needs flashinfer >= 0.6.9 (mxfp8_quantize, trtllm_fp4_block_scale_routed_moe
-    # and friends were not exported in 0.6.3, the version pinned by sglang-kt's pyproject).
+    # V4-Flash needs flashinfer >= 0.6.9 (mxfp8_quantize,
+    # trtllm_fp4_block_scale_routed_moe and friends were not exported in 0.6.3).
     # Fail loud with the exact upgrade command rather than letting the imports below crash
     # with a bare ImportError. Origin: sglang 本身.
     import flashinfer as _flashinfer

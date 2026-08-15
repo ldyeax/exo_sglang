@@ -41,8 +41,15 @@ except ModuleNotFoundError as exc:
     build_rust = None
 
 _BUILD_RUST_EXTS_ENV = "SGLANG_BUILD_RUST_EXTS"
+_KT_VERSION_ENV = "SGLANG_KT_VERSION"
 _PYTHON_DIR = Path(__file__).resolve().parent
 _RUST_WORKSPACE_DIR = _PYTHON_DIR.parent / "rust"
+
+
+def _version_setup_kwargs():
+    """Let KTransformers stamp its release while retaining SCM standalone builds."""
+    version = os.environ.get(_KT_VERSION_ENV)
+    return {"version": version} if version else {}
 
 
 def _cargo_workspace_metadata():
@@ -194,6 +201,7 @@ if build_rust is not None:
     setup(
         cmdclass={"build_rust": BuildRust},
         rust_extensions=_declared_rust_extensions(),
+        **_version_setup_kwargs(),
     )
 else:
-    setup()
+    setup(**_version_setup_kwargs())
