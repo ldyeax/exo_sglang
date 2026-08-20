@@ -1503,6 +1503,8 @@ class Scheduler(
 
     def init_memory_pools(self):
         """Allocate KV cache pools for target and draft workers."""
+        if self.draft_worker is not None:
+            self.draft_worker.prepare_for_target_memory_pool()
         self.init_target_memory_pool()
         if self.draft_worker is not None:
             pool, allocator = self.tp_worker.get_memory_pool()

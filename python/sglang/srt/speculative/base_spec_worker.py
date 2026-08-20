@@ -115,6 +115,15 @@ class BaseSpecWorker(ABC):
         # TODO: move this method to BaseTpWorker and call through self.model_runner
         pass
 
+    def prepare_for_target_memory_pool(self) -> None:
+        """Release shareable draft weights before target memory profiling.
+
+        Most speculative workers have nothing to release. Workers that load
+        temporary copies of target-owned modules override this hook so the
+        target KV-cache profiler observes the steady-state model footprint.
+        """
+        return None
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,

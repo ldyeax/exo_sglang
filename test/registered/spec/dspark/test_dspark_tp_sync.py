@@ -309,3 +309,64 @@ def test_dspark_tp2_broadcasts_accept_before_eager_commit(monkeypatch) -> None:
         events[mamba_commit_index][1], torch.tensor([2], dtype=torch.int32)
     )
     assert torch.equal(events[kv_commit_index][1], torch.tensor([2], dtype=torch.int32))
+
+
+def test_dspark_replayssm_fold_commits_the_authoritative_chain_lens(
+    monkeypatch,
+) -> None:
+    recorded: dict[str, object] = {}
+    spec_state = object()
+
+    def record_fold(**kwargs) -> None:
+        recorded.update(kwargs)
+
+    class LegacyBackend:
+        def update_mamba_state_after_mtp_verify(self, **kwargs) -> None:
+            raise AssertionError("ReplaySSM fold must not use the legacy state scatter")
+
+    req_pool = SimpleNamespace(
+        mamba_pool=SimpleNamespace(
+            replayssm_spec_fold=True,
+            replayssm_is_kda=False,
+        ),
+        get_speculative_mamba2_params_all_layers=lambda: spec_state,
+        get_mamba_indices=lambda indices: indices + 10,
+    )
+    worker = object.__new__(dspark_worker_v2.DSparkWorkerV2)
+    worker._need_mamba_verify_commit = True
+    worker.server_args = SimpleNamespace(
+        speculative_eagle_topk=1,
+        mamba_track_interval=4,
+    )
+    worker._target_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            attn_backend=LegacyBackend(),
+            req_to_token_pool=req_pool,
+        )
+    )
+    monkeypatch.setattr(
+        dspark_worker_v2,
+        "_commit_gdn_replayssm_fold_after_verify",
+        record_fold,
+    )
+
+    commit_lens = torch.tensor([2], dtype=torch.int32)
+    mamba_track_indices = torch.tensor([7], dtype=torch.int64)
+    worker._commit_target_mamba_states_after_verify(
+        batch=SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            mamba_track_indices=mamba_track_indices,
+            req_pool_indices=torch.tensor([3], dtype=torch.int64),
+        ),
+        seq_lens_pre_verify=torch.tensor([3], dtype=torch.int64),
+        seq_lens_post_verify=torch.tensor([5], dtype=torch.int64),
+        commit_lens=commit_lens,
+    )
+
+    assert recorded["spec_state"] is spec_state
+    assert torch.equal(recorded["state_batch_indices"], torch.tensor([13]))
+    assert recorded["accept_lens"] is commit_lens
+    assert torch.equal(recorded["last_correct_step_indices"], torch.tensor([1]))
+    assert recorded["mamba_track_indices"] is mamba_track_indices
+    assert torch.equal(recorded["mamba_steps_to_track"], torch.tensor([0]))
+    assert recorded["null_block_id"] == -1

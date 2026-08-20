@@ -143,6 +143,11 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         # Capture-time globals required by parent's capture_one_shape signature.
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.LAST
+        # Ragged verification is a target-verify concern.  This specialized
+        # draft runner deliberately bypasses DecodeCudaGraphRunner.__init__,
+        # so initialize the parent field explicitly for its shared capture
+        # loop.  Draft decoding always captures the ordinary batch dimension.
+        self.ragged_verify_mode = False
 
         # Bucket sizes
         self.capture_bs, _ = get_batch_sizes_to_capture(model_runner)
@@ -329,10 +334,20 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        *,
+        num_tokens: Optional[int] = None,
     ):
         num_seqs = size  # EAGLE legacy name
         buffers = self.buffers
-        num_tokens = num_seqs * self.captured_req_width
+        expected_num_tokens = num_seqs * self.captured_req_width
+        if num_tokens is None:
+            num_tokens = expected_num_tokens
+        elif num_tokens != expected_num_tokens:
+            raise ValueError(
+                "EAGLE draft CUDA graphs require a uniform capture width: "
+                f"got {num_tokens=} for {num_seqs=} and "
+                f"captured_req_width={self.captured_req_width}"
+            )
 
         # Graph inputs
         req_pool_indices = buffers.req_pool_indices[:num_seqs]

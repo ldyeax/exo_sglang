@@ -1238,15 +1238,23 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_mm().mm_enable_dp_encoder
 
-        self.visual = Qwen3VLMoeVisionModel(
-            config.vision_config,
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=None,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("model.visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-        )
+        self.visual: Optional[Qwen3VLMoeVisionModel]
+        if getattr(config, "language_only", False):
+            # A language-only EPD worker receives encoder-produced embeddings
+            # and never executes the local vision tower. Avoid constructing it
+            # so its unloaded parameters do not consume the decoder's KV-cache
+            # budget.
+            self.visual = None
+        else:
+            self.visual = Qwen3VLMoeVisionModel(
+                config.vision_config,
+                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=None,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("model.visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -1333,10 +1341,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        visual = self.visual
+        if visual is None:
+            raise RuntimeError(
+                "The local vision encoder is unavailable on a --language-only worker."
+            )
         pixel_values = materialize_multimodal_features(
             [item.feature for item in items],
-            device=self.visual.device,
-            dtype=self.visual.dtype,
+            device=visual.device,
+            dtype=visual.dtype,
         )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
@@ -1344,29 +1357,34 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
-                self.visual,
+                visual,
                 pixel_values,
                 image_grid_thw.tolist(),
                 rope_type="rope_3d",
             )
         else:
-            return self.visual(pixel_values, grid_thw=image_grid_thw)
+            return visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        visual = self.visual
+        if visual is None:
+            raise RuntimeError(
+                "The local vision encoder is unavailable on a --language-only worker."
+            )
         pixel_values = materialize_multimodal_features(
             [item.feature for item in items],
-            device=self.visual.device,
-            dtype=self.visual.dtype,
+            device=visual.device,
+            dtype=visual.dtype,
         )
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
         if self.use_data_parallel:
             return run_dp_sharded_mrope_vision_model(
-                self.visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
+                visual, pixel_values, video_grid_thw.tolist(), rope_type="rope_3d"
             )
         else:
-            video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
+            video_embeds = visual(pixel_values, grid_thw=video_grid_thw)
         return video_embeds
 
     def get_input_embeddings(self):
@@ -1463,6 +1481,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if self.visual is None and "visual" in name:
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")

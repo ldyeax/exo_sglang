@@ -5,11 +5,19 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, Callable, List, Literal, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    List,
+    Literal,
+    Optional,
+    Protocol,
+    Tuple,
+)
 
 import torch
 from huggingface_hub import snapshot_download
-
 from sglang.kernels.ops.speculative.cache_locs import (
     align_evict_mask_to_page_size as align_evict_mask_to_page_size,
 )
@@ -87,6 +95,15 @@ if _is_cpu:
 
 
 logger = logging.getLogger(__name__)
+
+
+class _VocabShardIndices(Protocol):
+    padded_org_vocab_start_index: int
+    padded_org_vocab_end_index: int
+    org_vocab_start_index: int
+    org_vocab_end_index: int
+    added_vocab_start_index: int
+    added_vocab_end_index: int
 
 
 def resolve_num_tokens_per_req(
@@ -186,9 +203,9 @@ def draft_kv_indices_buffer_width(
     num_seqs * topk branches each attend up to max_context_len KV slots; the topk
     factor is mandatory -- dropping it under-allocates and overflows the row (#27338, #27460).
     """
-    assert (
-        num_seqs * topk * max_context_len < 2**31
-    ), "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    assert num_seqs * topk * max_context_len < 2**31, (
+        "kv_indices flat offset would overflow int32; reduce batch/topk/context"
+    )
     return num_seqs * topk * max_context_len
 
 
@@ -639,7 +656,7 @@ def build_grammar_vocab_mask(
     return GrammarMask(grammar, vocab_mask)
 
 
-def load_token_map(token_map_path: str) -> List[int]:
+def load_token_map(token_map_path: str) -> torch.Tensor:
     if not os.path.exists(token_map_path):
         repo_id = os.path.dirname(token_map_path)
         file_name = os.path.basename(token_map_path)
@@ -665,8 +682,204 @@ def load_token_map(token_map_path: str) -> List[int]:
             )
 
         token_map_path = os.path.join(cache_dir, file_name)
-    hot_token_id = torch.load(token_map_path, weights_only=True)
-    return torch.tensor(hot_token_id, dtype=torch.int64)
+    hot_token_id = torch.as_tensor(
+        torch.load(token_map_path, weights_only=True), dtype=torch.int64
+    )
+    if hot_token_id.ndim != 1:
+        raise ValueError(
+            "Speculative token map must be a one-dimensional sequence of global "
+            f"token ids, got shape {tuple(hot_token_id.shape)}."
+        )
+    if hot_token_id.numel() == 0:
+        raise ValueError("Speculative token map must contain at least one token id.")
+    if torch.any(hot_token_id < 0):
+        raise ValueError("Speculative token map contains a negative token id.")
+    if torch.unique(hot_token_id).numel() != hot_token_id.numel():
+        raise ValueError("Speculative token map contains duplicate token ids.")
+    return hot_token_id.contiguous()
+
+
+def _hot_lm_head_shard_contribution(
+    local_weight: torch.Tensor,
+    hot_token_id: torch.Tensor,
+    *,
+    shard_indices: _VocabShardIndices,
+) -> torch.Tensor:
+    """Place locally-owned global-vocabulary rows in hot-vocabulary order.
+
+    Every other row is zero, making the result suitable for a TP all-reduce.
+    This handles the padded base/LoRA layout used by ``ParallelLMHead`` rather
+    than assuming that a global token id is also a local weight-row index.
+    """
+    contribution = torch.zeros(
+        (hot_token_id.numel(), local_weight.shape[1]),
+        dtype=local_weight.dtype,
+        device=local_weight.device,
+    )
+
+    org_mask = (hot_token_id >= shard_indices.org_vocab_start_index) & (
+        hot_token_id < shard_indices.org_vocab_end_index
+    )
+    added_mask = (hot_token_id >= shard_indices.added_vocab_start_index) & (
+        hot_token_id < shard_indices.added_vocab_end_index
+    )
+    owned_mask = org_mask | added_mask
+    owned_positions = torch.nonzero(owned_mask, as_tuple=False).flatten()
+    if owned_positions.numel() == 0:
+        return contribution
+
+    num_org_elements_padded = (
+        shard_indices.padded_org_vocab_end_index
+        - shard_indices.padded_org_vocab_start_index
+    )
+    local_rows = torch.where(
+        org_mask,
+        hot_token_id - shard_indices.org_vocab_start_index,
+        hot_token_id - shard_indices.added_vocab_start_index + num_org_elements_padded,
+    )
+    owned_local_rows = local_rows.index_select(0, owned_positions)
+    if torch.any(owned_local_rows < 0) or torch.any(
+        owned_local_rows >= local_weight.shape[0]
+    ):
+        raise ValueError("Speculative token map resolved outside the local LM head.")
+    contribution.index_copy_(
+        0,
+        owned_positions,
+        local_weight.index_select(0, owned_local_rows),
+    )
+    return contribution
+
+
+@torch.no_grad()
+def build_tp_hot_lm_head(
+    local_weight: torch.Tensor,
+    hot_token_id: torch.Tensor,
+    *,
+    num_embeddings: int,
+    shard_indices: _VocabShardIndices,
+    tp_group: GroupCoordinator,
+) -> torch.Tensor:
+    """Build this TP rank's contiguous slice of an FR-Spec LM head.
+
+    ``hot_token_id`` is ordered in reduced-vocabulary index order and contains
+    global target token ids. The target LM head is vocab-sharded, so indexing a
+    rank-local weight with those global ids is incorrect. For each destination
+    rank, all source ranks instead populate their owned rows into a zeroed
+    hot-vocabulary slice and all-reduce it. Concatenating the resulting rank
+    slices during logits processing exactly reconstructs ``hot_token_id``
+    order, allowing the existing reduced-index-to-global-id remap to remain
+    correct.
+
+    Processing one destination at a time bounds temporary memory to one local
+    hot-vocabulary shard instead of materializing the full target or hot head.
+    """
+    if local_weight.ndim != 2:
+        raise ValueError(
+            "TP FR-Spec requires a row-major two-dimensional LM-head weight, "
+            f"got shape {tuple(local_weight.shape)}."
+        )
+    if hot_token_id.ndim != 1:
+        raise ValueError(
+            "Speculative token map must be one-dimensional, "
+            f"got shape {tuple(hot_token_id.shape)}."
+        )
+    if hot_token_id.device != local_weight.device:
+        raise ValueError("Speculative token map and LM head must be on one device.")
+    if torch.any(hot_token_id < 0) or torch.any(hot_token_id >= num_embeddings):
+        raise ValueError(
+            f"Speculative token map contains an id outside [0, {num_embeddings})."
+        )
+
+    tp_size = tp_group.world_size
+    if hot_token_id.numel() % tp_size != 0:
+        raise ValueError(
+            "Speculative token-map length must be divisible by tensor parallel "
+            f"size: {hot_token_id.numel()} % {tp_size} != 0."
+        )
+
+    tokens_per_partition = hot_token_id.numel() // tp_size
+    local_hot_weight = None
+    for destination_rank in range(tp_size):
+        start = destination_rank * tokens_per_partition
+        destination_token_ids = hot_token_id.narrow(0, start, tokens_per_partition)
+        contribution = _hot_lm_head_shard_contribution(
+            local_weight,
+            destination_token_ids,
+            shard_indices=shard_indices,
+        )
+        reduced = tp_group.all_reduce(contribution)
+        if destination_rank == tp_group.rank_in_group:
+            local_hot_weight = reduced
+
+    assert local_hot_weight is not None
+    return local_hot_weight.contiguous()
+
+
+@torch.no_grad()
+def prepare_fp8_marlin_hot_lm_head(
+    lm_head: torch.nn.Module,
+    target_lm_head: torch.nn.Module,
+    *,
+    quant_method: Optional[Any] = None,
+) -> None:
+    """FP8-Marlin pack an independently materialized FR-Spec draft head.
+
+    ``build_tp_hot_lm_head`` creates rank-local storage in reduced-vocabulary
+    order. Refuse shared storage here so an opt-in draft optimization cannot
+    repack the authoritative target head in place.
+
+    ``quant_method`` is injectable solely to make ownership and layer-metadata
+    wiring CPU-testable; production constructs the standard online-FP8 method.
+    """
+    if lm_head is target_lm_head:
+        raise ValueError("FR-Spec FP8-Marlin requires a private draft LM head.")
+    if not hasattr(lm_head, "weight") or not hasattr(target_lm_head, "weight"):
+        raise ValueError("FR-Spec FP8-Marlin requires draft and target LM weights.")
+
+    weight = lm_head.weight
+    target_weight = target_lm_head.weight
+    if weight.ndim != 2:
+        raise ValueError(
+            "FR-Spec FP8-Marlin requires a two-dimensional draft LM head, "
+            f"got shape {tuple(weight.shape)}."
+        )
+    if (
+        weight.untyped_storage().data_ptr()
+        == target_weight.untyped_storage().data_ptr()
+    ):
+        raise ValueError(
+            "FR-Spec FP8-Marlin refuses draft LM-head storage shared with target."
+        )
+    if weight.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            "FR-Spec FP8-Marlin expects an FP16/BF16 materialized draft head, "
+            f"got {weight.dtype}."
+        )
+
+    if quant_method is None:
+        from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+
+        quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=False,
+            activation_scheme="dynamic",
+        )
+        quant_method = Fp8LinearMethod(quant_config)
+    else:
+        quant_config = quant_method.quant_config
+
+    if not quant_method.use_marlin:
+        raise RuntimeError(
+            "FR-Spec FP8 LM-head conversion requires the Marlin FP8 backend."
+        )
+
+    output_size, input_size = weight.shape
+    lm_head.logical_widths = [output_size]
+    lm_head.input_size_per_partition = input_size
+    lm_head.output_size_per_partition = output_size
+    lm_head.orig_dtype = weight.dtype
+    quant_method.process_weights_after_loading(lm_head)
+    lm_head.quant_config = quant_config
+    lm_head.quant_method = quant_method
 
 
 @contextmanager

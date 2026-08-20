@@ -105,8 +105,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        self.initialize_shared_embedding_and_lm_head()
 
     def init_attention_backends(self):
         with self.draft_tp_context(

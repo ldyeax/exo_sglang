@@ -659,6 +659,12 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "Qwen3_5ForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
+            # Conditional-generation checkpoints keep the language-model
+            # shape on ``text_config``.  ModelConfig derives
+            # ``num_nextn_predict_layers`` from that nested config, so setting
+            # only the outer field makes the target KV profiler mistake this
+            # one-layer MTP draft for the full target depth.
+            self.hf_text_config.num_nextn_predict_layers = 1
 
         if is_draft_model and self.hf_config.architectures[0] == "ExaoneMoEForCausalLM":
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"

@@ -92,6 +92,15 @@ if _is_cuda or _is_xpu or _is_musa:
         gemma_rmsnorm,
         rmsnorm,
     )
+
+    # Some FlashInfer/CuTe DSL combinations import successfully but fail while
+    # compiling their first normalization kernel.  Keep the optimized compiled
+    # sgl-kernel implementations available as an explicit compatibility path;
+    # changing this module flag affects all four wrappers imported above.
+    if get_bool_env_var("SGLANG_DISABLE_FLASHINFER_NORM"):
+        import sgl_kernel.elementwise as _sgl_kernel_elementwise
+
+        _sgl_kernel_elementwise._has_flashinfer = False
 _has_aiter_layer_norm = False
 _has_vllm_rms_norm = False
 _has_rocm_triton_gemma_rms_norm = False

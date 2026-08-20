@@ -1,4 +1,5 @@
 import contextlib
+import gc
 import logging
 import time
 from dataclasses import replace
@@ -37,7 +38,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -90,10 +95,12 @@ from sglang.srt.speculative.kt_mtp import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
+    build_tp_hot_lm_head,
     draft_tp_context,
     fast_sample,
     get_plan_stream,
     load_token_map,
+    prepare_fp8_marlin_hot_lm_head,
     renorm_draft_probs,
     sample_draft_proposal,
     select_top_k_tokens,
@@ -107,6 +114,7 @@ from sglang.srt.utils.async_probe import (
 from sglang.srt.utils.common import (
     MultiprocessingSerializer,
     empty_context,
+    empty_device_cache,
     fast_topk,
     get_available_gpu_memory,
     is_cpu,
@@ -116,6 +124,7 @@ from sglang.srt.utils.common import (
     is_npu,
     is_xpu,
     log_info_on_rank0,
+    require_gathered_buffer,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
@@ -208,6 +217,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.tree_mask_mode = default_tree_mask_mode()
 
+        # Some native MTP checkpoints load private embedding and LM-head
+        # weights before replacing them with the target's modules. Sharing must
+        # happen exactly once: a second set_embed_and_head call can delete the
+        # already-shared target LM-head weight.
+        self._shared_embedding_and_lm_head_initialized = False
+
         self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     def _kt_mtp_context(self):
@@ -244,8 +259,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_token_map()
-        self.init_lm_head()
+        self.initialize_shared_embedding_and_lm_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -262,6 +276,38 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     f"target to share one vocab, but the draft vocab "
                     f"({draft_vocab_size}) != target vocab ({target_vocab_size})."
                 )
+
+    def initialize_shared_embedding_and_lm_head(self) -> None:
+        """Install the final draft vocabulary modules exactly once.
+
+        The scheduler invokes this before profiling the target KV pool so
+        private draft copies do not reduce the profiled token capacity. The
+        draft pool initializer invokes it again for compatibility with direct
+        worker construction; that second call is intentionally a no-op.
+        """
+        if getattr(self, "_shared_embedding_and_lm_head_initialized", False):
+            return
+
+        self.init_token_map()
+        self.init_lm_head()
+        self._shared_embedding_and_lm_head_initialized = True
+
+        # Vocab weights carry loader-bound methods and model/module references
+        # that can survive the attribute replacement until cyclic GC runs.  In
+        # particular, Qwen3.5's final set_lm_head_from_target() happens after
+        # its model-local empty_cache() call.  Reclaim the complete old module
+        # graph here, before the target KV profiler samples free device memory.
+        gc.collect()
+        device_module = torch.get_device_module(self.device)
+        empty_device_cache(device_module)
+        synchronize = getattr(device_module, "synchronize", None)
+        if synchronize is not None:
+            synchronize()
+        logger.info(
+            "Shared draft embedding and LM head before target memory-pool profiling; "
+            "avail mem=%.2f GB",
+            get_available_gpu_memory(self.device, self.gpu_id),
+        )
 
     def init_attention_backends(self):
         with (
@@ -362,12 +408,55 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         else:
             if self.hot_token_id is not None:
-                head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
+                if target_lm_head is None or not hasattr(
+                    target_lm_head, "shard_indices"
+                ):
+                    raise ValueError(
+                        "--speculative-token-map requires a ParallelLMHead-style "
+                        "target LM head with vocabulary-shard metadata."
+                    )
+                target_head_tp_size = getattr(target_lm_head, "tp_size", 1)
+                draft_head_tp_size = self.draft_runner.tp_group.world_size
+                if target_head_tp_size != draft_head_tp_size:
+                    raise ValueError(
+                        "--speculative-token-map requires matching target/draft "
+                        "LM-head tensor parallelism, got target TP "
+                        f"{target_head_tp_size} and draft TP {draft_head_tp_size}."
+                    )
+                head = build_tp_hot_lm_head(
+                    head,
+                    self.hot_token_id,
+                    num_embeddings=target_lm_head.num_embeddings,
+                    shard_indices=target_lm_head.shard_indices,
+                    tp_group=self.draft_runner.tp_group,
+                )
+                logger.info(
+                    "Built TP-aware FR-Spec LM head: global hot vocab=%d, "
+                    "local rows=%d, TP=%d",
+                    self.hot_token_id.numel(),
+                    head.shape[0],
+                    self.draft_runner.tp_group.world_size,
+                )
 
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
+            if (
+                self.hot_token_id is not None
+                and envs.SGLANG_FR_SPEC_FP8_MARLIN_HEAD.get()
+            ):
+                draft_lm_head = getattr(self.draft_runner.model, "lm_head", None)
+                if draft_lm_head is None:
+                    raise ValueError(
+                        "FR-Spec FP8-Marlin requires a draft model LM-head module."
+                    )
+                prepare_fp8_marlin_hot_lm_head(draft_lm_head, target_lm_head)
+                logger.info(
+                    "Packed private TP FR-Spec draft LM head with FP8 Marlin: "
+                    "local_vocab=%d, hidden=%d",
+                    draft_lm_head.output_size_per_partition,
+                    draft_lm_head.input_size_per_partition,
+                )
             maybe_share_target_lm_head()
 
     def init_attention_backend(self):
@@ -915,6 +1004,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             + batch_result.accept_lens
             - 1
         )
+        if self.cuda_graph_runner_for_draft_extend is not None:
+            prune_draft_extend_logits = (
+                self.cuda_graph_runner_for_draft_extend.prune_draft_extend_logits
+            )
+        else:
+            prune_draft_extend_logits = not require_gathered_buffer(self.server_args)
+        if prune_draft_extend_logits:
+            draft_extend_input.select_index = select_index
 
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
@@ -931,6 +1028,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
             )
+            if prune_draft_extend_logits:
+                forward_batch.capture_hidden_mode = (
+                    CaptureHiddenMode.NULL
+                    if self.speculative_algorithm.is_standalone()
+                    else CaptureHiddenMode.LAST
+                )
 
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
@@ -985,24 +1088,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         dsa_seed_topk_indices = None
         if self.seed_dsa_topk_from_draft_extend:
             if can_run_decode_cuda_graph:
-                dsa_extend_topk_capture = (
-                    self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
-                )
+                dsa_extend_topk_capture = self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
             else:
                 dsa_extend_topk_capture = forward_batch.spec_info.dsa_seed_topk_capture
             # Fancy indexing returns a fresh tensor (detached from the buffer).
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
-        # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
-        if draft_logits_output.hidden_states is not None:
-            draft_logits_output.hidden_states = draft_logits_output.hidden_states[
-                select_index
-            ]
-        # The draft-extend graph only anchors full logits; selected-row topk is
-        # owned by the worker for both graph and eager paths.
+        # Dense TP selects before lm_head; gathered-buffer modes retain their
+        # all-row logits contract and select here as before.
+        if not prune_draft_extend_logits:
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
+            if draft_logits_output.hidden_states is not None:
+                draft_logits_output.hidden_states = draft_logits_output.hidden_states[
+                    select_index
+                ]
         if get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
@@ -1113,6 +1214,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self._draft_worker.draft_runner.attn_backend,
         )
 
+    def prepare_for_target_memory_pool(self) -> None:
+        self._draft_worker.initialize_shared_embedding_and_lm_head()
+
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
@@ -1146,8 +1250,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+        self,
+        batch: ScheduleBatch,
+        on_publish=None,
+        grammar_barrier=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ):
+        # Scheduler.run_batch passes this keyword on every non-overlap
+        # speculative call, including ordinary PP=1 execution where its value
+        # is None.  EAGLE v2 does not yet implement pipeline-parallel proxy
+        # propagation, so accept the PP=1 compatibility value but fail closed
+        # instead of silently dropping a real proxy tensor bundle.
+        if pp_proxy_tensors is not None:
+            raise NotImplementedError(
+                "EAGLE v2 does not support pipeline-parallel proxy tensors."
+            )
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill
             target_capture_mode = (

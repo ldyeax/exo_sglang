@@ -65,6 +65,15 @@ from sglang.srt.utils import get_available_gpu_memory, is_cuda
 logger = logging.getLogger(__name__)
 
 
+def _commit_gdn_replayssm_fold_after_verify(**kwargs) -> None:
+    """Lazy import seam for DSpark's ReplaySSM commit path."""
+    from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+        commit_gdn_replayssm_fold_after_verify,
+    )
+
+    commit_gdn_replayssm_fold_after_verify(**kwargs)
+
+
 def broadcast_dspark_tensors(tensors: tuple[torch.Tensor, ...]) -> None:
     """Keep proposal and acceptance state identical across tensor-parallel ranks."""
     # DP-attention ranks can run unrelated requests and idle ranks do not enter
@@ -820,6 +829,30 @@ class DSparkWorkerV2(BaseSpecWorker):
                 to_track_ith.to(torch.int64),
                 torch.full_like(to_track_ith, -1, dtype=torch.int64),
             )
+
+        model_runner = self.target_worker.model_runner
+        req_pool = model_runner.req_to_token_pool
+        mamba_pool = getattr(req_pool, "mamba_pool", None)
+        if (
+            mamba_pool is not None
+            and getattr(mamba_pool, "replayssm_spec_fold", False)
+            and not getattr(mamba_pool, "replayssm_is_kda", False)
+        ):
+            if batch.forward_mode.is_idle() or commit_lens.numel() == 0:
+                return
+            batch_size = commit_lens.shape[0]
+            _commit_gdn_replayssm_fold_after_verify(
+                spec_state=req_pool.get_speculative_mamba2_params_all_layers(),
+                state_batch_indices=req_pool.get_mamba_indices(
+                    batch.req_pool_indices[:batch_size]
+                ),
+                accept_lens=commit_lens,
+                last_correct_step_indices=last_correct_step_indices,
+                mamba_track_indices=batch.mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                null_block_id=-1,
+            )
+            return
 
         attn_backend.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct_step_indices,

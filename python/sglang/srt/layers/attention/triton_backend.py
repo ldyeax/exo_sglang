@@ -70,6 +70,16 @@ if TYPE_CHECKING:
 _MLA_DECODE_MIN_BLOCK_KV = 32
 
 
+def _resolve_verify_num_tokens_per_req(model_runner: ModelRunner) -> Optional[int]:
+    """Return this runner's verify width without enabling verify for decode-only."""
+    configured_num_tokens = get_spec().speculative_num_draft_tokens
+    if configured_num_tokens is None or not model_runner.spec_algorithm.is_speculative():
+        return configured_num_tokens
+    return model_runner.decode_num_tokens_per_req(
+        num_draft_tokens=configured_num_tokens
+    )
+
+
 def _mla_decode_kv_splits_cap(
     base_max_kv_splits: int, sm_count: int, max_context_len: int
 ) -> int:
@@ -168,7 +178,10 @@ class TritonAttnBackend(AttentionBackend):
         self._translate_kv_loc = getattr(
             self.token_to_kv_pool_allocator, "translate_kv_loc_dense", None
         ) or getattr(self.token_to_kv_pool_allocator, "translate_kv_loc", None)
-        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
+        # DSpark verifies gamma + 1 rows in the target runner but executes only
+        # gamma rows in the draft runner.  Using the process-global target width
+        # here makes Triton's draft qo_indptr and mask metadata one row too wide.
+        self.num_draft_tokens = _resolve_verify_num_tokens_per_req(model_runner)
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
         # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
